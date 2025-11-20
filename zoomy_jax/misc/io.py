@@ -14,7 +14,7 @@ def get_save_fields(_filepath, write_all=False, overwrite=True):
         filepath = os.path.join(main_dir, _filepath)
 
         with h5py.File(filepath, "a") as f:
-            if i_snap == 0 and not "fields" in f.keys():
+            if i_snap == 0 and "fields" not in f.keys():
                 fields = f.create_group("fields")
             else:
                 fields = f["fields"]
@@ -65,4 +65,3 @@ def get_save_fields(_filepath, write_all=False, overwrite=True):
         return jax.lax.cond(condition, do_nothing, do_save, operand=None)
 
     return save_fields
-

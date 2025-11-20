@@ -34,9 +34,7 @@ def log_callback_hyperbolic(iteration, time, dt, time_stamp, log_every=10):
 
 
 def log_callback_poisson(iteration, res):
-    logger.debug(f"Newton iterations: {iteration}, final residual norm: {
-                 jnp.linalg.norm(res):.3e}"
-                )
+    logger.debug(f"Newton iterations: {iteration}, final residual norm: {jnp.linalg.norm(res):.3e}")
     return None
 
 
@@ -332,8 +330,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         if write_output:
             output_hdf5_path = os.path.join(
-                self.settings.output.directory, f"{
-                    self.settings.output.filename}.h5"
+                self.settings.output.directory, f"{self.settings.output.filename}.h5"
             )
             save_fields = jax_io.get_save_fields(output_hdf5_path, write_all=False)
         else:
