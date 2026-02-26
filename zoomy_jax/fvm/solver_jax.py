@@ -21,8 +21,10 @@ from zoomy_core.misc.misc import Zstruct, Settings
 import zoomy_jax.fvm.ode as ode
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver as HyperbolicSolverNumpy
+from zoomy_core.fvm.solver_numpy import Solver as SolverNumpy
 from zoomy_core.transformation.to_jax import JaxRuntimeModel
 from zoomy_jax.mesh.mesh import convert_mesh_to_jax
+
 
 def log_callback_hyperbolic(iteration, time, dt, time_stamp, log_every=10):
     if iteration % log_every == 0:
@@ -34,7 +36,9 @@ def log_callback_hyperbolic(iteration, time, dt, time_stamp, log_every=10):
 
 
 def log_callback_poisson(iteration, res):
-    logger.debug(f"Newton iterations: {iteration}, final residual norm: {jnp.linalg.norm(res):.3e}")
+    logger.debug(
+        f"Newton iterations: {iteration}, final residual norm: {jnp.linalg.norm(res):.3e}"
+    )
     return None
 
 
@@ -44,7 +48,6 @@ def log_callback_execution_time(time):
 
 
 def newton_solver(residual):
-
     def Jv(Q, U):
         return jax.jvp(lambda q: residual(q), (Q,), (U,))[1]
 
@@ -62,6 +65,7 @@ def newton_solver(residual):
             def inner_loop(j, d):
                 val = compute_entry(i, j)
                 return d.at[i, j].set(val)
+
             return jax.lax.fori_loop(0, N, inner_loop, diag)
 
         diag_init = jnp.zeros_like(Q)
@@ -116,7 +120,7 @@ def newton_solver(residual):
                         improved,
                         lambda _: (0.0, Qnew, r_new),  # Accept and stop
                         lambda _: (alpha * 0.5, Q_curr, r_curr),  # Retry
-                        operand=None
+                        operand=None,
                     )
 
                 return jax.lax.while_loop(cond, body, (alpha, Q, r))[1:]
@@ -130,11 +134,7 @@ def newton_solver(residual):
 
         Q_final, res, i = jax.lax.while_loop(cond_fun, body_fun, init_state)
 
-        jax.experimental.io_callback(
-            log_callback_poisson,
-            None,
-            i, res
-        )
+        jax.experimental.io_callback(log_callback_poisson, None, i, res)
 
         return Q_final
 
@@ -147,14 +147,14 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     nc_flux: nonconservative_flux.NonconservativeFlux = field(
         factory=lambda: nonconservative_flux.Rusanov()
     )
-    
+
     def create_runtime(self, Q, Qaux, mesh, model):
         jax_mesh = convert_mesh_to_jax(mesh)
         Q, Qaux = jnp.asarray(Q), jnp.asarray(Qaux)
         parameters = jnp.asarray(model.parameter_values)
         runtime_model = JaxRuntimeModel(model)
         return Q, Qaux, parameters, jax_mesh, runtime_model
-    
+
     def get_compute_source(self, mesh, model):
         @jax.jit
         @partial(jax.named_call, name="source")
@@ -184,7 +184,6 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             return dQ
 
         return compute_source
-
 
     def get_apply_boundary_conditions(self, mesh, model):
         """
@@ -251,7 +250,6 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return apply_boundary_conditions
 
-
     def get_compute_max_abs_eigenvalue(self, mesh, model):
         @jax.jit
         @partial(jax.named_call, name="max_abs_eigenvalue")
@@ -266,19 +264,18 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             normal = mesh.face_normals
             evA = model.eigenvalues(qA, qauxA, parameters, normal)
             evB = model.eigenvalues(qB, qauxB, parameters, normal)
-            max_abs_eigenvalue = jnp.maximum(
-                jnp.abs(evA).max(), jnp.abs(evB).max())
+            max_abs_eigenvalue = jnp.maximum(jnp.abs(evA).max(), jnp.abs(evB).max())
             return max_abs_eigenvalue
+
         return compute_max_abs_eigenvalue
 
     def get_flux_operator(self, mesh, model):
         compute_num_flux = self.flux.get_flux_operator(model)
         compute_nc_flux = self.nc_flux.get_flux_operator(model)
-        
+
         @jax.jit
         @partial(jax.named_call, name="Flux")
         def flux_operator(dt, Q, Qaux, parameters, dQ):
-
             # Initialize dQ as zeros using jax.numpy
             dQ = jnp.zeros_like(dQ)
 
@@ -314,6 +311,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             dQ = dQ.at[:, iA].subtract(flux_out)
             dQ = dQ.at[:, iB].subtract(flux_in)
             return dQ
+
         return flux_operator
 
     # @jax.jit
@@ -321,12 +319,10 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     def solve(self, mesh, model, write_output=True):
         Q, Qaux = self.initialize(mesh, model)
 
-        Q, Qaux, parameters, mesh, model = self.create_runtime(
-            Q, Qaux, mesh, model)
+        Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
 
         # init once with dummy values for dt
-        Qaux = self.update_qaux(Q, Qaux, Q, Qaux, mesh,
-                                model, parameters, 0.0, 1.0)
+        Qaux = self.update_qaux(Q, Qaux, Q, Qaux, mesh, model, parameters, 0.0, 1.0)
 
         if write_output:
             output_hdf5_path = os.path.join(
@@ -334,6 +330,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             )
             save_fields = jax_io.get_save_fields(output_hdf5_path, write_all=False)
         else:
+
             def save_field(time, time_stamp, i_snapshot, Q, Qaux):
                 return i_snapshot
 
@@ -360,7 +357,8 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             min_inradius = jnp.min(mesh.cell_inradius)
 
             compute_max_abs_eigenvalue = self.get_compute_max_abs_eigenvalue(
-                mesh, model)
+                mesh, model
+            )
             flux_operator = self.get_flux_operator(mesh, model)
             source_operator = self.get_compute_source(mesh, model)
             boundary_operator = self.get_apply_boundary_conditions(mesh, model)
@@ -401,15 +399,15 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
                     Qnew = self.update_q(Q3, Qaux, mesh, model, parameters)
                     Qauxnew = self.update_qaux(
-                        Qnew, Qaux, Q, Qaux, mesh, model, parameters, time, dt)
+                        Qnew, Qaux, Q, Qaux, mesh, model, parameters, time, dt
+                    )
 
                     i_snapshot = save_fields(
-                        time, time_stamp, i_snapshot, Qnew, Qauxnew)
+                        time, time_stamp, i_snapshot, Qnew, Qauxnew
+                    )
 
                     jax.experimental.io_callback(
-                        log_callback_hyperbolic,
-                        None,
-                        iteration, time, dt, time_stamp
+                        log_callback_hyperbolic, None, iteration, time, dt, time_stamp
                     )
 
                     return (time, iteration, i_snapshot, Qnew, Qauxnew)
@@ -430,8 +428,80 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         time_start = gettime()
         Qnew, Qaux = run(Q, Qaux, parameters, model)
         jax.experimental.io_callback(
-            log_callback_execution_time,
-            None,
-            gettime() - time_start
+            log_callback_execution_time, None, gettime() - time_start
         )
         return Qnew, Qaux
+
+
+class PoissonSolver(SolverNumpy):
+    def get_residual(
+        self, Qaux, Qold, Qauxold, parameters, mesh, model, boundary_operator, time, dt
+    ):
+        def residual(Q):
+            qaux = self.update_qaux(
+                Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt
+            )
+            q = boundary_operator(time, Q, qaux, parameters)
+            res = model.residual(q, qaux, parameters)
+            # res = res.at[:, mesh.n_inner_cells:].set((10*(q-Q)**2)[:, mesh.n_inner_cells:])
+            res = res.at[:, mesh.n_inner_cells :].set(0.0)
+            return res
+
+        return residual
+
+    @jax.jit
+    @partial(jax.named_call, name="poission_solver")
+    def solve(self, mesh, model, write_output=True):
+        Q, Qaux = self.initialize(mesh, model)
+        Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
+
+        # dummy values for a consistent interface
+        i_snapshot = 0.0
+        time = 0.0
+        time_next_snapshot = 0.0
+        dt = 0.0
+
+        Qold = Q
+        Qauxold = Qaux
+
+        boundary_operator = self.get_apply_boundary_conditions(mesh, model)
+
+        Q = boundary_operator(time, Q, Qaux, parameters)
+        Qaux = self.update_qaux(
+            Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt
+        )
+
+        if write_output:
+            io.init_output_directory(
+                self.settings.output.directory, self.settings.output.clean_directory
+            )
+            output_hdf5_path = os.path.join(
+                self.settings.output.directory, f"{self.settings.output.filename}.h5"
+            )
+            mesh.write_to_hdf5(output_hdf5_path)
+            save_fields = jax_io.get_save_fields(output_hdf5_path, True)
+        else:
+
+            def save_fields(time, time_next_snapshot, i_snapshot, Q, Qaux):
+                return i_snapshot
+
+        residual = self.get_residual(
+            Qaux, Qold, Qauxold, parameters, mesh, model, boundary_operator, time, dt
+        )
+        newton_solve = newton_solver(residual)
+
+        time_start = gettime()
+
+        Q = newton_solve(Q)
+
+        Qaux = self.update_qaux(
+            Q, Qaux, Qold, Qauxold, mesh, model, parameters, time, dt
+        )
+
+        i_snapshot = save_fields(time, time_next_snapshot, i_snapshot, Q, Qaux)
+
+        jax.experimental.io_callback(
+            log_callback_execution_time, None, gettime() - time_start
+        )
+
+        return Q, Qaux
