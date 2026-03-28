@@ -22,7 +22,7 @@ import zoomy_jax.fvm.ode as ode
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver as HyperbolicSolverNumpy
 from zoomy_core.fvm.solver_numpy import Solver as SolverNumpy
-from zoomy_core.transformation.to_jax import JaxRuntimeModel
+from zoomy_jax.transformation.to_jax import JaxRuntimeModel
 from zoomy_jax.mesh.mesh import convert_mesh_to_jax
 
 
