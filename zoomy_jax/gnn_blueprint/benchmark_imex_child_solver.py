@@ -11,6 +11,9 @@
 
 Use ``--gmres-backend scipy`` (default) for **matvec** + **pr_norm** totals comparable to the Poisson docs
 script; use ``--gmres-backend jax`` for the fully JIT'd path (faster, fewer metrics).
+
+Longer physical runs: ``--time-end T`` (default 0.08) and optional ``--cfl`` (default 0.5) control integration
+length and adaptive step size; wall time grows roughly with the number of IMEX steps.
 """
 
 import argparse
@@ -62,6 +65,8 @@ def _make_solver(
     precond_model_path: str = "",
     vcycle_checkpoint: str = "",
     implicit_tol: float | None = None,
+    time_end: float = 0.08,
+    cfl: float = 0.5,
     **kwargs,
 ):
     kw = dict(kwargs)
@@ -70,7 +75,7 @@ def _make_solver(
             kw["precond_model_path"] = precond_model_path
         if vcycle_checkpoint:
             kw["vcycle_checkpoint"] = vcycle_checkpoint
-    solver = cls(time_end=0.08, compute_dt=timestepping.adaptive(CFL=0.5), **kw)
+    solver = cls(time_end=float(time_end), compute_dt=timestepping.adaptive(CFL=float(cfl)), **kw)
     object.__setattr__(solver, "source_mode", "auto")
     object.__setattr__(solver, "jv_backend", "ad")
     object.__setattr__(solver, "implicit_maxiter", 6)
@@ -143,6 +148,18 @@ def main():
         help="Optional Newton residual tolerance (default: solver default). "
         "Use a tighter value (e.g. 1e-14) if the implicit stage exits before any GMRES (matvec=0).",
     )
+    parser.add_argument(
+        "--time-end",
+        type=float,
+        default=0.08,
+        help="Physical end time T for IMEX (larger => more time steps, longer wall clock). Default 0.08.",
+    )
+    parser.add_argument(
+        "--cfl",
+        type=float,
+        default=0.5,
+        help="CFL for adaptive Δt; smaller CFL => smaller steps and usually more steps per unit time.",
+    )
     args = parser.parse_args()
     use_scipy = args.gmres_backend == "scipy"
     child_cls = IMEXSourceSolverJaxGNNGuessScipyGmres if use_scipy else IMEXSourceSolverJaxGNNGuess
@@ -208,7 +225,12 @@ def main():
     for r in range(args.repeats):
         mesh_base = petscMesh.Mesh.create_1d(domain=(0.0, 10.0), n_inner_cells=args.n_cells, lsq_degree=2)
         model_base = _build_model(args.case)
-        solver_base = _make_solver(IMEXSourceSolverJax, implicit_tol=args.implicit_tol)
+        solver_base = _make_solver(
+            IMEXSourceSolverJax,
+            implicit_tol=args.implicit_tol,
+            time_end=args.time_end,
+            cfl=args.cfl,
+        )
         Qb, _, tb, sb = _run_base(solver_base, mesh_base, model_base)
         base_times.append(tb)
         n = mesh_base.n_inner_cells
@@ -225,6 +247,8 @@ def main():
                 precond_model_path=precond_str,
                 vcycle_checkpoint=vck,
                 implicit_tol=args.implicit_tol,
+                time_end=args.time_end,
+                cfl=args.cfl,
             )
             Qc, _, tc, sc = _run_child(solver_child, mesh_child, model_child, use_scipy_gmres=use_scipy)
             l2 = float(np.sqrt(np.mean((Qb[:, :n] - Qc[:, :n]) ** 2)))
@@ -287,7 +311,10 @@ def main():
     base_mean = float(np.mean(base_times)) if base_times else 0.0
 
     print("\n=== Green–Naghdi IMEX / GMRES initial-guess summary ===")
-    print(f"case={args.case} n_cells={args.n_cells} repeats={args.repeats} gmres_backend={args.gmres_backend}")
+    print(
+        f"case={args.case} n_cells={args.n_cells} time_end={args.time_end} cfl={args.cfl} "
+        f"repeats={args.repeats} gmres_backend={args.gmres_backend}"
+    )
     print(f"base IMEX wall_s mean (per repeat, one solve): {base_mean:.4f}s")
     if precond_str:
         print(f"learned_deltaq weights: {precond_str}")
