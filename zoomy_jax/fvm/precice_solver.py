@@ -1,3 +1,5 @@
+"""Module `zoomy_jax.fvm.precice_solver`."""
+
 import os
 from time import time as gettime
 
@@ -37,17 +39,20 @@ import zoomy_jax.fvm.solver_jax as solver
 
 
 def precice_callback_read(interface, meshName, vertexIDs, dataName, dt):
+    """Precice callback read."""
     velocity = interface.read_data(meshName, dataName, vertexIDs, float(dt))
     return np.asarray(velocity, dtype=float)
 
 
 def precice_callback_write(interface, meshName, vertexIDs, dataName, data):
+    """Precice callback write."""
     interface.write_data(meshName, dataName, vertexIDs, data)
     return None
 
 
 @define(frozen=True, slots=True, kw_only=True)
 class PreciceHyperbolicSolver(solver.HyperbolicSolver):
+    """PreciceHyperbolicSolver. (class)."""
     settings: Zstruct = field(factory=lambda: Settings.default())
     compute_dt: Callable = field(factory=lambda: timestepping.adaptive(CFL=0.45))
     num_flux: Callable = field(factory=lambda: flux.Zero())
@@ -61,6 +66,7 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
     # initialisation
     # -----------------------------------------------------------------------
     def __attrs_post_init__(self):
+        """Hook `__attrs_post_init__`."""
         super().__attrs_post_init__()
         defaults = Settings.default()
         defaults.output.update(Zstruct(snapshots=10))
@@ -68,6 +74,7 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
         object.__setattr__(self, "settings", defaults)
 
     def initialize(self, mesh, model):
+        """Initialize."""
         Q, Qaux = super().initialize(mesh, model)
         Q = model.initial_conditions.apply(mesh.cell_centers, Q)
         Qaux = model.aux_initial_conditions.apply(mesh.cell_centers, Qaux)
@@ -75,7 +82,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_reader(interface, mesh, ids, name):
+        """Get precice callback reader."""
         def _cb(dt_scalar):
+            """Internal helper `_cb`."""
             arr = interface.read_data(mesh, name, ids, float(dt_scalar))
             return jnp.asarray(arr, dtype=jnp.float_)
 
@@ -83,7 +92,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_writer_pressure(interface, mesh, ids, name):
+        """Get precice callback writer pressure."""
         def _cb(Q, pr_back):
+            """Internal helper `_cb`."""
             if not interface.is_coupling_ongoing():
                 return None
             N = 243
@@ -104,7 +115,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_writer_alpha(interface, mesh, ids, name):
+        """Get precice callback writer alpha."""
         def _cb(Q, al):
+            """Internal helper `_cb`."""
             if not interface.is_coupling_ongoing():
                 return None
             N = 243
@@ -123,7 +136,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_writer_velocity(interface, mesh, ids, name):
+        """Get precice callback writer velocity."""
         def _cb(Q, al, vel):
+            """Internal helper `_cb`."""
             if not interface.is_coupling_ongoing():
                 return None
             N = 243
@@ -151,9 +166,11 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_advance_dt(interface):
+        """Get precice callback advance dt."""
         def _cb(dt):
             # b_read = interface.requires_reading_checkpoint()
             # b_write = interface.requires_writing_checkpoint()
+            """Internal helper `_cb`."""
             interface.advance(float(dt))
             return dt
 
@@ -161,7 +178,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_get_dt(interface):
+        """Get precice callback get dt."""
         def _cb():
+            """Internal helper `_cb`."""
             return interface.get_max_time_step_size()
 
         return _cb
@@ -170,9 +189,11 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
     def get_precice_callback_advance_or_read_checkpoint(
         interface, checkpoint_path, output_hdf5_path, dt_snapshot, write_all
     ):
+        """Get precice callback advance or read checkpoint."""
         save_fields = io.get_save_fields(output_hdf5_path, write_all=True)
 
         def _cb(Q, Qaux, time, dt, i_snapshot, iteration):
+            """Internal helper `_cb`."""
             read_checkpoint = interface.requires_reading_checkpoint()
             if read_checkpoint:
                 Q, Qaux, time = io.load_fields_from_hdf5(checkpoint_path, 0)
@@ -193,7 +214,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_read_checkpoint(interface, checkpoint_path):
+        """Get precice read checkpoint."""
         def _cb(Q, Qaux, time, read_checkpoint):
+            """Internal helper `_cb`."""
             jax.debug.print("Reading checkpoint")
 
             read_checkpoint = interface.requires_reading_checkpoint()
@@ -206,9 +229,11 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_advance(output_hdf5_path, write_all):
+        """Get precice callback advance."""
         save_fields = io.get_save_fields(output_hdf5_path, write_all=True)
 
         def _cb(Q, Qaux, time, dt, i_snapshot, iteration):
+            """Internal helper `_cb`."""
             if time % 0.01 < 0.001:
                 i_snapshot = save_fields(time, dt, i_snapshot, Q, Qaux)
 
@@ -224,7 +249,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_write_checkpoint(interface, checkpoint_path):
+        """Get precice callback write checkpoint."""
         def _cb(Q, Qaux, time):
+            """Internal helper `_cb`."""
             jax.debug.print("Writing checkpoint at time")
             write_checkpoint = interface.requires_writing_checkpoint()
             if write_checkpoint:
@@ -237,7 +264,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_precice_callback_checkpointing(interface, checkpoint_path):
+        """Get precice callback checkpointing."""
         def _cb(Q, Qaux, time, iteration, i_snapshot, dt):
+            """Internal helper `_cb`."""
             read_checkpoint = interface.requires_reading_checkpoint()
             write_checkpoint = interface.requires_writing_checkpoint()
             if read_checkpoint:
@@ -261,7 +290,9 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     @staticmethod
     def get_is_coupling_ongoing(interface):
+        """Get is coupling ongoing."""
         def _cb(Q):
+            """Internal helper `_cb`."""
             return jnp.asarray(interface.is_coupling_ongoing(), dtype=jnp.bool)
 
         return _cb
@@ -272,6 +303,7 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
     def get_apply_boundary_conditions(
         self, interface, vertexIds, mesh, model, model_orig
     ):
+        """Get apply boundary conditions."""
         bc_hyp = super().get_apply_boundary_conditions(mesh, model)
         bc_precice = self.get_apply_boundary_conditions_precice(
             interface, vertexIds, mesh, model, model_orig
@@ -279,6 +311,7 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
         @partial(jax.named_call, name="boundary_conditions")
         def apply_boundary_conditions(time, Q, Qaux, parameters):
+            """Apply boundary conditions."""
             Q = bc_hyp(time, Q, Qaux, parameters)
             q_shape_dtype = jax.ShapeDtypeStruct(
                 Q.shape, jnp.asarray(0.0, Q.dtype).dtype
@@ -294,12 +327,14 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
     def get_apply_boundary_conditions_precice(
         self, interface, vertexIDs, mesh, model, model_orig
     ):
+        """Get apply boundary conditions precice."""
         grid = self.get_grid()
         meshName = "Fluid2-Mesh"
 
         z, dz = self.get_z()
 
         def apply_bc_numpy(Qnew):
+            """Apply bc numpy."""
             Qnew = np.array(Qnew)
 
             ve = interface.read_data(meshName, "Velocity", vertexIDs, 0.0)
@@ -374,6 +409,7 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
     def solve(self, mesh, model, write_output=True):
         # ----------------- initial state -----------------------------------
+        """Solve."""
         Q, Qaux = self.initialize(mesh, model)
         model_orig = model
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
@@ -459,6 +495,7 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
         @partial(jax.named_call, name="time_loop")
         def run(Q, Qaux, parameters):
             # local constants for JIT
+            """Run."""
             min_inradius = jnp.min(mesh.cell_inradius)
             flux_operator = self.get_flux_operator(mesh, model)
             source_operator = self.get_compute_source(mesh, model)
@@ -478,6 +515,7 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
             iteration_desc = jax.ShapeDtypeStruct((), iteration.dtype)
 
             def body(carry):
+                """Body."""
                 time, Q, Qaux, i_snapshot, iteration = carry
 
                 jax.experimental.io_callback(cb_write_checkpoint, None, Q, Qaux, time)
@@ -542,8 +580,10 @@ class PreciceHyperbolicSolver(solver.HyperbolicSolver):
 
 @define(frozen=True, slots=True, kw_only=True)
 class PreciceHyperbolicSolverBidirectional(PreciceHyperbolicSolver):
+    """PreciceHyperbolicSolverBidirectional. (class)."""
     def solve(self, mesh, model, write_output=True):
         # ----------------- initial state -----------------------------------
+        """Solve."""
         Q, Qaux = self.initialize(mesh, model)
         model_orig = model
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
@@ -635,6 +675,7 @@ class PreciceHyperbolicSolverBidirectional(PreciceHyperbolicSolver):
         @partial(jax.named_call, name="time_loop")
         def run(Q, Qaux, parameters):
             # local constants for JIT
+            """Run."""
             min_inradius = jnp.min(mesh.cell_inradius)
             flux_operator = self.get_flux_operator(mesh, model)
             source_operator = self.get_compute_source(mesh, model)
@@ -653,6 +694,7 @@ class PreciceHyperbolicSolverBidirectional(PreciceHyperbolicSolver):
             iteration_desc = jax.ShapeDtypeStruct((), iteration.dtype)
 
             def body(carry):
+                """Body."""
                 time, Q, Qaux, i_snapshot, iteration = carry
 
                 dummy_ = jax.experimental.io_callback(
@@ -726,7 +768,9 @@ class PreciceHyperbolicSolverBidirectional(PreciceHyperbolicSolver):
 
 @define(frozen=True, slots=True, kw_only=True)
 class PreciceTestSolver(PreciceHyperbolicSolver):
+    """PreciceTestSolver. (class)."""
     def solve(self, mesh, model, write_output=True):
+        """Solve."""
         Q, Qaux = self.initialize(mesh, model)
         # Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
 
@@ -819,8 +863,10 @@ class PreciceTestSolver(PreciceHyperbolicSolver):
 
 @define(frozen=True, slots=True, kw_only=True)
 class PreciceHyperbolicSolverAUP(PreciceHyperbolicSolver):
+    """PreciceHyperbolicSolverAUP. (class)."""
     def solve(self, mesh, model, write_output=True):
         # ----------------- initial state -----------------------------------
+        """Solve."""
         Q, Qaux = self.initialize(mesh, model)
         model_orig = model
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
@@ -924,6 +970,7 @@ class PreciceHyperbolicSolverAUP(PreciceHyperbolicSolver):
         @partial(jax.named_call, name="time_loop")
         def run(Q, Qaux, parameters):
             # local constants for JIT
+            """Run."""
             min_inradius = jnp.min(mesh.cell_inradius)
             flux_operator = self.get_flux_operator(mesh, model)
             source_operator = self.get_compute_source(mesh, model)
@@ -945,6 +992,7 @@ class PreciceHyperbolicSolverAUP(PreciceHyperbolicSolver):
             floating = jax.ShapeDtypeStruct((), jnp.float_)
 
             def body(carry):
+                """Body."""
                 time, Q, Qaux, i_snapshot, iteration = carry
 
                 # read_checkpoint, Q, Qaux, time = jax.experimental.io_callback(cb_read_checkpoint,
@@ -1041,16 +1089,20 @@ class PreciceHyperbolicSolverAUP(PreciceHyperbolicSolver):
 
 @define(frozen=True, slots=True, kw_only=True)
 class PreciceHyperbolicSolverAUP_while(PreciceHyperbolicSolver):
+    """PreciceHyperbolicSolverAUP while. (class)."""
     def get_interface_size(self):
+        """Get interface size."""
         return 36, 0.12
 
     def get_z(self):
+        """Get z."""
         N, z_max = self.get_interface_size()
         dz = z_max / N
         z = np.arange(dz / 2, z_max, dz)
         return z, dz
 
     def get_grid(self):
+        """Get grid."""
         N, z_max = self.get_interface_size()
         z, dz = self.get_z()
         grid = np.zeros((N, 3))
@@ -1061,6 +1113,7 @@ class PreciceHyperbolicSolverAUP_while(PreciceHyperbolicSolver):
 
     def solve(self, mesh, model, write_output=True):
         # ----------------- initial state -----------------------------------
+        """Solve."""
         Q, Qaux = self.initialize(mesh, model)
         model_orig = model
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
@@ -1118,6 +1171,7 @@ class PreciceHyperbolicSolverAUP_while(PreciceHyperbolicSolver):
         @partial(jax.named_call, name="time_loop")
         def run(Q, Qaux, parameters):
             # local constants for JIT
+            """Run."""
             min_inradius = jnp.min(mesh.cell_inradius)
             flux_operator = self.get_flux_operator(mesh, model)
             source_operator = self.get_compute_source(mesh, model)
@@ -1195,16 +1249,20 @@ class PreciceHyperbolicSolverAUP_while(PreciceHyperbolicSolver):
 
 @define(frozen=True, slots=True, kw_only=True)
 class PreciceHyperbolicSolver2d3d(PreciceHyperbolicSolverAUP_while):
+    """PreciceHyperbolicSolver2d3d. (class)."""
     def get_interface_size(self):
+        """Get interface size."""
         return 9, 1.0
 
     def get_z(self):
+        """Get z."""
         N, z_max = self.get_interface_size()
         dz = z_max / N
         z = np.arange(dz / 2, z_max, dz)
         return z, dz
 
     def get_grid(self):
+        """Get grid."""
         N, z_max = self.get_interface_size()
         z, dz = self.get_z()
 
