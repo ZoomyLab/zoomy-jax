@@ -1,9 +1,12 @@
+"""Module `zoomy_jax.fvm.jvp_jax`."""
+
 import jax.numpy as jnp
 
 from zoomy_jax.mesh.mesh import compute_derivatives
 
 
 def _dqaux_action_from_specs(symbolic_model, V, mesh, dt):
+    """Internal helper `_dqaux_action_from_specs`."""
     n_aux, n_cells = symbolic_model.n_aux_variables, V.shape[1]
     dQaux = jnp.zeros((n_aux, n_cells), dtype=V.dtype)
     if not hasattr(symbolic_model, "derivative_specs") or not symbolic_model.derivative_specs:
@@ -37,6 +40,7 @@ def _dqaux_action_from_specs(symbolic_model, V, mesh, dt):
 
 
 def analytic_source_jvp_jax(runtime_model, symbolic_model, Q, Qaux, V, mesh, dt, include_chain_rule=True):
+    """Analytic source jvp jax."""
     parameters = jnp.asarray(symbolic_model.parameter_values)
     Jq = runtime_model.source_jacobian_wrt_variables(Q, Qaux, parameters)
     jv = jnp.einsum("ijc,jc->ic", Jq, V)

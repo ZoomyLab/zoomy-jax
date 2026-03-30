@@ -1,3 +1,5 @@
+"""Module `zoomy_jax.mesh.mesh`."""
+
 import os
 import h5py
 try:
@@ -37,6 +39,7 @@ from itertools import product
 
 
 def compute_derivatives(u, mesh, derivatives_multi_index=None):
+    """Compute derivatives."""
     A_glob = mesh.lsq_gradQ  # shape (n_cells, n_monomials, n_neighbors)
     neighbors = mesh.lsq_neighbors  # list of neighbors per cell
     mon_indices = mesh.lsq_monomial_multi_index  # shape (n_monomials, dim)
@@ -48,6 +51,7 @@ def compute_derivatives(u, mesh, derivatives_multi_index=None):
     indices = find_derivative_indices(mon_indices, derivatives_multi_index)
 
     def reconstruct_cell(A_loc, neighbor_idx, u_i):
+        """Reconstruct cell."""
         u_neighbors = u[neighbor_idx]
         delta_u = u_neighbors - u_i
         return (scale_factors * (A_loc.T @ delta_u)).T  # shape (n_monomials,)
@@ -62,6 +66,7 @@ def compute_derivatives(u, mesh, derivatives_multi_index=None):
 
 @define(frozen=True, slots=True)
 class MeshJAX(Mesh):
+    """MeshJAX. (class)."""
     dimension: int = attr.ib()
     type: str = attr.ib()
     n_cells: int = attr.ib()
@@ -99,6 +104,7 @@ class MeshJAX(Mesh):
 
 
 def convert_mesh_to_jax(mesh: Mesh) -> MeshJAX:
+    """Convert mesh to jax."""
     return MeshJAX(
         dimension=mesh.dimension,
         type=mesh.type,
@@ -142,6 +148,7 @@ def convert_mesh_to_jax(mesh: Mesh) -> MeshJAX:
 
 def meshjax_flatten(mesh: MeshJAX):
     # Children: all jnp arrays only (no strings)
+    """Meshjax flatten."""
     children = (
         mesh.vertex_coordinates,
         mesh.cell_vertices,
@@ -184,6 +191,7 @@ def meshjax_flatten(mesh: MeshJAX):
 
 
 def meshjax_unflatten(aux_data, children):
+    """Meshjax unflatten."""
     (
         dimension,
         type_,

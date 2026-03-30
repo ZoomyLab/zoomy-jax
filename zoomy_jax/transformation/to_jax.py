@@ -1,3 +1,5 @@
+"""Module `zoomy_jax.transformation.to_jax`."""
+
 import os
 
 import jax  # type: ignore[reportMissingImports]

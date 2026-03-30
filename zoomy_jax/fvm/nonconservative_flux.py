@@ -1,3 +1,5 @@
+"""Module `zoomy_jax.fvm.nonconservative_flux`."""
+
 import numpy as np
 import jax.numpy as jnp
 from numpy.polynomial.legendre import leggauss
@@ -5,10 +7,13 @@ from functools import partial
 import jax
 
 class NonconservativeFlux:
+    """NonconservativeFlux. (class)."""
     def get_flux_operator(self, model):
+        """Get flux operator."""
         pass  
 
 class Zero(NonconservativeFlux):
+    """Zero. (class)."""
     def get_flux_operator(self, model):
         @jax.jit
         def compute( 
@@ -23,11 +28,14 @@ class Zero(NonconservativeFlux):
             Vij,
             dt
         ):
+            """Compute."""
             return jnp.zeros_like(Qi), jnp.zeros_like(Qi)
         return compute
 
 class Rusanov(NonconservativeFlux):
+    """Rusanov. (class)."""
     def __init__(self, integration_order=3, identity_matrix=None, eps=-1, index_h=1):
+        """Initialize the instance."""
         self.integration_order = integration_order
         samples, weights = leggauss(integration_order)
         # shift from [-1, 1] to [0,1]
@@ -40,20 +48,24 @@ class Rusanov(NonconservativeFlux):
         self.index_h = index_h
         
     def _get_A(self, model):
+        """Internal helper `_get_A`."""
         def A(q, qaux, parameters, n):                      
             # q : (n_dof,)
             # evaluate the matrices A_d
+            """A."""
             _A = model.quasilinear_matrix(q, qaux, parameters)
             return jnp.einsum('d,ijd->ij', n, _A)
 
         return A
     
     def _integrate_path(self, model):
+        """Internal helper `_integrate_path`."""
         compute_A = self._get_A(model)
         def A_int(Qi, Qj,
                             Qauxi, Qauxj,
                             parameters,
                             normal):
+            """A int."""
             dQ     =  Qj    - Qi
             dQaux  =  Qauxj - Qauxi
 
@@ -71,6 +83,7 @@ class Rusanov(NonconservativeFlux):
     
     
     def _single(self, model):
+        """Internal helper `_single`."""
         compute_path_integral = self._integrate_path(model)
         Id = self.Id(model.n_variables)
         def _rusanov(Qi, Qj,
@@ -83,10 +96,12 @@ class Rusanov(NonconservativeFlux):
             # cond1 = (Qi[index_h] < eps) & (Qi[index_topography] > Qj[index_h] + Qj[index_topography])
             # cond2 = (Qj[index_h] < eps) & (Qj[index_topography] > Qi[index_h] + Qi[index_topography])
             # dry   = cond1 | cond2
+            """Internal helper `_rusanov`."""
             dry = (self.eps >=0) & (Qi[self.index_h] < self.eps) & (Qj[self.index_h] < self.eps)
 
 
             def _compute():                         # executed only if not dry
+                """Internal helper `_compute`."""
                 dQ     =  Qj    - Qi
                 dQaux  =  Qauxj - Qauxi
 
@@ -112,6 +127,7 @@ class Rusanov(NonconservativeFlux):
                 return Dp, Dm
             
             def _dry():
+                """Internal helper `_dry`."""
                 return jnp.zeros_like(Qi), jnp.zeros_like(Qi)
 
             return jax.lax.cond(dry,
@@ -121,6 +137,7 @@ class Rusanov(NonconservativeFlux):
 
 
     def get_flux_operator(self, model):
+        """Get flux operator."""
         compute_single = self._single(model)
         @partial(jax.named_call, name="NC_Flux")
         @jax.jit
@@ -170,7 +187,9 @@ class Rusanov(NonconservativeFlux):
 
 class PriceC(Rusanov):
     
+    """PriceC. (class)."""
     def _single(self, model):
+        """Internal helper `_single`."""
         compute_path_integral = self._integrate_path(model)
         def _priceC(Qi, Qj, Qauxi, Qauxj, parameters, normal, Vi, Vj, Vij, dt):
             """
