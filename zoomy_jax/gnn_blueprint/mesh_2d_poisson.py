@@ -55,6 +55,29 @@ def edge_list_from_grid(ni_x: int, ni_y: int) -> np.ndarray:
     return e
 
 
+def gaussian_bump_interior(
+    nx: int,
+    ny: int,
+    *,
+    amplitude: float = 0.12,
+    sigma: float = 0.15,
+    cx: float = 0.5,
+    cy: float = 0.5,
+) -> np.ndarray:
+    """Smooth Gaussian bump on interior nodes (iy-major), normalized cell coords in (0,1)²."""
+    ni_x, ni_y, n = interior_grid_shape(nx, ny)
+    out = np.zeros(n, dtype=np.float64)
+    denom = 2.0 * sigma**2
+    for iy in range(ni_y):
+        for ix in range(ni_x):
+            x = (ix + 0.5) / ni_x
+            y = (iy + 0.5) / ni_y
+            r2 = (x - cx) ** 2 + (y - cy) ** 2
+            i = flat_interior_index(ix, iy, ni_x)
+            out[i] = amplitude * np.exp(-r2 / denom)
+    return out
+
+
 def edge_list_from_adjacency(adj: np.ndarray) -> np.ndarray:
     """Symmetric 0/1 adjacency → (2, E) both directions."""
     adj = np.asarray(adj, dtype=np.float64)
