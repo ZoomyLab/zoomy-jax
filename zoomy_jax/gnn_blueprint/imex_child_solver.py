@@ -46,6 +46,7 @@ class IMEXSourceSolverJaxGNNGuess(IMEXSourceSolverJax):
         policy_mode: str = "use",
         collect_path: str = "outputs/gnn_blueprint/collect/latest_run.npz",
         precond_model_path: str = "",
+        vcycle_checkpoint: str = "",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -55,6 +56,7 @@ class IMEXSourceSolverJaxGNNGuess(IMEXSourceSolverJax):
         object.__setattr__(self, "policy_mode", policy_mode)    # off|use|collect
         object.__setattr__(self, "collect_path", collect_path)
         object.__setattr__(self, "precond_model_path", precond_model_path)
+        object.__setattr__(self, "vcycle_checkpoint", str(vcycle_checkpoint))
         object.__setattr__(self, "last_stats_gnn", IMEXGNNGuessStats(source_mode=self.source_mode))
 
     def _save_collection(self, Qnew, Qauxnew, stats: IMEXGNNGuessStats):
@@ -222,6 +224,12 @@ class IMEXSourceSolverJaxGNNGuess(IMEXSourceSolverJax):
                 if guess_mode in ("learned_deltaq", "learned_deltaq_fp"):
                     dq = IMEXSourceSolverJaxGNNGuess._predict_delta_q_learned(Qc, Qauxold, dt, class_id, precond_params, message_steps)
                     return guess_scale * dq.reshape(-1)
+                if guess_mode == "learned_vcycle":
+                    logger.warning(
+                        "guess_mode learned_vcycle is not wired inside JIT'd JAX GMRES; "
+                        "use IMEXSourceSolverJaxGNNGuessScipyGmres. Using zero x0."
+                    )
+                    return jnp.zeros_like(b)
                 return jnp.zeros_like(b)
 
             def cond(state):

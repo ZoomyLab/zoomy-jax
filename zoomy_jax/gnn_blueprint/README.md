@@ -99,13 +99,20 @@ This first loop is intentionally lightweight and standalone. The next step is wi
 
 A child class `IMEXSourceSolverJaxGNNGuess` overrides only the global implicit GMRES path and injects an `x0` strategy.
 
-Benchmark on Green-Naghdi 1D:
+Benchmark on Green-Naghdi 1D (guess modes: `zero`, `explicit`, `learned_deltaq`; default compares all three):
 
 ```bash
-conda run -n zoomy python library/zoomy_jax/zoomy_jax/gnn_blueprint/benchmark_imex_child_solver.py --guess-mode explicit --n-cells 120 --repeats 2
+conda run -n zoomy python library/zoomy_jax/zoomy_jax/gnn_blueprint/benchmark_imex_child_solver.py --n-cells 120 --repeats 2
 ```
 
-This prints base vs child runtime plus solution drift (`l2`).
+- **`--gmres-backend scipy`** (default): `IMEXSourceSolverJaxGNNGuessScipyGmres` — Python time loop + **SciPy** GMRES so you get **matvec** and **pr_norm** totals (same idea as the Poisson CI script). No outer XLA compile on the time integrator; `integrate` time is a fairer runtime slice.
+- **`--gmres-backend jax`**: original fully JIT’d path (`jax.scipy.sparse.linalg.gmres` inside the loop) — faster for production experiments, fewer diagnostics.
+
+`learned_deltaq` uses **one fixed** `weights_deltaq.npz` (no online retraining). It is the **delta-Q** model from `train_deltaq.py`, not the Poisson V-cycle GNN.
+
+On some GN setups the implicit residual is already below `implicit_tol` at the explicit predictor, so **Newton (and GMRES) may never run** (`matvec=0`). Tighten with `--implicit-tol` or use a harder case if you need nonzero Krylov work.
+
+This prints base vs child wall times, `l2` drift vs base, and (SciPy backend) Krylov counters.
 
 
 ## IMEX sweep (variance across meshes + topography)
