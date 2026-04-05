@@ -9,8 +9,7 @@ import jax.numpy as jnp
 from jax.scipy.sparse.linalg import gmres
 # from jaxopt import Broyden
 
-from typing import Callable
-from attrs import define, field
+import param
 
 
 from zoomy_core.misc.logger_config import logger
@@ -159,13 +158,14 @@ def newton_solver(residual):
     return newton_solve
 
 
-@define(frozen=True, slots=True, kw_only=True)
 class HyperbolicSolver(HyperbolicSolverNumpy):
-    """HyperbolicSolver. (class)."""
-    flux: fvmflux.Flux = field(factory=lambda: fvmflux.Zero())
-    nc_flux: nonconservative_flux.NonconservativeFlux = field(
-        factory=lambda: nonconservative_flux.Rusanov()
-    )
+    """JAX HyperbolicSolver — JIT-compiled time stepping."""
+
+    def __init__(self, **kwargs):
+        # Default to JAX flux implementations
+        kwargs.setdefault("flux", fvmflux.Zero())
+        kwargs.setdefault("nc_flux", nonconservative_flux.Rusanov())
+        super().__init__(**kwargs)
 
     def create_runtime(self, Q, Qaux, mesh, model):
         """Create runtime."""
