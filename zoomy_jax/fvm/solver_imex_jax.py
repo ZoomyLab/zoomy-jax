@@ -14,6 +14,7 @@ from zoomy_core.misc.logger_config import logger
 
 from zoomy_jax.fvm.jvp_jax import analytic_source_jvp_jax
 from zoomy_jax.mesh.mesh import compute_derivatives, convert_mesh_to_jax
+from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_jax.transformation.to_jax import JaxRuntimeModel
 
 
@@ -54,7 +55,9 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
 
     def create_runtime(self, Q, Qaux, mesh, model):
         """Create runtime."""
-        mesh.resolve_periodic_bcs(model.boundary_conditions)
+        mesh = ensure_lsq_mesh(mesh, model)
+        if hasattr(mesh, "resolve_periodic_bcs"):
+            mesh.resolve_periodic_bcs(model.boundary_conditions)
         jax_mesh = convert_mesh_to_jax(mesh)
         Q = jnp.asarray(Q)
         Qaux = jnp.asarray(Qaux)

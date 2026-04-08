@@ -25,6 +25,7 @@ from zoomy_core.fvm.solver_numpy import HyperbolicSolver as HyperbolicSolverNump
 from zoomy_core.fvm.solver_numpy import Solver as SolverNumpy
 from zoomy_jax.transformation.to_jax import JaxRuntimeModel
 from zoomy_jax.mesh.mesh import convert_mesh_to_jax
+from zoomy_core.mesh import ensure_lsq_mesh
 
 
 def log_callback_hyperbolic(iteration, time, dt, time_stamp, log_every=10):
@@ -169,6 +170,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
     def create_runtime(self, Q, Qaux, mesh, model):
         """Create runtime."""
+        mesh = ensure_lsq_mesh(mesh, model)
         jax_mesh = convert_mesh_to_jax(mesh)
         Q, Qaux = jnp.asarray(Q), jnp.asarray(Qaux)
         parameters = jnp.asarray(model.parameter_values)
