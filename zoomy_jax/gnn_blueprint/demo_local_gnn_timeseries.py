@@ -1,7 +1,6 @@
 import argparse
 import sys
 from pathlib import Path
-from urllib.request import urlopen
 
 import equinox as eqx
 import jax
@@ -33,25 +32,12 @@ class TinyMessagePassing(eqx.Module):
         return self.w_node * graph.nodes[:, 0] + agg + self.b_node
 
 
-def _download_mesh_h5(mesh_name: str, out_path: Path) -> Path:
-    base_url = "https://zoomylab.github.io/meshes/meshes/"
-    candidates = [f"{mesh_name}.h5", f"{mesh_name}_mesh.h5"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    last_error = None
-    for filename in candidates:
-        try:
-            with urlopen(base_url + filename) as response:
-                out_path.write_bytes(response.read())
-            return out_path
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"Could not download mesh '{mesh_name}'") from last_error
-
-
 def _resolve_mesh_file(repo_root: Path, mesh_name: str, mesh_h5: Path) -> Path:
     if mesh_name:
-        target = mesh_h5.parent / f"{mesh_name}.h5"
-        return target if target.exists() else _download_mesh_h5(mesh_name, target)
+        _ensure_local_imports()
+        from zoomy_core.mesh.mesh_catalog import MeshCatalog
+        catalog = MeshCatalog()
+        return catalog.download(mesh_name, size="medium", filetype="h5", folder=mesh_h5.parent)
     return mesh_h5 if mesh_h5.is_absolute() else (repo_root / mesh_h5)
 
 
@@ -86,7 +72,7 @@ def _build_cell_graph(mesh) -> jraph.GraphsTuple:
 
 def run_demo(mesh_file: Path, output_h5: Path, vtk_name: str, n_steps: int, dt: float) -> None:
     _ensure_local_imports()
-    from zoomy_core.mesh.mesh import Mesh
+    from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
     from zoomy_core.misc import io as core_io
     from zoomy_jax.mesh.mesh import convert_mesh_to_jax
     from zoomy_jax.misc.io import get_save_fields
