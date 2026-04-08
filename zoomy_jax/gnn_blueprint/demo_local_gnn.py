@@ -2,7 +2,6 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
-from urllib.request import urlopen
 
 import equinox as eqx
 import jax
@@ -96,34 +95,13 @@ def _build_cell_graph(mesh) -> jraph.GraphsTuple:
 
 
 def _load_mesh(mesh_file: Path):
-    from zoomy_core.mesh.mesh import Mesh
+    from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
 
     if mesh_file.suffix == ".h5":
         return Mesh.from_hdf5(str(mesh_file))
     if mesh_file.suffix == ".msh":
         return Mesh.from_gmsh(str(mesh_file))
     raise ValueError(f"Unsupported mesh format: {mesh_file}")
-
-
-def _download_mesh_h5(mesh_name: str, out_path: Path) -> Path:
-    base_url = "https://zoomylab.github.io/meshes/meshes/"
-    candidates = [f"{mesh_name}.h5", f"{mesh_name}_mesh.h5"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    last_error = None
-    for filename in candidates:
-        url = base_url + filename
-        try:
-            with urlopen(url) as response:
-                data = response.read()
-            out_path.write_bytes(data)
-            return out_path
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(
-        f"Could not download mesh '{mesh_name}'. Tried: {candidates}"
-    ) from last_error
 
 
 def _resolve_mesh_file(repo_root: Path, args) -> Path:
@@ -133,10 +111,9 @@ def _resolve_mesh_file(repo_root: Path, args) -> Path:
 
     # Preferred path: download/use HDF5 mesh to bypass petsc4py.
     if args.mesh_name:
-        downloaded = mesh_h5.parent / f"{args.mesh_name}.h5"
-        if downloaded.exists():
-            return downloaded
-        return _download_mesh_h5(args.mesh_name, downloaded)
+        from zoomy_core.mesh.mesh_catalog import MeshCatalog
+        catalog = MeshCatalog()
+        return catalog.download(args.mesh_name, size="medium", filetype="h5", folder=mesh_h5.parent)
 
     if mesh_h5.exists():
         return mesh_h5

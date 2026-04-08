@@ -1,6 +1,5 @@
 import sys
 from pathlib import Path
-from urllib.request import urlopen
 
 import jax.numpy as jnp
 import jraph
@@ -15,19 +14,15 @@ def ensure_local_imports() -> Path:
     return repo_root
 
 
+def _get_catalog():
+    ensure_local_imports()
+    from zoomy_core.mesh.mesh_catalog import MeshCatalog
+    return MeshCatalog()
+
+
 def download_mesh_h5(mesh_name: str, out_path: Path) -> Path:
-    base_url = "https://zoomylab.github.io/meshes/meshes/"
-    candidates = [f"{mesh_name}.h5", f"{mesh_name}_mesh.h5"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    last_error = None
-    for filename in candidates:
-        try:
-            with urlopen(base_url + filename) as response:
-                out_path.write_bytes(response.read())
-            return out_path
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"Could not download mesh '{mesh_name}'") from last_error
+    catalog = _get_catalog()
+    return catalog.download(mesh_name, size="medium", filetype="h5", folder=out_path.parent)
 
 
 def resolve_mesh_h5(repo_root: Path, mesh_name: str, mesh_h5: Path) -> Path:
@@ -43,7 +38,7 @@ def resolve_mesh_h5(repo_root: Path, mesh_name: str, mesh_h5: Path) -> Path:
 
 def load_mesh_jax(mesh_h5: Path):
     ensure_local_imports()
-    from zoomy_core.mesh.mesh import Mesh
+    from zoomy_core.mesh.lsq_mesh import LSQMesh as Mesh
     from zoomy_jax.mesh.mesh import convert_mesh_to_jax
 
     mesh = Mesh.from_hdf5(str(mesh_h5))
