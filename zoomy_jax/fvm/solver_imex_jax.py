@@ -1,4 +1,12 @@
-"""Module `zoomy_jax.fvm.solver_imex_jax`."""
+"""JAX IMEX solver: explicit flux + implicit diffusion + implicit source.
+
+Extends ``HyperbolicSolver`` (JAX) with:
+- RK2 for explicit stage when reconstruction_order >= 2
+- Implicit diffusion via Crank-Nicolson (DiffusionOperatorJAX)
+- Implicit source stepping: local (cell-wise Newton) or global (Newton-GMRES)
+
+All operations are JIT-compatible inside ``jax.lax.while_loop``.
+"""
 
 import time as _time
 from dataclasses import dataclass
@@ -20,7 +28,7 @@ from zoomy_jax.transformation.to_jax import JaxRuntimeModel
 
 @dataclass
 class IMEXStats:
-    """IMEXStats. (class)."""
+    """Statistics from an IMEX solve."""
     n_steps: int = 0
     source_mode: str = "auto"
     implicit_calls: int = 0
@@ -31,13 +39,62 @@ class IMEXStats:
     total_time_s: float = 0.0
 
 
-class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
-    """
-    Pure-JAX IMEX solver whose entire time integration compiles into a
-    single XLA program via ``jax.lax.while_loop``.
+def _param_value(model, name, default=None):
+    """Extract a scalar parameter value from a symbolic model."""
+    if hasattr(model, 'parameters'):
+        keys = list(model.parameters.keys())
+        if name in keys:
+            idx = keys.index(name)
+            return float(model.parameter_values[idx])
+    return default
 
-    Local sources  -> cell-wise Newton via ``jax.lax.fori_loop``
-    Global sources -> Newton-GMRES via ``jax.lax.while_loop``
+
+def _build_diffusion_operators_jax(mesh_numpy, symbolic_model, dim, n_vars):
+    """Build JAX DiffusionOperator for each variable (if model has diffusion).
+
+    Parameters
+    ----------
+    mesh_numpy : BaseMesh / LSQMesh
+        The original NumPy mesh (before JAX conversion). Needed for
+        assembling the Laplacian with Python loops.
+    symbolic_model : Model
+        The symbolic model (has diffusive_flux, parameters, etc.)
+    dim : int
+    n_vars : int
+
+    Returns
+    -------
+    dict or None
+        {var_index: DiffusionOperatorJAX} or None if no diffusion.
+    """
+    if not hasattr(symbolic_model, 'diffusive_flux'):
+        return None
+    sym_dflux = symbolic_model.diffusive_flux()
+    is_zero = hasattr(sym_dflux, 'tolist') and all(
+        e == 0 for row in sym_dflux.tolist()
+        for e in (row if isinstance(row, list) else [row])
+    )
+    if is_zero:
+        return None
+    nu_val = _param_value(symbolic_model, "nu", default=0.0)
+    if nu_val <= 0:
+        return None
+    from zoomy_jax.fvm.reconstruction_jax import DiffusionOperatorJAX
+    return {v: DiffusionOperatorJAX(mesh_numpy, dim, nu=nu_val)
+            for v in range(n_vars)}
+
+
+class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
+    """Pure-JAX IMEX solver with implicit diffusion and source stepping.
+
+    The entire time integration compiles into a single XLA program via
+    ``jax.lax.while_loop``.
+
+    Features:
+    - RK2 for explicit advection when reconstruction_order >= 2
+    - Crank-Nicolson implicit diffusion via DiffusionOperatorJAX
+    - Local sources  -> cell-wise Newton via ``jax.lax.fori_loop``
+    - Global sources -> Newton-GMRES via ``jax.lax.while_loop``
     """
 
     source_mode = "auto"          # "auto" | "local" | "global"
@@ -66,7 +123,7 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         return Q, Qaux, parameters, jax_mesh, runtime_model
 
     def _resolve_source_mode(self, model):
-        """Internal helper `_resolve_source_mode`."""
+        """Resolve source mode."""
         if self.source_mode in ("local", "global"):
             return self.source_mode
         sym = model.model if hasattr(model, "model") else model
@@ -74,7 +131,7 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         return "global" if has else "local"
 
     def _resolve_jv_backend(self):
-        """Internal helper `_resolve_jv_backend`."""
+        """Resolve Jacobian-vector product backend."""
         return self.jv_backend if self.jv_backend in ("analytic", "fd", "ad") else "ad"
 
     # ── pure closures for JIT tracing ────────────────────────────────────
@@ -91,7 +148,6 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         key_idx = sym.derivative_key_to_index
 
         def _uq(Q, Qaux, Qold, dt):
-            """Internal helper `_uq`."""
             out = jnp.array(Qaux)
             for sp in specs:
                 i_aux = key_idx[sp.key]
@@ -102,7 +158,8 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                 if n_t == 1:
                     data = (Q[i_q] - Qold[i_q]) / jnp.maximum(dt, 1e-14)
                 if n_x > 0:
-                    data = compute_derivatives(data, mesh, derivatives_multi_index=[[n_x]])[:, 0]
+                    data = compute_derivatives(
+                        data, mesh, derivatives_multi_index=[[n_x]])[:, 0]
                 out = out.at[i_aux, :].set(data)
             return out
 
@@ -112,9 +169,7 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
     def _build_implicit_local(runtime_model, parameters, n_vars, maxiter):
         """Cell-wise Newton via fori_loop."""
         def _impl(Qexp, Qaux, dt):
-            """Internal helper `_impl`."""
             def body(i, Q):
-                """Body."""
                 S = runtime_model.source(Q, Qaux, parameters)
                 Jq = runtime_model.source_jacobian_wrt_variables(Q, Qaux, parameters)
                 A = jnp.eye(n_vars, dtype=Q.dtype)[:, :, None] - dt * Jq
@@ -132,11 +187,9 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                                jv_backend, fd_eps):
         """Newton-GMRES via while_loop with early exit on convergence."""
         def _impl(Qexp, Qauxold, Qold, time_now, dt):
-            """Internal helper `_impl`."""
             q_shape = Qexp.shape
 
             def residual(Qstate):
-                """Residual."""
                 Qa = update_qaux(Qstate, Qauxold, Qold, dt)
                 Qbc = boundary_op(time_now, Qstate, Qa, parameters)
                 S = runtime_model.source(Qbc, Qa, parameters)
@@ -144,17 +197,14 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
 
             if jv_backend == "ad":
                 def matvec(Qc, _Rc, v):
-                    """Matvec."""
                     V = v.reshape(q_shape)
                     return jax.jvp(residual, (Qc,), (V,))[1].reshape(-1)
             elif jv_backend == "fd":
                 def matvec(Qc, Rc, v):
-                    """Matvec."""
                     V = v.reshape(q_shape)
                     return ((residual(Qc + fd_eps * V) - Rc) / fd_eps).reshape(-1)
             else:
                 def matvec(Qc, _Rc, v):
-                    """Matvec."""
                     V = v.reshape(q_shape)
                     Qa = update_qaux(Qc, Qauxold, Qold, dt)
                     jvs = analytic_source_jvp_jax(
@@ -163,12 +213,10 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                     return (V - dt * jvs).reshape(-1)
 
             def cond(state):
-                """Cond."""
                 _, _, rnorm, i = state
                 return jnp.logical_and(i < maxiter, rnorm > tol)
 
             def body(state):
-                """Body."""
                 Q, R, _rnorm, i = state
                 b = (-R).reshape(-1)
                 delta, info = jax_gmres(
@@ -186,15 +234,53 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
 
         return _impl
 
+    @staticmethod
+    def _build_implicit_diffusion(diffusion_ops_jax, bc_op, parameters):
+        """Build a JIT-compatible implicit diffusion closure.
+
+        Parameters
+        ----------
+        diffusion_ops_jax : dict or None
+            {var_index: DiffusionOperatorJAX} mapping.
+        bc_op : callable
+            Boundary condition operator.
+        parameters : jnp.ndarray
+            Model parameters.
+
+        Returns
+        -------
+        callable or None
+            (Q, Qaux, dt, time) -> Q_diffused, or None if no diffusion.
+        """
+        if diffusion_ops_jax is None:
+            return None
+
+        var_indices = sorted(diffusion_ops_jax.keys())
+        ops = [diffusion_ops_jax[v] for v in var_indices]
+
+        def _apply_diffusion(Q, Qaux, dt, time):
+            for v_idx, op in zip(var_indices, ops):
+                u_diffused = op.implicit_solve(Q[v_idx, :], dt)
+                Q = Q.at[v_idx, :].set(u_diffused)
+            Q = bc_op(time, Q, Qaux, parameters)
+            return Q
+
+        return _apply_diffusion
+
     # ── main entry point ─────────────────────────────────────────────────
 
     def solve(self, mesh, model, write_output=False):
-        """Solve."""
+        """Full IMEX solve: setup + JIT-compiled time loop."""
         t0_wall = _time.time()
 
-        Q, Qaux = self.initialize(mesh, model)
+        # Keep reference to NumPy mesh for diffusion operator assembly
+        mesh_numpy = ensure_lsq_mesh(mesh, model)
+        if hasattr(mesh_numpy, "resolve_periodic_bcs"):
+            mesh_numpy.resolve_periodic_bcs(model.boundary_conditions)
+
+        Q, Qaux = self.initialize(mesh_numpy, model)
         Q, Qaux, parameters, jmesh, rmodel = self.create_runtime(
-            Q, Qaux, mesh, model)
+            Q, Qaux, mesh_numpy, model)
 
         source_mode = self._resolve_source_mode(rmodel)
         jv_backend = self._resolve_jv_backend()
@@ -218,6 +304,16 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         compute_dt_fn = self.compute_dt
         sym_model = rmodel.model if hasattr(rmodel, "model") else None
 
+        # Build diffusion operators from the NumPy mesh
+        symbolic_model = sym_model if sym_model is not None else rmodel
+        diff_ops = _build_diffusion_operators_jax(
+            mesh_numpy, symbolic_model,
+            symbolic_model.dimension, n_vars)
+
+        # Build implicit diffusion closure
+        impl_diffusion = self._build_implicit_diffusion(
+            diff_ops, bc_op, parameters)
+
         if source_mode == "local":
             impl = self._build_implicit_local(
                 rmodel, parameters, n_vars, self.implicit_maxiter)
@@ -228,28 +324,34 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                 self.gmres_tol, self.gmres_maxiter,
                 jv_backend, self.fd_eps)
 
+        # Select ODE stepper: RK2 for 2nd-order, RK1 for 1st-order
+        ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
+
         # ── build the full loop ──────────────────────────────────────────
 
         def run_loop(Q0, Qa0, max_steps):
-            """Run loop."""
             init = (jnp.asarray(0.0, dtype=Q0.dtype),
                     Q0, Qa0,
                     jnp.asarray(0, dtype=jnp.int32))
 
             def cond(s):
-                """Cond."""
                 return jnp.logical_and(s[0] < time_end, s[3] < max_steps)
 
             def step(s):
-                """Step."""
                 t, Qn, Qan, ns = s
                 dt = compute_dt_fn(
                     Qn, Qan, parameters, h_face, ev_op)
                 dt = jnp.minimum(dt, time_end - t)
 
-                Qe = ode.RK1(flux_op, Qn, Qan, parameters, dt)
+                # Explicit flux step (RK1 or RK2)
+                Qe = ode_step(flux_op, Qn, Qan, parameters, dt)
                 Qe = bc_op(t, Qe, Qan, parameters)
 
+                # Implicit diffusion step (Crank-Nicolson)
+                if impl_diffusion is not None:
+                    Qe = impl_diffusion(Qe, Qan, dt, t)
+
+                # Implicit source step
                 if source_mode == "local":
                     Qa_imp = uq(Qe, Qan, Qn, dt)
                     Qi = impl(Qe, Qa_imp, dt)
@@ -265,7 +367,11 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         t_init = _time.time() - t0_wall
 
         # AOT compile
-        logger.info(f"JIT-compiling IMEX loop (source_mode={source_mode}, jv={jv_backend}) ...")
+        has_diff = impl_diffusion is not None
+        logger.info(
+            f"JIT-compiling IMEX loop (source_mode={source_mode}, "
+            f"jv={jv_backend}, ode={'RK2' if self.reconstruction_order >= 2 else 'RK1'}, "
+            f"diffusion={'CN' if has_diff else 'none'}) ...")
         t_c0 = _time.time()
         lowered = jax.jit(run_loop).lower(
             Qnew, Qauxnew, jnp.int32(0))

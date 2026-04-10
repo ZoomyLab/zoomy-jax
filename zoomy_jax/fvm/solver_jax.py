@@ -1,4 +1,15 @@
-"""Module `zoomy_jax.fvm.solver_jax`."""
+"""JAX FVM solvers: JIT-compiled time stepping.
+
+Solver hierarchy (mirrors NumPy):
+    HyperbolicSolver  (explicit flux + source)
+      setup_simulation  — mesh/model → JAX operators (closures)
+      step              — single explicit timestep
+      run_simulation    — jax.lax.while_loop over step
+      solve             — init + setup + run
+
+Inherits param definitions from NumPy ``HyperbolicSolverNumpy`` but
+overrides all computational methods with JAX implementations.
+"""
 
 import os
 from time import time as gettime
@@ -7,10 +18,8 @@ import jax
 from functools import partial
 import jax.numpy as jnp
 from jax.scipy.sparse.linalg import gmres
-# from jaxopt import Broyden
 
 import param
-
 
 from zoomy_core.misc.logger_config import logger
 
@@ -27,6 +36,8 @@ from zoomy_jax.transformation.to_jax import JaxRuntimeModel
 from zoomy_jax.mesh.mesh import convert_mesh_to_jax
 from zoomy_core.mesh import ensure_lsq_mesh
 
+
+# ── Logging callbacks (used by io_callback inside JIT) ──────────────────────
 
 def log_callback_hyperbolic(iteration, time, dt, time_stamp, log_every=10):
     """Log callback hyperbolic."""
@@ -51,6 +62,8 @@ def log_callback_execution_time(time):
     logger.info(f"Finished simulation with in {time:.3f} seconds")
     return None
 
+
+# ── Newton solver (for PoissonSolver) ───────────────────────────────────────
 
 def newton_solver(residual):
     """Newton solver."""
@@ -100,24 +113,14 @@ def newton_solver(residual):
                 """Lin op."""
                 return Jv(Q, v)
 
-            # Preconditioner
-            # diag_J = compute_diagonal_of_jacobian(Q)
-            # # regularize diagonal to avoid division by zero
-            # diag_J = jnp.where(jnp.abs(diag_J) > 1e-12, diag_J, 1.0)
-            # def preconditioner(v):
-            #    return v / diag_J
-
             delta, info = gmres(
                 lin_op,
                 -r,
                 x0=jnp.zeros_like(Q),
-                # x0=Qold,
                 maxiter=10,
                 solve_method="incremental",
-                # solve_method="batched",
                 restart=100,
                 tol=1e-6,
-                # M=preconditioner,
             )
 
             def backtrack(alpha, Q, delta, r):
@@ -159,8 +162,14 @@ def newton_solver(residual):
     return newton_solve
 
 
+# ── HyperbolicSolver ────────────────────────────────────────────────────────
+
 class HyperbolicSolver(HyperbolicSolverNumpy):
-    """JAX HyperbolicSolver — JIT-compiled time stepping."""
+    """JAX HyperbolicSolver — JIT-compiled explicit time stepping.
+
+    Follows the setup_simulation / step / run_simulation pattern.
+    Inherits param definitions from the NumPy base class.
+    """
 
     def __init__(self, **kwargs):
         # Default: centered conservative flux + nonconservative-only fluctuations.
@@ -172,14 +181,18 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         )
         super().__init__(**kwargs)
 
+    # ── Runtime creation ────────────────────────────────────────────────
+
     def create_runtime(self, Q, Qaux, mesh, model):
-        """Create runtime."""
+        """Create JAX runtime: convert mesh and model to JAX-compatible forms."""
         mesh = ensure_lsq_mesh(mesh, model)
         jax_mesh = convert_mesh_to_jax(mesh)
         Q, Qaux = jnp.asarray(Q), jnp.asarray(Qaux)
         parameters = jnp.asarray(model.parameter_values)
         runtime_model = JaxRuntimeModel(model)
         return Q, Qaux, parameters, jax_mesh, runtime_model
+
+    # ── State update (vmap over cells) ──────────────────────────────────
 
     def update_q(self, Q, Qaux, mesh, model, parameters):
         """JIT-compatible update_variables via vmap (replaces NumPy cell loop)."""
@@ -196,7 +209,10 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         Q_updated = jax.vmap(_update_cell, in_axes=(1, 1), out_axes=1)(Q, Qaux)
         return Q_updated
 
+    # ── Operator builders ───────────────────────────────────────────────
+
     def get_compute_source(self, mesh, model):
+        """Build JIT-compiled source operator."""
         @jax.jit
         @partial(jax.named_call, name="source")
         def compute_source(dt, Q, Qaux, parameters, dQ):
@@ -213,6 +229,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return compute_source
 
     def get_compute_source_jacobian(self, mesh, model):
+        """Build JIT-compiled source Jacobian operator."""
         @jax.jit
         @partial(jax.named_call, name="source_jacobian")
         def compute_source(dt, Q, Qaux, parameters, dQ):
@@ -229,32 +246,12 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return compute_source
 
     def get_apply_boundary_conditions(self, mesh, model):
-        """
-        Returns a JAX-compatible function that applies boundary
-        conditions using the new unified `model.boundary_conditions`.
-        """
+        """Build JIT-compiled boundary condition operator."""
 
         @jax.jit
         @partial(jax.named_call, name="apply_boundary_conditions")
         def apply_boundary_conditions(time, Q, Qaux, parameters):
-            """
-            JAX version of the boundary condition application.
-
-            Mirrors the NumPy logic:
-                - Loops over boundary faces
-                - Computes distance, position, normal, etc.
-                - Calls `model.boundary_conditions(...)`
-                - Updates ghost cells in Q
-
-            Args:
-                time: scalar
-                Q: (Q_dim, n_cells)
-                Qaux: (Qaux_dim, n_cells)
-                parameters: model parameters (pytree)
-
-            Returns:
-                Updated Q with ghost cells set by boundary conditions.
-            """
+            """Apply boundary conditions to ghost cells (JAX fori_loop)."""
 
             def loop_body(i, Q):
                 i = jnp.asarray(i, dtype=jnp.int32)
@@ -293,11 +290,11 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return apply_boundary_conditions
 
     def get_compute_max_abs_eigenvalue(self, mesh, model):
+        """Build JIT-compiled max eigenvalue computation."""
         @jax.jit
         @partial(jax.named_call, name="max_abs_eigenvalue")
         def compute_max_abs_eigenvalue(Q, Qaux, parameters):
-            """Compute max abs eigenvalue."""
-            max_abs_eigenvalue = -jnp.inf
+            """Compute max abs eigenvalue (scalar)."""
             i_cellA = mesh.face_cells[0]
             i_cellB = mesh.face_cells[1]
             qA = Q[:, i_cellA]
@@ -323,7 +320,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return ConstantReconstruction(mesh, dim)
 
     def get_flux_operator(self, mesh, model):
-        """Get flux operator with reconstruction."""
+        """Build flux operator with reconstruction (conservative + nonconservative)."""
         compute_num_flux = self._jax_flux.get_flux_operator(model)
         compute_nc_flux = self._jax_nc_flux.get_flux_operator(model)
 
@@ -373,133 +370,265 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return flux_operator
 
-    # @jax.jit
-    # @partial(jax.named_call, name="hyperbolic solver")
-    def solve(self, mesh, model, write_output=True):
-        """Solve."""
+    # ── setup_simulation / step / run_simulation ────────────────────────
+
+    def setup_simulation(self, mesh, model):
+        """Build all JAX operators from mesh and model.
+
+        Converts mesh to MeshJAX, model to JaxRuntimeModel, and creates
+        closures for flux, source, boundary conditions, and eigenvalue
+        computation. The operators are stored as attributes for use by
+        ``step`` and ``run_simulation``.
+
+        Returns
+        -------
+        Q, Qaux : jnp.ndarray
+            Initial state arrays on device.
+        """
         mesh = ensure_lsq_mesh(mesh, model)
         Q, Qaux = self.initialize(mesh, model)
+        Q, Qaux, parameters, jax_mesh, runtime_model = self.create_runtime(
+            Q, Qaux, mesh, model
+        )
 
-        Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
+        # Store runtime state for step / run_simulation
+        self._rt_mesh = jax_mesh
+        self._rt_model = runtime_model
+        self._rt_parameters = parameters
 
-        # init once with dummy values for dt
-        Qaux = self.update_qaux(Q, Qaux, Q, Qaux, mesh, model, parameters, 0.0, 1.0)
+        # Build operators (closures over jax_mesh / runtime_model)
+        self._rt_flux_op = self.get_flux_operator(jax_mesh, runtime_model)
+        self._rt_source_op = self.get_compute_source(jax_mesh, runtime_model)
+        self._rt_bc_op = self.get_apply_boundary_conditions(jax_mesh, runtime_model)
+        self._rt_eigenvalue_op = self.get_compute_max_abs_eigenvalue(
+            jax_mesh, runtime_model
+        )
+
+        # Precompute scalar used for CFL
+        self._rt_min_inradius = jnp.min(jax_mesh.cell_inradius)
+
+        # Initial aux update
+        Qaux = self.update_qaux(
+            Q, Qaux, Q, Qaux, jax_mesh, runtime_model, parameters, 0.0, 1.0
+        )
+
+        # Apply initial BCs
+        Q = self._rt_bc_op(jnp.asarray(0.0, dtype=Q.dtype), Q, Qaux, parameters)
+
+        # Move to device
+        Q = jax.device_put(Q)
+        Qaux = jax.device_put(Qaux)
+        self._rt_mesh = jax.device_put(jax_mesh)
+
+        return Q, Qaux
+
+    def step(self, dt, Q, Qaux):
+        """Perform a single explicit time step.
+
+        Pipeline:
+            1. Reconstruct + flux operator (RK1 or RK2 depending on order)
+            2. Source operator (RK1)
+            3. Apply boundary conditions
+            4. Update Q (e.g. clamp, ramp)
+
+        This method is JIT-compatible when called inside ``run_simulation``.
+
+        Parameters
+        ----------
+        dt : scalar
+            Time step size.
+        Q : jnp.ndarray, shape (n_vars, n_cells)
+            Conservative state.
+        Qaux : jnp.ndarray, shape (n_aux, n_cells)
+            Auxiliary state.
+
+        Returns
+        -------
+        Q_new : jnp.ndarray
+            Updated state after one step.
+        """
+        parameters = self._rt_parameters
+
+        # Flux step (order-appropriate Runge-Kutta)
+        ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
+        Q = ode_step(self._rt_flux_op, Q, Qaux, parameters, dt)
+
+        # Source step
+        Q = ode.RK1(self._rt_source_op, Q, Qaux, parameters, dt)
+
+        return Q
+
+    def post_step(self, time, dt, Q, Qold, Qaux):
+        """Post-step processing: BCs, update_q, update_qaux.
+
+        Separated from ``step`` so that subclasses (e.g. IMEX) can insert
+        implicit solves between the explicit step and the post-processing.
+
+        Parameters
+        ----------
+        time : scalar
+            Current simulation time (after dt advance).
+        dt : scalar
+            Time step size.
+        Q : jnp.ndarray
+            State after explicit step.
+        Qold : jnp.ndarray
+            State before the step (for aux updates).
+        Qaux : jnp.ndarray
+            Auxiliary state before the step.
+
+        Returns
+        -------
+        Q_new, Qaux_new : jnp.ndarray
+            Fully updated state and auxiliary arrays.
+        """
+        mesh = self._rt_mesh
+        model = self._rt_model
+        parameters = self._rt_parameters
+
+        # Boundary conditions
+        Q = self._rt_bc_op(time, Q, Qaux, parameters)
+
+        # Update variables (clamp, etc.)
+        Q = self.update_q(Q, Qaux, mesh, model, parameters)
+
+        # Update auxiliary variables
+        Qaux = self.update_qaux(
+            Q, Qaux, Qold, Qaux, mesh, model, parameters, time, dt
+        )
+
+        return Q, Qaux
+
+    def compute_timestep(self, Q, Qaux):
+        """Compute the adaptive time step using the stored eigenvalue operator.
+
+        JIT-compatible. Uses ``self.compute_dt`` (from param) with the
+        precomputed eigenvalue operator and min inradius.
+
+        Returns
+        -------
+        dt : scalar
+        """
+        return self.compute_dt(
+            Q, Qaux, self._rt_parameters,
+            self._rt_min_inradius, self._rt_eigenvalue_op,
+        )
+
+    def run_simulation(self, Q, Qaux, write_output=True):
+        """JIT-compiled time loop using jax.lax.while_loop.
+
+        Calls ``compute_timestep`` -> ``step`` -> ``post_step`` in a
+        while_loop until ``time >= time_end``.
+
+        Parameters
+        ----------
+        Q, Qaux : jnp.ndarray
+            Initial state (from ``setup_simulation``).
+        write_output : bool
+            Whether to write snapshots to HDF5.
+
+        Returns
+        -------
+        Q, Qaux : jnp.ndarray
+            Final state.
+        """
+        mesh = self._rt_mesh
 
         if write_output:
             output_hdf5_path = os.path.join(
                 self.settings.output.directory, f"{self.settings.output.filename}.h5"
             )
+            io.init_output_directory(
+                self.settings.output.directory, self.settings.output.clean_directory
+            )
+            mesh.write_to_hdf5(output_hdf5_path)
+            io.save_settings(self.settings)
             save_fields = jax_io.get_save_fields(output_hdf5_path, write_all=False)
         else:
-
             def save_fields(time, time_stamp, i_snapshot, Q, Qaux):
                 """Save field."""
                 return i_snapshot
 
-        Q = jax.device_put(Q)
-        Qaux = jax.device_put(Qaux)
-        mesh = jax.device_put(mesh)
+        dt_snapshot = self.time_end / max(self.settings.output.snapshots - 1, 1)
+        i_snapshot = save_fields(0.0, 0.0, 0.0, Q, Qaux)
+        time_end = self.time_end
 
-        def run(Q, Qaux, parameters, model):
-            """Run."""
-            iteration = 0.0
-            time = 0.0
+        # Capture self references for the JIT closure
+        _step = self.step
+        _post_step = self.post_step
+        _compute_timestep = self.compute_timestep
 
-            i_snapshot = 0.0
-            dt_snapshot = self.time_end / (self.settings.output.snapshots - 1)
-            if write_output:
-                io.init_output_directory(
-                    self.settings.output.directory, self.settings.output.clean_directory
+        @jax.jit
+        @partial(jax.named_call, name="time_loop")
+        def time_loop(time, iteration, i_snapshot, Q, Qaux):
+            """JIT-compiled time loop."""
+            loop_val = (time, iteration, i_snapshot, Q, Qaux)
+
+            @partial(jax.named_call, name="time_step")
+            def loop_body(init_value):
+                """Single iteration of the time loop."""
+                time, iteration, i_snapshot, Qnew, Qauxnew = init_value
+
+                Qold = Qnew
+
+                dt = _compute_timestep(Qnew, Qauxnew)
+                dt = jnp.minimum(dt, time_end - time)
+
+                # Explicit step
+                Q_stepped = _step(dt, Qnew, Qauxnew)
+
+                # Post-step: BCs + update_q + update_qaux
+                time_new = time + dt
+                Q_final, Qaux_final = _post_step(
+                    time_new, dt, Q_stepped, Qold, Qauxnew
                 )
-                mesh.write_to_hdf5(output_hdf5_path)
-                io.save_settings(self.settings)
-            i_snapshot = save_fields(time, 0.0, i_snapshot, Q, Qaux)
 
-            Qnew = Q
+                iteration_new = iteration + 1
+                time_stamp = i_snapshot * dt_snapshot
 
-            min_inradius = jnp.min(mesh.cell_inradius)
+                i_snapshot_new = save_fields(
+                    time_new, time_stamp, i_snapshot, Q_final, Qaux_final
+                )
 
-            compute_max_abs_eigenvalue = self.get_compute_max_abs_eigenvalue(
-                mesh, model
+                jax.experimental.io_callback(
+                    log_callback_hyperbolic, None,
+                    iteration_new, time_new, dt, time_stamp,
+                )
+
+                return (time_new, iteration_new, i_snapshot_new, Q_final, Qaux_final)
+
+            def proceed(loop_val):
+                """Check if simulation should continue."""
+                time, iteration, i_snapshot, Qnew, Qaux = loop_val
+                return time < time_end
+
+            (time, iteration, i_snapshot, Qnew, Qauxnew) = jax.lax.while_loop(
+                proceed, loop_body, loop_val
             )
-            flux_operator = self.get_flux_operator(mesh, model)
-            source_operator = self.get_compute_source(mesh, model)
-            boundary_operator = self.get_apply_boundary_conditions(mesh, model)
-            Qnew = boundary_operator(time, Qnew, Qaux, parameters)
 
-            @jax.jit
-            @partial(jax.named_call, name="time loop")
-            def time_loop(time, iteration, i_snapshot, Qnew, Qaux):
-                """Time loop."""
-                loop_val = (time, iteration, i_snapshot, Qnew, Qaux)
+            return Qnew, Qauxnew
 
-                @partial(jax.named_call, name="time_step")
-                def loop_body(init_value):
-                    """Loop body."""
-                    time, iteration, i_snapshot, Qnew, Qauxnew = init_value
+        Q, Qaux = time_loop(0.0, 0.0, i_snapshot, Q, Qaux)
+        return Q, Qaux
 
-                    Q = Qnew
-                    Qaux = Qauxnew
+    # ── solve (top-level entry point) ───────────────────────────────────
 
-                    dt = self.compute_dt(
-                        Q, Qaux, parameters, min_inradius, compute_max_abs_eigenvalue
-                    )
-                    dt = jnp.minimum(dt, self.time_end - time)
+    def solve(self, mesh, model, write_output=True):
+        """Full solve: initialize -> setup -> run.
 
-                    ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
-                    Q1 = ode_step(flux_operator, Q, Qaux, parameters, dt)
-                    Q2 = ode.RK1(
-                        source_operator,
-                        Q1,
-                        Qaux,
-                        parameters,
-                        dt,
-                    )
-
-                    Q3 = boundary_operator(time, Q2, Qaux, parameters)
-
-                    # Update solution and time
-                    time += dt
-                    iteration += 1
-
-                    time_stamp = (i_snapshot) * dt_snapshot
-
-                    Qnew = self.update_q(Q3, Qaux, mesh, model, parameters)
-                    Qauxnew = self.update_qaux(
-                        Qnew, Qaux, Q, Qaux, mesh, model, parameters, time, dt
-                    )
-
-                    i_snapshot = save_fields(
-                        time, time_stamp, i_snapshot, Qnew, Qauxnew
-                    )
-
-                    jax.experimental.io_callback(
-                        log_callback_hyperbolic, None, iteration, time, dt, time_stamp
-                    )
-
-                    return (time, iteration, i_snapshot, Qnew, Qauxnew)
-
-                def proceed(loop_val):
-                    """Proceed."""
-                    time, iteration, i_snapshot, Qnew, Qaux = loop_val
-                    return time < self.time_end
-
-                (time, iteration, i_snapshot, Qnew, Qauxnew) = jax.lax.while_loop(
-                    proceed, loop_body, loop_val
-                )
-
-                return Qnew
-
-            Qnew = time_loop(time, iteration, i_snapshot, Qnew, Qaux)
-            return Qnew, Qaux
-
+        This is the main entry point, compatible with the NumPy solver
+        interface. Calls ``setup_simulation`` then ``run_simulation``.
+        """
         time_start = gettime()
-        Qnew, Qaux = run(Q, Qaux, parameters, model)
+        Q, Qaux = self.setup_simulation(mesh, model)
+        Q, Qaux = self.run_simulation(Q, Qaux, write_output=write_output)
         jax.experimental.io_callback(
             log_callback_execution_time, None, gettime() - time_start
         )
-        return Qnew, Qaux
+        return Q, Qaux
 
+
+# ── PoissonSolver ───────────────────────────────────────────────────────────
 
 class PoissonSolver(SolverNumpy):
     """PoissonSolver. (class)."""
@@ -514,7 +643,6 @@ class PoissonSolver(SolverNumpy):
             )
             q = boundary_operator(time, Q, qaux, parameters)
             res = model.residual(q, qaux, parameters)
-            # res = res.at[:, mesh.n_inner_cells:].set((10*(q-Q)**2)[:, mesh.n_inner_cells:])
             res = res.at[:, mesh.n_inner_cells :].set(0.0)
             return res
 
