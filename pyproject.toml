@@ -28,13 +28,10 @@ dependencies = [
 
   # depends on zoomy_core (local or PyPI)
   "zoomy_core>=0.1.14",
-
-  # server included by default (JAX is heavy anyway)
-  "zoomy-server",
 ]
 
-[project.scripts]
-zoomy-serve-jax = "zoomy_server.cli:main"
+[project.optional-dependencies]
+server = ["zoomy-server"]
 
 [project.urls]
 Homepage = "https://github.com/mbd-rwth/Zoomy"
