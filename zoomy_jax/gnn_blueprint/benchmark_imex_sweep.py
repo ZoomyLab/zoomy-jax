@@ -11,7 +11,7 @@ for p in (REPO_ROOT, REPO_ROOT / "library" / "zoomy_core", REPO_ROOT / "library"
         sys.path.insert(0, str(p))
 
 import zoomy_core.fvm.timestepping as timestepping
-import zoomy_core.mesh.mesh as petscMesh
+from zoomy_core.mesh import LSQMesh
 from zoomy_jax.fvm.solver_imex_jax import IMEXSourceSolverJax
 from zoomy_jax.gnn_blueprint.imex_child_solver import IMEXSourceSolverJaxGNNGuess
 from zoomy_jax.gnn_blueprint.cases_gn_topo import make_model as make_gn_topo_model
@@ -54,13 +54,13 @@ def _make_solver(cls, cfl, guess_mode="explicit"):
 
 
 def run_one(case_name, n_cells, cfl, guess_mode):
-    mesh1 = petscMesh.Mesh.create_1d(domain=(0.0, 10.0), n_inner_cells=n_cells, lsq_degree=2)
+    mesh1 = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=n_cells, lsq_degree=2)
     model1 = _build_case(case_name)
     sb = _make_solver(IMEXSourceSolverJax, cfl)
     Qb, _ = sb.solve(mesh1, model1, write_output=False)
     st_b = sb.last_stats
 
-    mesh2 = petscMesh.Mesh.create_1d(domain=(0.0, 10.0), n_inner_cells=n_cells, lsq_degree=2)
+    mesh2 = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=n_cells, lsq_degree=2)
     model2 = _build_case(case_name)
     sc = _make_solver(IMEXSourceSolverJaxGNNGuess, cfl, guess_mode=guess_mode)
     Qc, _ = sc.solve(mesh2, model2, write_output=False)
