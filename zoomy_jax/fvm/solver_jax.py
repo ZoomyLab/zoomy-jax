@@ -163,9 +163,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     """JAX HyperbolicSolver — JIT-compiled time stepping."""
 
     def __init__(self, **kwargs):
-        # Default to JAX flux implementations
-        kwargs.setdefault("flux", fvmflux.Zero())
-        kwargs.setdefault("nc_flux", nonconservative_flux.Rusanov())
+        # Default: centered conservative flux + nonconservative-only fluctuations.
+        # This matches the NumPy NonconservativeRusanov formulation:
+        #   F_num (centered, no dissipation) + Dp/Dm (nc path integral + dissipation)
+        self._jax_flux = kwargs.pop("flux", fvmflux.CenteredFlux())
+        self._jax_nc_flux = kwargs.pop(
+            "nc_flux", nonconservative_flux.NonconservativeRusanov()
+        )
         super().__init__(**kwargs)
 
     def create_runtime(self, Q, Qaux, mesh, model):
@@ -176,6 +180,21 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         parameters = jnp.asarray(model.parameter_values)
         runtime_model = JaxRuntimeModel(model)
         return Q, Qaux, parameters, jax_mesh, runtime_model
+
+    def update_q(self, Q, Qaux, mesh, model, parameters):
+        """JIT-compatible update_variables via vmap (replaces NumPy cell loop)."""
+        if not hasattr(model, 'update_variables'):
+            return Q
+        n_vars = Q.shape[0]
+        has_aux = Qaux.shape[0] > 0
+
+        def _update_cell(q_col, qaux_col):
+            qaux_arg = qaux_col if has_aux else jnp.array([])
+            updated = model.update_variables(q_col, qaux_arg, parameters)
+            return jnp.asarray(updated).ravel()[:n_vars]
+
+        Q_updated = jax.vmap(_update_cell, in_axes=(1, 1), out_axes=1)(Q, Qaux)
+        return Q_updated
 
     def get_compute_source(self, mesh, model):
         @jax.jit
@@ -293,22 +312,39 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return compute_max_abs_eigenvalue
 
+    def _build_reconstruction(self, mesh, symbolic_model):
+        """Build JAX face reconstruction. Override for free-surface variants."""
+        from zoomy_jax.fvm.reconstruction_jax import (
+            ConstantReconstruction, MUSCLReconstruction,
+        )
+        dim = symbolic_model.dimension
+        if self.reconstruction_order >= 2:
+            return MUSCLReconstruction(mesh, dim, limiter=self.limiter)
+        return ConstantReconstruction(mesh, dim)
+
     def get_flux_operator(self, mesh, model):
-        """Get flux operator."""
-        compute_num_flux = self.flux.get_flux_operator(model)
-        compute_nc_flux = self.nc_flux.get_flux_operator(model)
+        """Get flux operator with reconstruction."""
+        compute_num_flux = self._jax_flux.get_flux_operator(model)
+        compute_nc_flux = self._jax_nc_flux.get_flux_operator(model)
+
+        # Build reconstruction (resolved once, not per step)
+        symbolic_model = model.model if hasattr(model, "model") else model
+        reconstruct = self._build_reconstruction(mesh, symbolic_model)
 
         @jax.jit
         @partial(jax.named_call, name="Flux")
         def flux_operator(dt, Q, Qaux, parameters, dQ):
-            """Flux operator."""
+            """Flux operator with conservative flux + nonconservative fluctuation.
+
+            Mirrors NumPy: dQ[iA] -= (F_num + Dm) * fv/cv
+                           dQ[iB] -= (-F_num + Dp) * fv/cv
+            """
             dQ = jnp.zeros_like(dQ)
 
             iA = mesh.face_cells[0]
             iB = mesh.face_cells[1]
 
-            qA = Q[:, iA]
-            qB = Q[:, iB]
+            Q_L, Q_R = reconstruct(Q)
             qauxA = Qaux[:, iA]
             qauxB = Qaux[:, iB]
             normals = mesh.face_normals
@@ -318,23 +354,21 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             svA = mesh.face_subvolumes[:, 0]
             svB = mesh.face_subvolumes[:, 1]
 
-            Dp, Dm = compute_nc_flux(
-                qA,
-                qB,
-                qauxA,
-                qauxB,
-                parameters,
-                normals,
-                svA,
-                svB,
-                face_volumes,
-                dt,
+            # Conservative numerical flux: F_num = 0.5*(F_L+F_R).n - 0.5*sM*(Q_R-Q_L)
+            F_num = compute_num_flux(
+                Q_L, Q_R, qauxA, qauxB, parameters, normals,
+                svA, svB, face_volumes, dt,
             )
-            flux_out = Dm * face_volumes / cell_volumesA
-            flux_in = Dp * face_volumes / cell_volumesB
 
-            dQ = dQ.at[:, iA].subtract(flux_out)
-            dQ = dQ.at[:, iB].subtract(flux_in)
+            # Nonconservative fluctuations: Dp, Dm from path integral
+            Dp, Dm = compute_nc_flux(
+                Q_L, Q_R, qauxA, qauxB, parameters, normals,
+                svA, svB, face_volumes, dt,
+            )
+
+            # Combined update (conservative + nonconservative)
+            dQ = dQ.at[:, iA].subtract((F_num + Dm) * face_volumes / cell_volumesA)
+            dQ = dQ.at[:, iB].subtract((-F_num + Dp) * face_volumes / cell_volumesB)
             return dQ
 
         return flux_operator
@@ -343,6 +377,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     # @partial(jax.named_call, name="hyperbolic solver")
     def solve(self, mesh, model, write_output=True):
         """Solve."""
+        mesh = ensure_lsq_mesh(mesh, model)
         Q, Qaux = self.initialize(mesh, model)
 
         Q, Qaux, parameters, mesh, model = self.create_runtime(Q, Qaux, mesh, model)
@@ -357,7 +392,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             save_fields = jax_io.get_save_fields(output_hdf5_path, write_all=False)
         else:
 
-            def save_field(time, time_stamp, i_snapshot, Q, Qaux):
+            def save_fields(time, time_stamp, i_snapshot, Q, Qaux):
                 """Save field."""
                 return i_snapshot
 
@@ -409,8 +444,10 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                     dt = self.compute_dt(
                         Q, Qaux, parameters, min_inradius, compute_max_abs_eigenvalue
                     )
+                    dt = jnp.minimum(dt, self.time_end - time)
 
-                    Q1 = ode.RK1(flux_operator, Q, Qaux, parameters, dt)
+                    ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
+                    Q1 = ode_step(flux_operator, Q, Qaux, parameters, dt)
                     Q2 = ode.RK1(
                         source_operator,
                         Q1,

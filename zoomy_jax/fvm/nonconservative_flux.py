@@ -185,6 +185,24 @@ class Rusanov(NonconservativeFlux):
             return Dp.T, Dm.T
         return compute
 
+class NonconservativeRusanov(Rusanov):
+    """Rusanov fluctuations using only the nonconservative matrix.
+
+    Mirrors the NumPy ``NonconservativeRusanov``: the path integral
+    is computed over ``nonconservative_matrix`` (not ``quasilinear_matrix``),
+    so the fluctuations contain only the nonconservative contribution plus
+    Rusanov dissipation.  The conservative flux is handled separately by
+    the flux operator (``CenteredFlux``).
+    """
+
+    def _get_A(self, model):
+        """Override: use nonconservative_matrix instead of quasilinear_matrix."""
+        def A(q, qaux, parameters, n):
+            _A = model.nonconservative_matrix(q, qaux, parameters)
+            return jnp.einsum('d,ijd->ij', n, _A)
+        return A
+
+
 class PriceC(Rusanov):
     
     """PriceC. (class)."""
