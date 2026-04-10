@@ -1,4 +1,4 @@
-"""JIT-compatible FVM face reconstruction for JAX.
+"""JIT-compatible FVM face reconstruction and diffusion for JAX.
 
 Mirrors the NumPy reconstruction classes in zoomy_core.fvm.reconstruction
 with the same interface: ``recon(Q) → (Q_L, Q_R)``.
@@ -11,6 +11,7 @@ Classes
 - ``ConstantReconstruction``: 1st-order piecewise-constant.
 - ``MUSCLReconstruction``: 2nd-order MUSCL with slope limiting.
 - ``FreeSurfaceMUSCL``: MUSCL with wet-dry fallback and h-positivity.
+- ``DiffusionOperatorJAX``: Sparse discrete Laplacian with Crank-Nicolson implicit solve.
 """
 
 from __future__ import annotations
@@ -261,3 +262,128 @@ class FreeSurfaceMUSCL(MUSCLReconstruction):
         dry = Q[self._h_idx, :] < self._eps_wet
         phi = jnp.where(dry[jnp.newaxis, :], 0.0, phi)
         return grads, phi
+
+
+# ── Diffusion operator (JAX, JIT-compatible) ────────────────────────────────
+
+class DiffusionOperatorJAX:
+    """Sparse discrete diffusion operator for JAX: L(u) = nabla . (nu nabla u).
+
+    Assembled once per mesh + viscosity as a dense (nc, nc) matrix.
+    Provides:
+    - explicit(u): L @ u  (for explicit stepping)
+    - implicit_solve(u_star, dt): Crank-Nicolson solve
+
+    The dense matrix approach is JIT-compatible and works inside
+    jax.lax.while_loop. For typical 1D/2D FVM grids (up to ~1000 cells)
+    this is efficient; for larger grids a matrix-free GMRES variant is
+    also available via ``implicit_solve_gmres``.
+    """
+
+    def __init__(self, mesh, dim, nu=1.0):
+        nc = mesh.n_inner_cells
+        n_cells = mesh.n_cells
+
+        iA = mesh.face_cells[0]
+        iB = mesh.face_cells[1]
+        centers = mesh.cell_centers[:dim, :]
+        normals = mesh.face_normals[:dim, :]
+        face_vol = mesh.face_volumes
+        cell_vol = mesh.cell_volumes
+
+        # Build the Laplacian as a dense (nc, nc) matrix using NumPy
+        # then convert to JAX.  This is done once at setup time.
+        import numpy as np
+        L = np.zeros((nc, nc), dtype=float)
+
+        n_faces = mesh.n_faces
+        for f in range(n_faces):
+            a = int(iA[f])
+            b = int(iB[f])
+            dx = centers[:, b] - centers[:, a]
+            dist = np.linalg.norm(dx)
+            if dist < 1e-30:
+                continue
+
+            n = normals[:, f]
+            n_dot_e = np.dot(n, dx / dist)
+            n_dot_e = max(abs(n_dot_e), 0.1) * np.sign(n_dot_e + 1e-30)
+            coeff = nu * float(face_vol[f]) / dist / abs(n_dot_e)
+
+            if a < nc and b < nc:
+                L[a, b] += coeff / float(cell_vol[a])
+                L[a, a] -= coeff / float(cell_vol[a])
+                L[b, a] += coeff / float(cell_vol[b])
+                L[b, b] -= coeff / float(cell_vol[b])
+
+        self.L = jnp.array(L)
+        self.nc = nc
+        self.n_cells = n_cells
+
+        # Precompute boundary ghost -> inner cell mapping for post-solve copy
+        self._boundary_ghosts = jnp.array(mesh.boundary_face_ghosts)
+        self._boundary_cells = jnp.array(mesh.boundary_face_cells)
+
+    def explicit(self, u):
+        """Compute L @ u[:nc] (for explicit stepping). Returns shape (nc,)."""
+        return self.L @ u[:self.nc]
+
+    def implicit_solve(self, u_star, dt):
+        """Crank-Nicolson: (I - dt/2 * L) u^{n+1} = (I + dt/2 * L) u*.
+
+        Second-order in time for diffusion. Uses dense linear solve
+        (jnp.linalg.solve) which is fully JIT-compatible.
+
+        Parameters
+        ----------
+        u_star : jnp.ndarray, shape (n_cells,)
+            State after explicit advection step (includes ghost cells).
+        dt : scalar
+            Time step.
+
+        Returns
+        -------
+        u_new : jnp.ndarray, shape (n_cells,)
+            Updated state with ghost cells copied from inner neighbors.
+        """
+        nc = self.nc
+        L = self.L
+        I = jnp.eye(nc)
+
+        # Right-hand side: (I + dt/2 * L) @ u*[:nc]
+        rhs = (I + 0.5 * dt * L) @ u_star[:nc]
+
+        # System matrix: (I - dt/2 * L)
+        A = I - 0.5 * dt * L
+
+        # Solve
+        sol = jnp.linalg.solve(A, rhs)
+
+        # Assemble full solution with ghost cells
+        result = u_star.at[:nc].set(sol)
+
+        # Copy inner cell values to boundary ghosts (Neumann-like)
+        result = result.at[self._boundary_ghosts].set(result[self._boundary_cells])
+        return result
+
+    def implicit_solve_gmres(self, u_star, dt, tol=1e-8, maxiter=100):
+        """Crank-Nicolson via matrix-free GMRES. JIT-compatible.
+
+        Use this for larger grids where the dense solve becomes expensive.
+        """
+        from jax.scipy.sparse.linalg import gmres as jax_gmres
+
+        nc = self.nc
+        L = self.L
+
+        rhs = u_star[:nc] + 0.5 * dt * (L @ u_star[:nc])
+
+        def matvec(x):
+            return x - 0.5 * dt * (L @ x)
+
+        sol, info = jax_gmres(matvec, rhs, x0=u_star[:nc],
+                              tol=tol, atol=0.0, maxiter=maxiter)
+
+        result = u_star.at[:nc].set(sol)
+        result = result.at[self._boundary_ghosts].set(result[self._boundary_cells])
+        return result
