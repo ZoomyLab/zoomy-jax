@@ -41,7 +41,7 @@ def _dqaux_action_from_specs(symbolic_model, V, mesh, dt):
 
 def analytic_source_jvp_jax(runtime_model, symbolic_model, Q, Qaux, V, mesh, dt, include_chain_rule=True):
     """Analytic source jvp jax."""
-    parameters = jnp.asarray(symbolic_model.parameter_values)
+    parameters = jnp.asarray(list(symbolic_model.parameters.values()))
     Jq = runtime_model.source_jacobian_wrt_variables(Q, Qaux, parameters)
     jv = jnp.einsum("ijc,jc->ic", Jq, V)
 
