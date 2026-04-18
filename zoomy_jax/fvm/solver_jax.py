@@ -188,7 +188,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         mesh = ensure_lsq_mesh(mesh, model)
         jax_mesh = convert_mesh_to_jax(mesh)
         Q, Qaux = jnp.asarray(Q), jnp.asarray(Qaux)
-        parameters = jnp.asarray(model.parameter_values)
+        parameters = jnp.asarray(list(model.parameters.values()))
         from zoomy_core.kernel import Kernel
         kernel = Kernel(model)
         kernel.regularize(model)
