@@ -188,8 +188,12 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         mesh = ensure_lsq_mesh(mesh, model)
         jax_mesh = convert_mesh_to_jax(mesh)
         Q, Qaux = jnp.asarray(Q), jnp.asarray(Qaux)
-        parameters = jnp.asarray(model.parameter_values)
-        runtime_model = JaxRuntimeModel(model)
+        parameters = jnp.asarray(list(model.parameters.values()))
+        from zoomy_core.kernel import Kernel
+        kernel = Kernel(model)
+        kernel.regularize(model)
+        self._kernel = kernel
+        runtime_model = JaxRuntimeModel(model, kernel=kernel)
         return Q, Qaux, parameters, jax_mesh, runtime_model
 
     # ── State update (vmap over cells) ──────────────────────────────────

@@ -11,7 +11,7 @@ for p in (REPO_ROOT, REPO_ROOT / "library" / "zoomy_core", REPO_ROOT / "library"
         sys.path.insert(0, str(p))
 
 import zoomy_core.fvm.timestepping as timestepping
-import zoomy_core.mesh.mesh as petscMesh
+from zoomy_core.mesh import LSQMesh
 from zoomy_jax.gnn_blueprint.cases_gn_topo import make_model
 from zoomy_jax.gnn_blueprint.imex_child_solver import IMEXSourceSolverJaxGNNGuess
 
@@ -33,7 +33,7 @@ def make_solver(message_steps, guess_mode='learned_deltaq', guess_scale=1.0, cfl
 
 
 def run_once(n_cells, topo_mode, message_steps, cfl, time_end):
-    mesh = petscMesh.Mesh.create_1d((0.0, 10.0), n_cells, lsq_degree=2)
+    mesh = LSQMesh.create_1d((0.0, 10.0), n_cells, lsq_degree=2)
     model = make_model(topo_mode)
     solver = make_solver(message_steps, cfl=cfl, time_end=time_end)
     t0 = time.perf_counter()

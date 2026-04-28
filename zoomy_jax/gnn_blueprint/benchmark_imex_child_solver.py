@@ -33,7 +33,7 @@ for p in (REPO_ROOT, REPO_ROOT / "library" / "zoomy_core", REPO_ROOT / "library"
         sys.path.insert(0, str(p))
 
 import zoomy_core.fvm.timestepping as timestepping
-import zoomy_core.mesh.mesh as petscMesh
+from zoomy_core.mesh import LSQMesh
 from zoomy_jax.fvm.solver_imex_jax import IMEXSourceSolverJax
 from zoomy_jax.gnn_blueprint.imex_child_solver import IMEXSourceSolverJaxGNNGuess
 from zoomy_jax.gnn_blueprint.imex_scipy_gmres_solver import IMEXSourceSolverJaxGNNGuessScipyGmres
@@ -223,7 +223,7 @@ def main():
     }
 
     for r in range(args.repeats):
-        mesh_base = petscMesh.Mesh.create_1d(domain=(0.0, 10.0), n_inner_cells=args.n_cells, lsq_degree=2)
+        mesh_base = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=args.n_cells, lsq_degree=2)
         model_base = _build_model(args.case)
         solver_base = _make_solver(
             IMEXSourceSolverJax,
@@ -238,7 +238,7 @@ def main():
         print(f"run {r} base: wall={tb:.3f}s steps={sb.n_steps} run={sb.runtime_only_s:.3f}s compile={sb.compile_time_s:.3f}s")
 
         for mode in mode_list:
-            mesh_child = petscMesh.Mesh.create_1d(domain=(0.0, 10.0), n_inner_cells=args.n_cells, lsq_degree=2)
+            mesh_child = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=args.n_cells, lsq_degree=2)
             model_child = _build_model(args.case)
             vck = vcycle_str if mode == "learned_vcycle" else ""
             solver_child = _make_solver(
