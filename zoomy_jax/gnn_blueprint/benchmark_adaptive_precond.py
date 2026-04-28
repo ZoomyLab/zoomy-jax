@@ -12,7 +12,7 @@ for p in (REPO_ROOT, REPO_ROOT / "library" / "zoomy_core", REPO_ROOT / "library"
         sys.path.insert(0, str(p))
 
 import zoomy_core.fvm.timestepping as timestepping
-import zoomy_core.mesh.mesh as petscMesh
+from zoomy_core.mesh import LSQMesh
 from zoomy_jax.gnn_blueprint.cases_gn_topo import make_model
 from zoomy_jax.gnn_blueprint.imex_child_solver import IMEXSourceSolverJaxGNNGuess
 
@@ -81,7 +81,7 @@ def main():
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     # A) "train" preconditioner on bump via collect + customize
-    mesh_bump = petscMesh.Mesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
+    mesh_bump = LSQMesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
     model_bump = make_model("bump")
     bump_collect = Path("outputs/gnn_blueprint/collect/bump_collect.npz")
 
@@ -111,7 +111,7 @@ def main():
         })
 
     # 1) baseline (no gnn guess)
-    mesh1 = petscMesh.Mesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
+    mesh1 = LSQMesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
     model1 = make_model("sine")
     solver1 = _make_solver("zero", 1.0, "use", "outputs/gnn_blueprint/collect/tmp1.npz", args.time_end, args.cfl)
     _, _, t1, st1 = _run(solver1, mesh1, model1)
@@ -120,13 +120,13 @@ def main():
 
     # 2a) best-case same-data: collect on sine and customize from same distribution
     sine_collect_same = Path("outputs/gnn_blueprint/collect/sine_collect_same_dist.npz")
-    mesh2a = petscMesh.Mesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
+    mesh2a = LSQMesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
     model2a = make_model("sine")
     solver2a_collect = _make_solver("learned_deltaq", 1.0, "collect", str(sine_collect_same), args.time_end, args.cfl)
     _run(solver2a_collect, mesh2a, model2a)
     scale_same = _estimate_scale_from_collect(Path.cwd() / sine_collect_same)
 
-    mesh2b = petscMesh.Mesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
+    mesh2b = LSQMesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
     model2b = make_model("sine")
     solver2b = _make_solver("learned_deltaq", scale_same, "use", "outputs/gnn_blueprint/collect/tmp2b.npz", args.time_end, args.cfl)
     _, _, t2b, st2b = _run(solver2b, mesh2b, model2b)
@@ -134,7 +134,7 @@ def main():
 
     # 2) static: bump-trained on sine
     gmode, gscale = _load_precond(Path.cwd() / precond_bump)
-    mesh2 = petscMesh.Mesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
+    mesh2 = LSQMesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
     model2 = make_model("sine")
     solver2 = _make_solver(gmode, gscale, "use", "outputs/gnn_blueprint/collect/tmp2.npz", args.time_end, args.cfl)
     _, _, t2, st2 = _run(solver2, mesh2, model2)
@@ -142,7 +142,7 @@ def main():
 
     # 3) adaptive: collect on sine with bump-precond -> update scale -> rerun
     sine_collect = Path("outputs/gnn_blueprint/collect/sine_collect_from_static.npz")
-    mesh3a = petscMesh.Mesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
+    mesh3a = LSQMesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
     model3a = make_model("sine")
     solver3a = _make_solver(gmode, gscale, "collect", str(sine_collect), args.time_end, args.cfl)
     _run(solver3a, mesh3a, model3a)
@@ -151,7 +151,7 @@ def main():
     precond_adapt = Path("outputs/gnn_blueprint/precond/precond_bump_then_sine_adapt.npz")
     _save_precond(Path.cwd() / precond_adapt, gmode, scale_adapt, "adapted_with_sine_collect")
 
-    mesh3b = petscMesh.Mesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
+    mesh3b = LSQMesh.create_1d((0.0, 10.0), args.n_cells, lsq_degree=2)
     model3b = make_model("sine")
     solver3b = _make_solver(gmode, scale_adapt, "use", "outputs/gnn_blueprint/collect/tmp3.npz", args.time_end, args.cfl)
     _, _, t3, st3 = _run(solver3b, mesh3b, model3b)

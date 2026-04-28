@@ -42,10 +42,8 @@ class IMEXStats:
 def _param_value(model, name, default=None):
     """Extract a scalar parameter value from a symbolic model."""
     if hasattr(model, 'parameters'):
-        keys = list(model.parameters.keys())
-        if name in keys:
-            idx = keys.index(name)
-            return float(model.parameter_values[idx])
+        if model.parameters.contains(name):
+            return float(getattr(model.parameters, name))
     return default
 
 
@@ -118,7 +116,7 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         jax_mesh = convert_mesh_to_jax(mesh)
         Q = jnp.asarray(Q)
         Qaux = jnp.asarray(Qaux)
-        parameters = jnp.asarray(model.parameter_values)
+        parameters = jnp.asarray(list(model.parameters.values()))
         runtime_model = JaxRuntimeModel(model)
         return Q, Qaux, parameters, jax_mesh, runtime_model
 
