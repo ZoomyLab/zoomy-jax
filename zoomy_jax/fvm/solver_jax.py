@@ -17,6 +17,7 @@ from time import time as gettime
 import jax
 from functools import partial
 import jax.numpy as jnp
+import numpy as np
 from jax.scipy.sparse.linalg import gmres
 
 import param
@@ -182,6 +183,29 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         super().__init__(**kwargs)
 
     # ── Runtime creation ────────────────────────────────────────────────
+
+    def initialize(self, mesh, model):
+        """Allocate state arrays sized for the *full* mesh, including the
+        ghost cells that the indexed-BC operator writes into.
+
+        The numpy solver stores only inner cells and recomputes face
+        boundary values inside its flux operator on-demand; the JAX path
+        works the other way round — ghost cells are written by the BC
+        kernel and read directly from Q at boundary faces. If Q is sized
+        to inner-cells-only, those writes target out-of-bounds indices,
+        JAX silently clips them, and every BC degenerates to a clamp on
+        the last interior cell (this was masking real solutions for
+        Periodic / non-Extrapolation BCs entirely).
+        """
+        Q_in, Qaux_in = super().initialize(mesh, model)
+        n_cells = mesh.n_cells
+        n_vars = Q_in.shape[0]
+        n_aux = Qaux_in.shape[0]
+        Q = np.zeros((n_vars, n_cells), dtype=Q_in.dtype)
+        Qaux = np.zeros((n_aux, n_cells), dtype=Qaux_in.dtype)
+        Q[:, : mesh.n_inner_cells] = Q_in
+        Qaux[:, : mesh.n_inner_cells] = Qaux_in
+        return Q, Qaux
 
     def create_runtime(self, Q, Qaux, mesh, model):
         """Create JAX runtime: convert mesh and model to JAX-compatible forms."""
@@ -426,38 +450,38 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return Q, Qaux
 
-    def step(self, dt, Q, Qaux):
+    def step(self, dt, time, Q, Qaux):
         """Perform a single explicit time step.
 
-        Pipeline:
-            1. Reconstruct + flux operator (RK1 or RK2 depending on order)
-            2. Source operator (RK1)
-            3. Apply boundary conditions
-            4. Update Q (e.g. clamp, ramp)
-
-        This method is JIT-compatible when called inside ``run_simulation``.
-
-        Parameters
-        ----------
-        dt : scalar
-            Time step size.
-        Q : jnp.ndarray, shape (n_vars, n_cells)
-            Conservative state.
-        Qaux : jnp.ndarray, shape (n_aux, n_cells)
-            Auxiliary state.
-
-        Returns
-        -------
-        Q_new : jnp.ndarray
-            Updated state after one step.
+        Each RK stage starts by refreshing the boundary ghost cells from
+        the *current* interior state — mirroring the numpy solver, which
+        evaluates the indexed BC kernel inside its flux operator. Without
+        per-stage BCs the second RK stage reads stale ghosts from the
+        previous outer step, contaminating a few cells next to each
+        boundary and stripping the global L2 of its 2nd-order rate even
+        though the interior is fine (interior errs ≈ O(dx²), boundary
+        errs ≈ O(dx)).
         """
         parameters = self._rt_parameters
+        bc = self._rt_bc_op
+        flux = self._rt_flux_op
 
-        # Flux step (order-appropriate Runge-Kutta)
-        ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
-        Q = ode_step(self._rt_flux_op, Q, Qaux, parameters, dt)
+        if self.reconstruction_order >= 2:
+            # SSP-RK2 (Heun) with per-stage BC.
+            Q0 = Q
+            Q_bc0 = bc(time, Q0, Qaux, parameters)
+            dQ = flux(dt, Q_bc0, Qaux, parameters, jnp.zeros_like(Q))
+            Q1 = Q_bc0 + dt * dQ
+            Q_bc1 = bc(time + dt, Q1, Qaux, parameters)
+            dQ = flux(dt, Q_bc1, Qaux, parameters, jnp.zeros_like(Q))
+            Q2 = Q_bc1 + dt * dQ
+            Q = 0.5 * (Q0 + Q2)
+        else:
+            Q_bc = bc(time, Q, Qaux, parameters)
+            dQ = flux(dt, Q_bc, Qaux, parameters, jnp.zeros_like(Q))
+            Q = Q_bc + dt * dQ
 
-        # Source step
+        # Source step (explicit Euler is fine — source is treated as O1).
         Q = ode.RK1(self._rt_source_op, Q, Qaux, parameters, dt)
 
         return Q
@@ -578,8 +602,8 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 dt = _compute_timestep(Qnew, Qauxnew)
                 dt = jnp.minimum(dt, time_end - time)
 
-                # Explicit step
-                Q_stepped = _step(dt, Qnew, Qauxnew)
+                # Explicit step (per-stage BCs applied inside).
+                Q_stepped = _step(dt, time, Qnew, Qauxnew)
 
                 # Post-step: BCs + update_q + update_qaux
                 time_new = time + dt

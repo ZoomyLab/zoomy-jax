@@ -107,15 +107,18 @@ class MUSCLReconstruction:
     # ── Neighbor bounds (JAX) ────────────────────────────────────────
 
     def _neighbor_bounds(self, u):
-        """Per-cell min/max over face-neighbors."""
+        """Per-cell min/max over face-neighbors.
+
+        Each cell starts at its own value and gets max'd / min'd against
+        the value at the *other* side of every face it touches. JAX's
+        ``.at[idx].max(vals)`` does a segment-max when ``idx`` contains
+        duplicates — exactly the neighbour-fold we want, without an
+        artificial 0-base that previously clamped the bounds and stripped
+        MUSCL of its second-order accuracy on fields that cross zero.
+        """
         iA, iB = self.iA, self.iB
-        u_max = u.copy()
-        u_min = u.copy()
-        # Scatter max/min: for each face, update both cell A and cell B
-        u_max = jnp.maximum(u_max, jnp.zeros_like(u).at[iA].max(u[iB]))
-        u_max = jnp.maximum(u_max, jnp.zeros_like(u).at[iB].max(u[iA]))
-        u_min = jnp.minimum(u_min, jnp.full_like(u, jnp.inf).at[iA].min(u[iB]))
-        u_min = jnp.minimum(u_min, jnp.full_like(u, jnp.inf).at[iB].min(u[iA]))
+        u_max = u.at[iA].max(u[iB]).at[iB].max(u[iA])
+        u_min = u.at[iA].min(u[iB]).at[iB].min(u[iA])
         return u_min, u_max
 
     # ── Face deltas ──────────────────────────────────────────────────
@@ -241,21 +244,42 @@ class FreeSurfaceMUSCL(MUSCLReconstruction):
     """MUSCL with wet-dry fallback for free-surface flows (JAX).
 
     In dry cells (h < eps_wet), falls back to 1st order (φ = 0).
-    Clamps h ≥ 0 at face states after reconstruction.
+    Clamps h ≥ 0 at face states after reconstruction, and zeros the
+    corresponding momentum components so dry-face velocities never become
+    infinite (without this, ``hu/h`` blows the HLLC flux to NaN at the
+    dry front of a Ritter dam-break).
     """
 
-    def __init__(self, mesh, dim, h_index, eps_wet=1e-3, limiter="venkatakrishnan"):
+    def __init__(self, mesh, dim, h_index, eps_wet=1e-3, limiter="venkatakrishnan",
+                 momentum_indices=None):
         super().__init__(mesh, dim, limiter=limiter)
         self._h_idx = h_index
         self._eps_wet = eps_wet
+        # Indices of the momentum components (hu, hv, …). If left as None,
+        # assume they immediately follow h in the state vector — matches the
+        # standard ``[h, hu]`` and ``[h, hu, hv]`` SWE conventions.
+        self._mom_idx = (
+            tuple(momentum_indices) if momentum_indices is not None
+            else tuple(range(h_index + 1, h_index + 1 + dim))
+        )
 
     def __call__(self, Q):
         n_vars = Q.shape[0]
         grads, phi = self._compute_limited_gradients(Q, n_vars)
         Q_L, Q_R = self._reconstruct(Q, grads, phi)
-        Q_L = Q_L.at[self._h_idx, :].set(jnp.maximum(Q_L[self._h_idx, :], 0.0))
-        Q_R = Q_R.at[self._h_idx, :].set(jnp.maximum(Q_R[self._h_idx, :], 0.0))
+        Q_L = self._wet_dry_clamp(Q_L)
+        Q_R = self._wet_dry_clamp(Q_R)
         return Q_L, Q_R
+
+    def _wet_dry_clamp(self, Q_face):
+        h = jnp.maximum(Q_face[self._h_idx, :], 0.0)
+        Q_face = Q_face.at[self._h_idx, :].set(h)
+        # If h was clamped to ~0 the cell is dry-side: also zero its
+        # momentum components so u = hu/h doesn't blow up downstream.
+        dry = h < self._eps_wet
+        for mi in self._mom_idx:
+            Q_face = Q_face.at[mi, :].set(jnp.where(dry, 0.0, Q_face[mi, :]))
+        return Q_face
 
     def _compute_limited_gradients(self, Q, n_vars):
         grads, phi = super()._compute_limited_gradients(Q, n_vars)
