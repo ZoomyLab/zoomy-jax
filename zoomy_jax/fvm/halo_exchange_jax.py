@@ -21,6 +21,37 @@ those slots with the BC-evaluated face value, so the same kernel
 runs everywhere — no Python branching inside the JIT trace.
 
 The cell axis is always the *last* axis of Q (``(n_var, n_cells)``).
+
+Composition with the existing solver
+------------------------------------
+Already wired (see ``tests/unit/zoomy_jax/``):
+  * ``test_halo_exchange.py``  — bit-correct halo on 2/4 devices.
+  * ``test_spmd_advection.py`` — bit-identity scalar advection on
+    {2,4} devices × {16,32} cells vs single-device.
+  * ``test_partition_jax.py``  — ``partition_1d_contiguous`` chops a
+    global ``MeshJAX`` into per-partition padded slabs with shifted
+    face indices.
+  * ``test_spmd_solver_integration.py`` — existing
+    ``ConstantReconstruction`` composes with SPMD shard_map when
+    handed a per-partition mesh; bit-identity vs single-device.
+
+Open work to lift this into the full ``HyperbolicSolver``:
+  1. Rebuild LSQ stencils per partition (``LSQMUSCLReconstructionJAX``
+     consumes ``mesh.lsq_gradQ`` / ``mesh.lsq_neighbors`` /
+     ``mesh.lsq_boundary_face_neighbors`` — partition_jax leaves
+     these empty.  Re-run ``LSQMesh._build_lsq_stencil`` on the
+     padded coordinate system of each partition.)
+  2. Drop the periodic-wrap demo path and use the inline BC kernel
+     at global boundaries (rank-0 left face + rank-(N-1) right face).
+     The partition's ``boundary_face_*`` arrays already carry exactly
+     these faces; the existing flux operator's BC fori_loop runs over
+     them per shard.
+  3. Wrap ``HyperbolicSolver.step`` in ``shard_map(... in_specs=
+     P(None, "cells"), out_specs=P(None, "cells"))`` with the
+     halo exchange called inside the body before the flux operator.
+  4. For multi-process deployment: ``jax.distributed.initialize()``
+     at process startup (SLURM auto-detection).  Dev loop runs in
+     one process via ``XLA_FLAGS=--xla_force_host_platform_device_count=N``.
 """
 from __future__ import annotations
 
