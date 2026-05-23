@@ -278,8 +278,10 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         return p.at[-1].set(jnp.asarray(dt, dtype=p.dtype))
 
     def _refresh_aux_for_sm(self, Qaux, sm, Q):
-        """LSQ-recompute every state-derivative aux entry for ``sm``
-        in place on ``Qaux``."""
+        """LSQ-recompute every state-derivative aux entry for ``sm``.
+
+        Pure function — returns a new Qaux array.  Safe to call inside
+        ``jax.jit`` / ``jax.lax.scan``."""
         mesh = self._rt_mesh
         for entry in (sm.aux_registry or []):
             if (entry.get("kind") not in ("derivative", "limited_derivative")
@@ -294,7 +296,10 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         return Qaux
 
     def update_aux_variables(self):
-        """Refresh state-derivative aux rows in each sub-system's pool."""
+        """Host-side wrapper that mutates ``self`` — convenience for
+        notebooks / tests that drive the solver imperatively.  The
+        pure-functional equivalent (used by the JIT-able ``step``) is
+        :meth:`_refresh_aux_for_sm` called per sub-system."""
         self._sim_Qaux = self._refresh_aux_for_sm(
             self._sim_Qaux, self.sm_pred, self._sim_Q)
         self.Qaux_press = self._refresh_aux_for_sm(
@@ -302,36 +307,81 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         self.Qaux_corr = self._refresh_aux_for_sm(
             self.Qaux_corr, self.sm_corr, self._sim_Q)
 
-    # ── Chorin step ───────────────────────────────────────────────
+    # ── Chorin step (pure-functional core, JIT-able) ──────────────
+
+    def chorin_cycle(self, dt, time, Q, Qaux_pred, Qaux_press, Qaux_corr):
+        """One predictor → pressure → corrector cycle as a PURE
+        function of ``(Q, Qaux_pred, Qaux_press, Qaux_corr)`` — no
+        ``self._sim_*`` mutations during the call.  This is the
+        JIT-able entry point.  Returns the updated 4-tuple."""
+        # 1. Predictor (parent JAX HyperbolicSolver step).
+        Q = super().step(dt, time, Q, Qaux_pred)
+        Qaux_pred = self._refresh_aux_for_sm(Qaux_pred, self.sm_pred, Q)
+        Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
+        Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
+
+        # 2. Pressure step (matrix-free GMRES via JVP).
+        Q, Qaux_press = self._step_pressure_pure(Q, Qaux_press, dt)
+        Qaux_pred = self._refresh_aux_for_sm(Qaux_pred, self.sm_pred, Q)
+        Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
+        Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
+
+        # 3. Corrector step.
+        Q = self._step_corrector_pure(Q, Qaux_corr, dt)
+        Qaux_pred = self._refresh_aux_for_sm(Qaux_pred, self.sm_pred, Q)
+        Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
+        Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
+
+        return Q, Qaux_pred, Qaux_press, Qaux_corr
 
     def step(self, dt, time, Q, Qaux):
-        """One Chorin step: predictor → pressure → corrector.
-
-        Note: signature matches parent JaxRuntime step (dt, time, Q, Qaux);
-        ``time_order == 2`` is implemented inside run_simulation via the
-        parent's RK2 loop.  Here we do a single cycle.
-        """
-        # Predictor step via parent JAX HyperbolicSolver.
-        Q = super().step(dt, time, Q, Qaux)
-        # Sync to internal state for the pressure + corrector substeps
-        # (which run on numpy-side data here for clarity).
+        """Host-side wrapper that drives one Chorin cycle and mutates
+        ``self._sim_Q`` / ``self.Qaux_press`` / ``self.Qaux_corr``.
+        Calls the pure-functional :meth:`chorin_cycle` internally.
+        Tests and notebooks that want a JIT'd run loop should call
+        :meth:`chorin_cycle` (or :meth:`run_jit_steps`) directly."""
+        Q, Qaux_pred, Qaux_press, Qaux_corr = self.chorin_cycle(
+            dt, time, Q, Qaux, self.Qaux_press, self.Qaux_corr)
         self._sim_Q = Q
-        self.update_aux_variables()
-        self._step_pressure(dt)
-        self.update_aux_variables()
-        self._step_corrector(dt)
-        self.update_aux_variables()
-        return self._sim_Q
+        self._sim_Qaux = Qaux_pred
+        self.Qaux_press = Qaux_press
+        self.Qaux_corr = Qaux_corr
+        return Q
 
-    def _step_pressure(self, dt):
-        """Matrix-free GMRES on the elliptic pressure residual."""
+    def run_jit_steps(self, dt, n_steps, Q, Qaux_pred, Qaux_press,
+                      Qaux_corr, t_start=0.0):
+        """JIT'd time loop via ``jax.lax.scan``.  Calls
+        :meth:`chorin_cycle` ``n_steps`` times.  Returns final
+        ``(Q, Qaux_pred, Qaux_press, Qaux_corr, time)``."""
+        cycle = jax.jit(self.chorin_cycle)
+
+        def _body(carry, k):
+            Q, Qaux_pred, Qaux_press, Qaux_corr, t = carry
+            Q, Qaux_pred, Qaux_press, Qaux_corr = cycle(
+                dt, t, Q, Qaux_pred, Qaux_press, Qaux_corr)
+            return (Q, Qaux_pred, Qaux_press, Qaux_corr, t + dt), None
+
+        init = (Q, Qaux_pred, Qaux_press, Qaux_corr,
+                jnp.asarray(t_start, dtype=Q.dtype))
+        (Q, Qaux_pred, Qaux_press, Qaux_corr, t_final), _ = jax.lax.scan(
+            _body, init, jnp.arange(n_steps))
+        return Q, Qaux_pred, Qaux_press, Qaux_corr, t_final
+
+    def _step_pressure_pure(self, Q, Qaux_press, dt):
+        """Pure-functional pressure step: matrix-free GMRES on the
+        elliptic block.  Returns ``(Q_new, Qaux_press_new)``.
+
+        The matvec is a JVP of the lambdified residual at ``p = 0`` —
+        custom_linear_solve transposes the JVP as a VJP natively
+        (the symbolic-linearity check inside ``linear_transpose``
+        can't peel apart the closure-captured frozen state from the
+        linear p_vec in the scatter + lambdified-source pipeline,
+        but the explicit JVP sidesteps that)."""
         rt = self.rt_press
         nc = self.nc
         e2s = self._press_state_idx
         nP = len(e2s)
         N = nP * nc
-        Q = self._sim_Q
-        Qaux0 = self.Qaux_press
         p_full = self._params_with_dt(rt, dt)
 
         local_of_state = {int(s): k for k, s in enumerate(e2s)}
@@ -348,55 +398,36 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
             return Qaux_work
 
         def _residual(p_vec):
-            """Lambdified elliptic-block source evaluated at
-            Q[e2s] = p_mat (other state frozen at predictor output).
-            Affine in p_vec by construction (split_simple builds the
-            elliptic block to be linear in P)."""
             p_mat = p_vec.reshape(nP, nc)
             Q_try = Q.at[e2s, :].set(p_mat)
-            Qaux_work = _refresh_pressure_aux(p_mat, Qaux0)
+            Qaux_work = _refresh_pressure_aux(p_mat, Qaux_press)
             R = rt.source(Q_try, Qaux_work, p_full)
             return R.reshape(-1)
 
-        # Data forcing: b = R(P = 0).  Independent of the GMRES iterate.
         b = _residual(jnp.zeros(N))
-        b_norm = float(jnp.linalg.norm(b))
-        if b_norm < self.pressure_tol:
-            return
-
-        # JVP-based linear operator.  ``custom_linear_solve`` needs to
-        # transpose-trace the matvec; an explicit JVP at p = 0
-        # extracts the linear part of _residual w.r.t. p, which JAX
-        # transposes natively (= VJP).  This avoids the
-        # AssertionError on full-rt.source closures over frozen state.
         zero_p = jnp.zeros(N)
 
         def matvec(p_vec):
             _, jvp_val = jax.jvp(_residual, (zero_p,), (p_vec,))
             return jvp_val
 
-        p_new, info = jax_gmres(
+        p_new, _info = jax_gmres(
             matvec, -b,
             atol=0.0, tol=self.pressure_tol,
             maxiter=self.pressure_maxit,
         )
-        if info != 0:
-            logger.warning(
-                f"Chorin (JAX) pressure GMRES did not fully converge "
-                f"(info={info}, ‖b‖={b_norm:.3e})")
-        self._sim_Q = Q.at[e2s, :].set(p_new.reshape(nP, nc))
-        self.Qaux_press = _refresh_pressure_aux(
-            p_new.reshape(nP, nc), self.Qaux_press)
+        Q_new = Q.at[e2s, :].set(p_new.reshape(nP, nc))
+        Qaux_press_new = _refresh_pressure_aux(
+            p_new.reshape(nP, nc), Qaux_press)
+        return Q_new, Qaux_press_new
 
-    def _step_corrector(self, dt):
-        """``Q[corr_e2s] ← state_update(Q, Qaux_corr, p, dt)``."""
+    def _step_corrector_pure(self, Q, Qaux_corr, dt):
+        """Pure-functional corrector: ``Q[corr_e2s] ← state_update(Q,
+        Qaux_corr, p, dt)``."""
         rt = self.rt_corr
-        p_full = self._params_with_dt(rt, dt)
         e2s = self._corr_state_idx
-
-        if not hasattr(rt, "state_update") or rt.state_update is None:
-            # The sm_corr may not declare a state_update — skip.
-            return
-        new_vals = rt.state_update(self._sim_Q, self.Qaux_corr, p_full)
-        # new_vals: shape (len(e2s), nc).  Assign in place.
-        self._sim_Q = self._sim_Q.at[e2s, :].set(jnp.asarray(new_vals))
+        if rt.state_update is None:
+            return Q
+        p_full = self._params_with_dt(rt, dt)
+        new_vals = rt.state_update(Q, Qaux_corr, p_full)
+        return Q.at[e2s, :].set(jnp.asarray(new_vals))
