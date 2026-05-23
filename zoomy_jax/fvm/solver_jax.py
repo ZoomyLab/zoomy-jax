@@ -432,8 +432,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 "runtime to switch to JaxRuntimeModel.from_system_model."
             )
         model = source_model
-        mesh = ensure_lsq_mesh(mesh, nsm.sm,
-                               lsq_degree=nsm.resolved_lsq_degree())
+        mesh = ensure_lsq_mesh(mesh, nsm)
         Q, Qaux = self.initialize(mesh, model)
         Q, Qaux, parameters, jax_mesh, runtime_model = self.create_runtime(
             Q, Qaux, mesh, model

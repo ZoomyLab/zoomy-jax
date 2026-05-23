@@ -118,7 +118,7 @@ def _make_model():
 
 
 def _run(order: int) -> tuple[LSQMesh, np.ndarray]:
-    mesh = LSQMesh.create_2d(domain=DOMAIN, nx=NX, ny=NY, lsq_degree=2)
+    mesh = LSQMesh.create_2d(domain=DOMAIN, nx=NX, ny=NY)
     model = _make_model()
     nsm = NumericalSystemModel.from_system_model(
         model,

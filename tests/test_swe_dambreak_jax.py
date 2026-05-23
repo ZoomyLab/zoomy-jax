@@ -162,7 +162,7 @@ def _make_model():
 
 def _run(N: int, order: int) -> tuple[np.ndarray, np.ndarray]:
     """Return (x_inner, h_inner) at t = T_END for given N, reconstruction order."""
-    mesh = LSQMesh.create_1d(domain=DOMAIN, n_inner_cells=N, lsq_degree=2)
+    mesh = LSQMesh.create_1d(domain=DOMAIN, n_inner_cells=N)
     model = _make_model()
     nsm = NumericalSystemModel.from_system_model(
         model, reconstruction=ReconstructionSpec(order=order, limiter="minmod"))
@@ -200,7 +200,7 @@ def _make_smooth_model():
 
 
 def _run_smooth(N: int, order: int, t_end: float = T_SMOOTH) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    mesh = LSQMesh.create_1d(domain=DOMAIN, n_inner_cells=N, lsq_degree=2)
+    mesh = LSQMesh.create_1d(domain=DOMAIN, n_inner_cells=N)
     model = _make_smooth_model()
     nsm = NumericalSystemModel.from_system_model(
         model, reconstruction=ReconstructionSpec(order=order, limiter="minmod"))
