@@ -119,8 +119,20 @@ def partition_1d_contiguous(
     """
     if mesh.dimension != 1:
         raise NotImplementedError(
-            "partition_1d_contiguous: only 1D meshes today; for >=2D "
-            "use graph partitioning (zoomy_jax.mesh.partition)."
+            "partition_1d_contiguous: only 1D meshes today.  For 2D "
+            "x-axis decomposition (regular nx*ny mesh, partition only "
+            "along x): follow the same recipe — owned cells at "
+            "ix ∈ [p*n_local_x .. (p+1)*n_local_x), iy ∈ [0..ny), "
+            "halo strips of `halo*ny` cells on each x-side; LSQ "
+            "stencils remap via the same g_idx -> local mapping "
+            "(2D LSQ stencil includes corner neighbors, but with x-"
+            "partitioning only those reach into the halo strip, so "
+            "halo = 1 is enough as long as y is not also "
+            "partitioned).  For unstructured/graph partitioning, "
+            "extend the existing pymetis-based "
+            "zoomy_jax.mesh.partition.partition_mesh to emit per-"
+            "rank MeshJAX with halo cells (it currently emits "
+            "PartitionInfo for the MPI pattern)."
         )
     nc_global = int(mesh.n_inner_cells)
     if nc_global % n_parts != 0:
