@@ -100,13 +100,18 @@ def _lambdify_array(arr: sp.Array, arg_lists: Sequence[Sequence[sp.Symbol]],
                     module: dict) -> Callable:
     """Lambdify a (possibly empty) sympy Array against grouped
     arg-lists.  Returns a callable that takes one positional argument
-    per arg_list (each itself a sequence of scalars) and returns an
-    array of the original sympy shape.
+    per arg_list (each itself a sequence of scalars matching the
+    signature's declared length) and returns an array of the original
+    sympy shape.
 
-    The grouping matches the SystemModel convention: a flux operator
-    is called as ``flux(Q_vec, Qaux_vec, p_vec)`` — three vector args
-    that the lambdified body unpacks internally."""
+    The runtime arg lengths must match the signature's declared scalar
+    counts.  Each runtime arg is sliced to ``len(group_syms)`` scalars
+    — this matters when the JAX mesh stores 3D-padded vectors for
+    fields the signature declares as 1D (e.g. SWE1D normal is just
+    ``n0``, but ``mesh.face_normals`` is shape ``(3, n_faces)``).
+    """
     shape = _shape(arr)
+    counts = [len(group) for group in arg_lists]
     flat_args = [sym for group in arg_lists for sym in group]
     flat_expr = list(arr) if shape else []
 
@@ -117,21 +122,20 @@ def _lambdify_array(arr: sp.Array, arg_lists: Sequence[Sequence[sp.Symbol]],
             return empty
         return _empty
 
-    # ``modules=[module, "jax"]`` so the module-dict overrides take
-    # precedence over jax's default name resolution.  Use cse=True
-    # for shared sub-expressions across the rows of large operator
-    # tensors (Galerkin VAM produces them).
     fn_flat = sp.lambdify(flat_args, flat_expr, modules=[module, "jax"],
                           cse=True)
 
     def call_per_cell(*grouped_args):
         flat = []
-        for g in grouped_args:
-            # ``g`` may be a JAX array, list, or tuple — iterate.
+        for g, count in zip(grouped_args, counts):
+            if count == 0:
+                continue
             if hasattr(g, "shape") and g.shape != ():
-                flat.extend([g[i] for i in range(int(g.shape[0]))])
+                for i in range(count):
+                    flat.append(g[i])
             else:
-                flat.extend(list(g))
+                # Scalar — only sensible when count == 1.
+                flat.append(g)
         out = fn_flat(*flat)
         if shape:
             return jnp.asarray(out).reshape(shape)
@@ -326,10 +330,13 @@ class JaxRuntime:
         numerics = self.nsm.build_numerics()
         self._numerics = numerics
 
-        # ``max_wavespeed`` plug — Rusanov-style numerics emit an
-        # opaque ``max_wavespeed(*Q_minus, *Q_plus, *Qaux_minus,
-        # *Qaux_plus, *p, *n)`` call.  Build a JIT-vmappable
-        # implementation from ``eigenvalues``: max(|ev(qL)|, |ev(qR)|).
+        # ``max_wavespeed`` plug — Rusanov-style numerics emit one
+        # ``max_wavespeed(*Q, *Qaux, *p, *n)`` per face side (left and
+        # right are *separate* invocations inside the symbolic body,
+        # each with arity ``n_state + n_aux + n_p + n_n``).  Build a
+        # plug that consumes those flat scalar args and returns the
+        # per-side max |eigenvalue| via the per-cell eigenvalues
+        # lambdified callable.
         n_state = self.n_state
         n_aux = self.n_aux
         n_p = len(self._p_syms)
@@ -343,23 +350,16 @@ class JaxRuntime:
         )
 
         def _max_wavespeed(*all_args):
-            # all_args = [Q_minus..., Q_plus..., Qaux_minus...,
-            #             Qaux_plus..., p..., n...] (all scalars)
-            offs = [0,
-                    n_state,
-                    2 * n_state,
-                    2 * n_state + n_aux,
-                    2 * n_state + 2 * n_aux,
-                    2 * n_state + 2 * n_aux + n_p]
-            qL = jnp.asarray(all_args[offs[0]:offs[1]])
-            qR = jnp.asarray(all_args[offs[1]:offs[2]])
-            qauxL = jnp.asarray(all_args[offs[2]:offs[3]])
-            qauxR = jnp.asarray(all_args[offs[3]:offs[4]])
-            p = jnp.asarray(all_args[offs[4]:offs[5]])
-            n = jnp.asarray(all_args[offs[5]:offs[5] + n_n])
-            ev_L = jnp.abs(_eig_scalar(qL, qauxL, p, n)).max()
-            ev_R = jnp.abs(_eig_scalar(qR, qauxR, p, n)).max()
-            return jnp.maximum(ev_L, ev_R)
+            # all_args = [q_scalars..., qaux_scalars...,
+            #             p_scalars..., n_scalars...] (one side).
+            q = jnp.asarray(all_args[:n_state])
+            qaux = jnp.asarray(all_args[n_state:n_state + n_aux])
+            p = jnp.asarray(
+                all_args[n_state + n_aux:n_state + n_aux + n_p])
+            n = jnp.asarray(
+                all_args[n_state + n_aux + n_p:
+                         n_state + n_aux + n_p + n_n])
+            return jnp.abs(_eig_scalar(q, qaux, p, n)).max()
 
         # Inject before lambdifying numerics.
         self.module["max_wavespeed"] = _max_wavespeed
@@ -407,61 +407,43 @@ class JaxRuntime:
 
     def _build_bc(self):
         """Lambdify the indexed BC kernel that lives on
-        ``sm.boundary_conditions`` (a sympy Function whose body is a
-        Piecewise selecting on ``i_bc_func``)."""
-        bc_fn = getattr(self.sm, "boundary_conditions", None)
-        if bc_fn is None:
-            self.boundary_conditions = None
-            return
+        ``sm.boundary_conditions``.  The definition is typically a
+        sympy ``Piecewise`` over ``i_bc_func`` whose branches are
+        ``sp.Array`` ghost-state vectors of length ``n_state``.
 
-        bc_def = bc_fn.definition
-        bc_sig = bc_fn.args
-        # ``bc_sig`` is a Zstruct of (i_bc_func, time, position,
-        # distance, variables, aux_variables, parameters, normal) per
-        # the model.boundary_conditions.get_boundary_condition_function
-        # contract.  Flatten symbol-by-symbol.
-        flat_args, structure = _flatten_with_structure(bc_sig)
-        bc_arr = _to_array_of_exprs(bc_def)
-        fn = sp.lambdify(flat_args, list(bc_arr),
-                         modules=[self.module, "jax"], cse=True)
+        We delegate to the proven NumPy ``_lambdify_function``
+        infrastructure (handles Piecewise-of-vectors, vectorized
+        broadcast, flatten/extract) and just JIT-wrap the result so
+        JAX sees it as one fused kernel.  No vmap — the BC index
+        varies per face, so the solver invokes this inside its
+        boundary fori_loop."""
+        from zoomy_core.transformation.to_numpy import NumpyRuntimeSymbolic
 
-        n_state = self.n_state
-        out_shape = _shape(bc_arr)
-
-        def _call(i_bc, time, position, distance, q_cell, qaux_cell,
-                  parameters, normal):
-            flat = _gather_flat(structure, i_bc, time, position, distance,
-                                q_cell, qaux_cell, parameters, normal)
-            out = fn(*flat)
-            return jnp.asarray(out).reshape(out_shape)
-
-        self.boundary_conditions = jax.jit(_call)
-
-        # Aux BC and gradient kernels — same pattern but lazy.
-        for attr in ("aux_boundary_conditions", "boundary_gradients"):
+        for attr in ("boundary_conditions",
+                     "aux_boundary_conditions",
+                     "boundary_gradients"):
             obj = getattr(self.sm, attr, None)
             if obj is None:
                 setattr(self, attr, None)
                 continue
-            obj_def = obj.definition
-            obj_sig = obj.args
-            obj_flat_args, obj_structure = _flatten_with_structure(obj_sig)
-            obj_arr = _to_array_of_exprs(obj_def)
-            obj_fn = sp.lambdify(obj_flat_args, list(obj_arr),
-                                 modules=[self.module, "jax"], cse=True)
-            obj_shape = _shape(obj_arr)
+            # Lambdify via NumpyRuntimeSymbolic-style with the JAX
+            # module dict so the body uses jnp.* operations.
+            stub = _StubSymbolicRegistrar(obj, attr)
+            rt = NumpyRuntimeSymbolic(stub, module=self.module, printer="jax")
+            jit_callable = jax.jit(rt.runtime_functions[attr])
+            setattr(self, attr, jit_callable)
 
-            def _build(structure_=obj_structure, fn_=obj_fn,
-                       shape_=obj_shape):
-                def _c(i_bc, time, position, distance, q_cell,
-                       qaux_cell, parameters, normal):
-                    flat = _gather_flat(structure_, i_bc, time, position,
-                                        distance, q_cell, qaux_cell,
-                                        parameters, normal)
-                    out = fn_(*flat)
-                    return jnp.asarray(out).reshape(shape_)
-                return jax.jit(_c)
-            setattr(self, attr, _build())
+
+class _StubSymbolicRegistrar:
+    """Minimal SymbolicRegistrar look-alike: exposes a single named
+    function via ``.functions``.  ``NumpyRuntimeSymbolic`` iterates
+    ``symbolic_obj.functions`` and lambdifies each entry — we feed it
+    one function at a time so each BC kernel becomes its own jit'd
+    callable."""
+
+    def __init__(self, fn_obj, name):
+        from zoomy_core.misc.misc import Zstruct
+        self.functions = Zstruct(**{name: fn_obj})
 
 
 # ── Signature-flattening helpers for the indexed BC kernel ────────
@@ -490,30 +472,58 @@ def _flatten_with_structure(sig):
 
 
 def _flatten_node(node):
+    """Recursively flatten a Zstruct/list/scalar node.  Returns
+    (flat_symbols, count) where count is the number of scalar slots
+    the signature expects for this node — used to size-match runtime
+    args (e.g. a 1D position signature declares 1 slot even though the
+    JAX mesh stores a 3D padded position array)."""
     if isinstance(node, sp.Symbol):
-        return [node], ("scalar",)
+        return [node], 1
     if hasattr(node, "values") and callable(node.values):
         syms = []
-        sub_keys = []
-        for k, v in zip(node.keys(), node.values()):
-            sub, _ = _flatten_node(v)
+        total = 0
+        for v in node.values():
+            sub, n = _flatten_node(v)
             syms.extend(sub)
-            sub_keys.append(k)
-        return syms, ("vector", sub_keys)
+            total += n
+        return syms, total
     if isinstance(node, (list, tuple)):
         syms = []
+        total = 0
         for v in node:
-            sub, _ = _flatten_node(v)
+            sub, n = _flatten_node(v)
             syms.extend(sub)
-        return syms, ("vector_n", len(node))
-    return [node], ("scalar",)
+            total += n
+        return syms, total
+    return [node], 1
+
+
+def _flatten_with_structure(sig):
+    """Walk a Zstruct-style signature and return (flat_arg_syms,
+    structure).  ``structure`` is a list of ``(key, expected_count)``
+    pairs used by ``_gather_flat`` to slice the runtime arrays to
+    the right length."""
+    flat_args: List[sp.Symbol] = []
+    structure: List[tuple] = []
+
+    if hasattr(sig, "keys") and hasattr(sig, "values"):
+        for key, val in zip(sig.keys(), sig.values()):
+            sub_flat, count = _flatten_node(val)
+            structure.append((key, count))
+            flat_args.extend(sub_flat)
+    else:
+        for i, val in enumerate(sig):
+            sub_flat, count = _flatten_node(val)
+            structure.append((f"arg{i}", count))
+            flat_args.extend(sub_flat)
+    return flat_args, structure
 
 
 def _gather_flat(structure, i_bc, time, position, distance, q_cell,
                  qaux_cell, parameters, normal):
     """Map runtime args (named) to the flat list the lambdified BC
-    function expects.  The ``structure`` records were built from the
-    signature Zstruct in source order, so we just match by key name."""
+    function expects.  Each ``structure`` entry is ``(key, count)`` —
+    we take exactly ``count`` scalars from the matching runtime arg."""
     named = {
         "i_bc_func": i_bc, "i_bc": i_bc,
         "time": time, "t": time,
@@ -525,22 +535,24 @@ def _gather_flat(structure, i_bc, time, position, distance, q_cell,
         "normal": normal, "n": normal,
     }
     flat = []
-    for key, sub in structure:
+    for key, count in structure:
         val = named.get(key, None)
         if val is None:
-            # Unknown structural key — pass zeros of compatible shape.
-            if sub[0] == "scalar":
+            # Unknown structural key — pass zeros (count of them).
+            for _ in range(count):
                 flat.append(jnp.asarray(0.0))
-            else:
-                flat.append(jnp.asarray([0.0]))
             continue
-        if sub[0] == "scalar":
+        if count == 1 and (
+            not hasattr(val, "shape") or val.shape == () or val.ndim == 0
+        ):
             flat.append(jnp.asarray(val))
-        else:
-            arr = jnp.asarray(val)
-            if arr.ndim == 0:
+            continue
+        arr = jnp.asarray(val)
+        if arr.ndim == 0:
+            # Scalar but multiple expected — repeat (rare).
+            for _ in range(count):
                 flat.append(arr)
-            else:
-                for i in range(int(arr.shape[0])):
-                    flat.append(arr[i])
+        else:
+            for i in range(count):
+                flat.append(arr[i])
     return flat

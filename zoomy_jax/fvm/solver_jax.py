@@ -24,8 +24,6 @@ import param
 
 from zoomy_core.misc.logger_config import logger
 
-import zoomy_jax.fvm.flux as fvmflux
-import zoomy_jax.fvm.nonconservative_flux as nonconservative_flux
 import zoomy_core.misc.io as io
 import zoomy_jax.misc.io as jax_io
 from zoomy_core.misc.misc import Zstruct, Settings
@@ -33,7 +31,7 @@ import zoomy_jax.fvm.ode as ode
 import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver as HyperbolicSolverNumpy
 from zoomy_core.fvm.solver_numpy import Solver as SolverNumpy
-from zoomy_jax.transformation.to_jax import JaxRuntimeModel
+from zoomy_jax.transformation.jax_runtime import JaxRuntime
 from zoomy_jax.mesh.mesh import convert_mesh_to_jax
 from zoomy_core.mesh import ensure_lsq_mesh
 
@@ -173,13 +171,11 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     """
 
     def __init__(self, **kwargs):
-        # Default: centered conservative flux + nonconservative-only fluctuations.
-        # This matches the NumPy NonconservativeRusanov formulation:
-        #   F_num (centered, no dissipation) + Dp/Dm (nc path integral + dissipation)
-        self._jax_flux = kwargs.pop("flux", fvmflux.CenteredFlux())
-        self._jax_nc_flux = kwargs.pop(
-            "nc_flux", nonconservative_flux.NonconservativeRusanov()
-        )
+        # Riemann numerics are now owned by the NSM (nsm.riemann is the
+        # symbolic class; nsm.build_numerics() instantiates it).  The
+        # JaxRuntime built in setup_simulation lambdifies that
+        # Numerics into jit-vmapped per-face callables.  No more legacy
+        # _jax_flux / _jax_nc_flux kwargs.
         super().__init__(**kwargs)
 
     # ── Runtime creation ────────────────────────────────────────────────
@@ -208,17 +204,20 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return Q, Qaux
 
     def create_runtime(self, Q, Qaux, mesh, model):
-        """Create JAX runtime: convert mesh and model to JAX-compatible forms."""
-        mesh = ensure_lsq_mesh(mesh, model)
+        """Create the JAX runtime over the NSM.
+
+        ``model`` here is ``self.nsm.sm`` — the SystemModel inside the
+        NSM that ``setup_simulation`` resolved.  Builds a
+        :class:`JaxRuntime` (jit-vmapped per-cell + per-face operators)
+        and converts the LSQ mesh to its JAX form.
+        """
         jax_mesh = convert_mesh_to_jax(mesh)
         Q, Qaux = jnp.asarray(Q), jnp.asarray(Qaux)
-        parameters = jnp.asarray(list(model.parameters.values()))
-        from zoomy_core.kernel import Kernel
-        kernel = Kernel(model)
-        kernel.regularize(model)
-        self._kernel = kernel
-        runtime_model = JaxRuntimeModel(model, kernel=kernel)
-        return Q, Qaux, parameters, jax_mesh, runtime_model
+        runtime = JaxRuntime.from_nsm(self.nsm)
+        # Parameters are live on the runtime; snapshot for the runtime
+        # state stored on self.
+        parameters = runtime.parameters
+        return Q, Qaux, parameters, jax_mesh, runtime
 
     # ── State update (vmap over cells) ──────────────────────────────────
 
@@ -239,101 +238,66 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
     # ── Operator builders ───────────────────────────────────────────────
 
-    def get_compute_source(self, mesh, model):
-        """Build JIT-compiled source operator."""
+    def get_compute_source(self, mesh, runtime):
+        """JIT-compiled source operator using JaxRuntime.source (which
+        is itself jit-vmap'd over the cell axis)."""
+        nc = mesh.n_inner_cells
+        rt_source = runtime.source
+
         @jax.jit
         @partial(jax.named_call, name="source")
         def compute_source(dt, Q, Qaux, parameters, dQ):
-            """Compute source."""
-            dQ = dQ.at[:, : mesh.n_inner_cells].set(
-                model.source(
-                    Q[:, : mesh.n_inner_cells],
-                    Qaux[:, : mesh.n_inner_cells],
-                    parameters,
-                )
-            )
-            return dQ
+            S = rt_source(Q[:, :nc], Qaux[:, :nc], parameters)
+            return dQ.at[:, :nc].set(S)
 
         return compute_source
 
-    def get_compute_source_jacobian(self, mesh, model):
-        """Build JIT-compiled source Jacobian operator."""
-        @jax.jit
-        @partial(jax.named_call, name="source_jacobian")
-        def compute_source(dt, Q, Qaux, parameters, dQ):
-            """Compute source."""
-            dQ = dQ.at[:, : mesh.n_inner_cells].set(
-                model.source_jacobian(
-                    Q[:, : mesh.n_inner_cells],
-                    Qaux[:, : mesh.n_inner_cells],
-                    parameters,
-                )
-            )
-            return dQ
-
-        return compute_source
-
-    def get_apply_boundary_conditions(self, mesh, model):
-        """Build JIT-compiled boundary condition operator."""
+    def get_apply_boundary_conditions(self, mesh, runtime):
+        """JIT-compiled BC operator that fills ghost cells via the
+        indexed kernel on JaxRuntime.boundary_conditions."""
+        rt_bc = runtime.boundary_conditions
+        if rt_bc is None:
+            # Model has no BC kernel — return identity.
+            return lambda time, Q, Qaux, parameters: Q
 
         @jax.jit
         @partial(jax.named_call, name="apply_boundary_conditions")
         def apply_boundary_conditions(time, Q, Qaux, parameters):
-            """Apply boundary conditions to ghost cells (JAX fori_loop)."""
-
             def loop_body(i, Q):
                 i = jnp.asarray(i, dtype=jnp.int32)
                 i_face = mesh.boundary_face_face_indices[i]
                 i_bc_func = mesh.boundary_face_function_numbers[i]
-
-                # Local state
                 q_cell = Q[:, mesh.boundary_face_cells[i]]
                 qaux_cell = Qaux[:, mesh.boundary_face_cells[i]]
-
-                # Geometry
                 normal = mesh.face_normals[:, i_face]
                 position = mesh.face_centers[i_face, :]
                 position_ghost = mesh.cell_centers[:, mesh.boundary_face_ghosts[i]]
                 distance = jnp.linalg.norm(position - position_ghost)
-
-                # Call the unified boundary condition function
-                q_ghost = model.boundary_conditions(
-                    i_bc_func,
-                    time,
-                    position,
-                    distance,
-                    q_cell,
-                    qaux_cell,
-                    parameters,
-                    normal,
+                q_ghost = rt_bc(
+                    i_bc_func, time, position, distance,
+                    q_cell, qaux_cell, parameters, normal,
                 )
-
                 Q = Q.at[:, mesh.boundary_face_ghosts[i]].set(q_ghost)
                 return Q
 
-            # Loop over boundary faces
-            Q_updated = jax.lax.fori_loop(0, mesh.n_boundary_faces, loop_body, Q)
-            return Q_updated
+            return jax.lax.fori_loop(0, mesh.n_boundary_faces, loop_body, Q)
 
         return apply_boundary_conditions
 
-    def get_compute_max_abs_eigenvalue(self, mesh, model):
-        """Build JIT-compiled max eigenvalue computation."""
+    def get_compute_max_abs_eigenvalue(self, mesh, runtime):
+        """Max |eigenvalue| over the faces, using JaxRuntime.eigenvalues
+        (which is jit-vmap'd per cell)."""
+        rt_eig = runtime.eigenvalues
+
         @jax.jit
         @partial(jax.named_call, name="max_abs_eigenvalue")
         def compute_max_abs_eigenvalue(Q, Qaux, parameters):
-            """Compute max abs eigenvalue (scalar)."""
-            i_cellA = mesh.face_cells[0]
-            i_cellB = mesh.face_cells[1]
-            qA = Q[:, i_cellA]
-            qB = Q[:, i_cellB]
-            qauxA = Qaux[:, i_cellA]
-            qauxB = Qaux[:, i_cellB]
+            iA = mesh.face_cells[0]
+            iB = mesh.face_cells[1]
             normal = mesh.face_normals
-            evA = model.eigenvalues(qA, qauxA, parameters, normal)
-            evB = model.eigenvalues(qB, qauxB, parameters, normal)
-            max_abs_eigenvalue = jnp.maximum(jnp.abs(evA).max(), jnp.abs(evB).max())
-            return max_abs_eigenvalue
+            evA = rt_eig(Q[:, iA], Qaux[:, iA], parameters, normal)
+            evB = rt_eig(Q[:, iB], Qaux[:, iB], parameters, normal)
+            return jnp.maximum(jnp.abs(evA).max(), jnp.abs(evB).max())
 
         return compute_max_abs_eigenvalue
 
@@ -348,23 +312,21 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 mesh, dim, limiter=self.nsm.reconstruction.limiter)
         return ConstantReconstruction(mesh, dim)
 
-    def get_flux_operator(self, mesh, model):
-        """Build flux operator with reconstruction (conservative + nonconservative)."""
-        compute_num_flux = self._jax_flux.get_flux_operator(model)
-        compute_nc_flux = self._jax_nc_flux.get_flux_operator(model)
-
-        # Build reconstruction (resolved once, not per step)
-        symbolic_model = model.model if hasattr(model, "model") else model
-        reconstruct = self._build_reconstruction(mesh, symbolic_model)
+    def get_flux_operator(self, mesh, runtime):
+        """Flux operator using JaxRuntime's symbolic-Riemann
+        numerical_flux + numerical_fluctuations (both vmap'd over
+        the face axis).  Mirrors the NumPy solver's symbolic path —
+        no more legacy CenteredFlux / NonconservativeRusanov JAX
+        wrappers."""
+        # Build reconstruction (resolved once, not per step).
+        reconstruct = self._build_reconstruction(mesh, runtime.sm)
+        rt_num_flux = runtime.numerical_flux
+        rt_num_fluct = runtime.numerical_fluctuations
+        n_eq = runtime.n_state
 
         @jax.jit
         @partial(jax.named_call, name="Flux")
         def flux_operator(dt, Q, Qaux, parameters, dQ):
-            """Flux operator with conservative flux + nonconservative fluctuation.
-
-            Mirrors NumPy: dQ[iA] -= (F_num + Dm) * fv/cv
-                           dQ[iB] -= (-F_num + Dp) * fv/cv
-            """
             dQ = jnp.zeros_like(dQ)
 
             iA = mesh.face_cells[0]
@@ -377,22 +339,16 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             face_volumes = mesh.face_volumes
             cell_volumesA = mesh.cell_volumes[iA]
             cell_volumesB = mesh.cell_volumes[iB]
-            svA = mesh.face_subvolumes[:, 0]
-            svB = mesh.face_subvolumes[:, 1]
 
-            # Conservative numerical flux: F_num = 0.5*(F_L+F_R).n - 0.5*sM*(Q_R-Q_L)
-            F_num = compute_num_flux(
-                Q_L, Q_R, qauxA, qauxB, parameters, normals,
-                svA, svB, face_volumes, dt,
-            )
+            # Symbolic Riemann (jit-vmap'd over face axis on the
+            # runtime).  F_num: (n_eq, n_faces); fluct: (2, n_eq,
+            # n_faces) — outer axis selects (Dp, Dm) per the
+            # ``ZArray([Dp, Dm])`` layout of ``numerical_fluctuations``.
+            F_num = rt_num_flux(Q_L, Q_R, qauxA, qauxB, parameters, normals)
+            fluct = rt_num_fluct(Q_L, Q_R, qauxA, qauxB, parameters, normals)
+            Dp = fluct[0]
+            Dm = fluct[1]
 
-            # Nonconservative fluctuations: Dp, Dm from path integral
-            Dp, Dm = compute_nc_flux(
-                Q_L, Q_R, qauxA, qauxB, parameters, normals,
-                svA, svB, face_volumes, dt,
-            )
-
-            # Combined update (conservative + nonconservative)
             dQ = dQ.at[:, iA].subtract((F_num + Dm) * face_volumes / cell_volumesA)
             dQ = dQ.at[:, iB].subtract((-F_num + Dp) * face_volumes / cell_volumesB)
             return dQ
@@ -423,19 +379,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         """
         nsm, source_model = self._coerce_to_nsm(model)
         self.nsm = nsm
-        if source_model is None:
-            raise NotImplementedError(
-                "JAX setup_simulation currently requires a Model (or an "
-                "NSM auto-promoted from one) — the JaxRuntimeModel + "
-                "Kernel pipeline does not yet accept a bare SystemModel. "
-                "Pass the source Model directly, or wait for the JAX "
-                "runtime to switch to JaxRuntimeModel.from_system_model."
-            )
-        model = source_model
         mesh = ensure_lsq_mesh(mesh, nsm)
-        Q, Qaux = self.initialize(mesh, model)
+        # `initialize` only needs the SystemModel's shape info + the
+        # initial_conditions if the SM carries them.  Source Model is
+        # no longer required — JaxRuntime is the runtime.
+        Q, Qaux = self.initialize(mesh, source_model if source_model is not None else nsm.sm)
         Q, Qaux, parameters, jax_mesh, runtime_model = self.create_runtime(
-            Q, Qaux, mesh, model
+            Q, Qaux, mesh, nsm.sm,
         )
 
         # Store runtime state for step / run_simulation
