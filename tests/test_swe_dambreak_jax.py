@@ -43,6 +43,7 @@ import zoomy_core.model.initial_conditions as IC
 from zoomy_core.mesh import LSQMesh
 from zoomy_core.misc.misc import ZArray
 from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
+from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 
 # Avoid spamming logs during tests.
 from loguru import logger
@@ -62,10 +63,11 @@ class SWEHyperbolicSolver(HyperbolicSolver):
 
     def _build_reconstruction(self, mesh, symbolic_model):
         dim = symbolic_model.dimension
-        if self.reconstruction_order >= 2:
+        if self.nsm.reconstruction.order >= 2:
             # h is variable index 0 for our SWE1D model (state = [h, hu]).
             return FreeSurfaceMUSCL(
-                mesh, dim, h_index=0, eps_wet=1e-6, limiter=self.limiter,
+                mesh, dim, h_index=0, eps_wet=1e-6,
+                limiter=self.nsm.reconstruction.limiter,
             )
         return ConstantReconstruction(mesh, dim)
 
@@ -162,13 +164,13 @@ def _run(N: int, order: int) -> tuple[np.ndarray, np.ndarray]:
     """Return (x_inner, h_inner) at t = T_END for given N, reconstruction order."""
     mesh = LSQMesh.create_1d(domain=DOMAIN, n_inner_cells=N, lsq_degree=2)
     model = _make_model()
+    nsm = NumericalSystemModel.from_system_model(
+        model, reconstruction=ReconstructionSpec(order=order, limiter="minmod"))
     solver = SWEHyperbolicSolver(
         time_end=T_END,
-        reconstruction_order=order,
-        limiter="minmod",          # minmod is wet-dry safe
         compute_dt=timestepping.adaptive(CFL=0.3),
     )
-    Q, _ = solver.solve(mesh, model, write_output=False)
+    Q, _ = solver.solve(mesh, nsm, write_output=False)
     x = np.asarray(mesh.cell_centers[0, :N])
     h = np.asarray(Q[0, :N])
     return x, h
@@ -200,13 +202,13 @@ def _make_smooth_model():
 def _run_smooth(N: int, order: int, t_end: float = T_SMOOTH) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mesh = LSQMesh.create_1d(domain=DOMAIN, n_inner_cells=N, lsq_degree=2)
     model = _make_smooth_model()
+    nsm = NumericalSystemModel.from_system_model(
+        model, reconstruction=ReconstructionSpec(order=order, limiter="minmod"))
     solver = SWEHyperbolicSolver(
         time_end=t_end,
-        reconstruction_order=order,
-        limiter="minmod",
         compute_dt=timestepping.adaptive(CFL=0.3),
     )
-    Q, _ = solver.solve(mesh, model, write_output=False)
+    Q, _ = solver.solve(mesh, nsm, write_output=False)
     x = np.asarray(mesh.cell_centers[0, :N])
     return x, np.asarray(Q[0, :N]), np.asarray(Q[1, :N])
 

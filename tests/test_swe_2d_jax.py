@@ -32,6 +32,7 @@ from zoomy_core.misc.misc import ZArray
 from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
 
 from zoomy_jax.fvm.solver_jax import HyperbolicSolver
+from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 from zoomy_jax.fvm.reconstruction_jax import (
     ConstantReconstruction, FreeSurfaceMUSCL,
 )
@@ -78,9 +79,10 @@ class SWE2DHyperbolicSolver(HyperbolicSolver):
 
     def _build_reconstruction(self, mesh, symbolic_model):
         dim = symbolic_model.dimension
-        if self.reconstruction_order >= 2:
+        if self.nsm.reconstruction.order >= 2:
             return FreeSurfaceMUSCL(
-                mesh, dim, h_index=0, eps_wet=1e-6, limiter=self.limiter,
+                mesh, dim, h_index=0, eps_wet=1e-6,
+                limiter=self.nsm.reconstruction.limiter,
             )
         return ConstantReconstruction(mesh, dim)
 
@@ -118,14 +120,16 @@ def _make_model():
 def _run(order: int) -> tuple[LSQMesh, np.ndarray]:
     mesh = LSQMesh.create_2d(domain=DOMAIN, nx=NX, ny=NY, lsq_degree=2)
     model = _make_model()
+    nsm = NumericalSystemModel.from_system_model(
+        model,
+        reconstruction=ReconstructionSpec(order=order, limiter="minmod"),
+    )
     solver = SWE2DHyperbolicSolver(
         time_end=T_END,
-        reconstruction_order=order,
-        limiter="minmod",
         compute_dt=timestepping.adaptive(CFL=0.3),
         nc_flux=ZeroNCFlux(),     # flat-bed SWE has no nonconservative term
     )
-    Q, _ = solver.solve(mesh, model, write_output=False)
+    Q, _ = solver.solve(mesh, nsm, write_output=False)
     return mesh, np.asarray(Q)
 
 
