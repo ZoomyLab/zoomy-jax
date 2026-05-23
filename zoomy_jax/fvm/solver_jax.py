@@ -343,8 +343,9 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             ConstantReconstruction, MUSCLReconstruction,
         )
         dim = symbolic_model.dimension
-        if self.reconstruction_order >= 2:
-            return MUSCLReconstruction(mesh, dim, limiter=self.limiter)
+        if self.nsm.reconstruction.order >= 2:
+            return MUSCLReconstruction(
+                mesh, dim, limiter=self.nsm.reconstruction.limiter)
         return ConstantReconstruction(mesh, dim)
 
     def get_flux_operator(self, mesh, model):
@@ -404,18 +405,15 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         """Build all JAX operators from mesh and model.
 
         ``model`` may be a :class:`Model`, a :class:`SystemModel`, or a
-        :class:`NumericalSystemModel`.  Auto-promoted NSMs inherit the
-        solver's current ``reconstruction_order`` / ``limiter`` /
-        ``eigenvalue_regularization`` kwargs; an explicitly-supplied
-        NSM's slots override them.  Either way, the mesh stencil uses
-        ``nsm.resolved_lsq_degree()`` (max spatial derivative order
-        across ``sm.aux_registry`` and any captured
-        ``source_derivative_specs``).
+        :class:`NumericalSystemModel`.  All numerical knobs
+        (``reconstruction.order``, ``reconstruction.limiter``,
+        ``regularization.eigenvalue_eps``) live on the NSM; the mesh
+        stencil uses ``nsm.resolved_lsq_degree()``.
 
         Until the JAX runtime is wired through
-        ``JaxRuntimeModel.from_system_model`` (next subtask), callers
-        passing a bare SystemModel or an NSM built from one must do so
-        with a source Model — JAX's :class:`Kernel` + Model-based
+        ``JaxRuntimeModel.from_system_model`` (S4b), callers passing a
+        bare SystemModel or an NSM built from one must do so with a
+        source Model — JAX's :class:`Kernel` + Model-based
         ``JaxRuntimeModel`` paths still need it.
 
         Returns
@@ -425,7 +423,6 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         """
         nsm, source_model = self._coerce_to_nsm(model)
         self.nsm = nsm
-        self._apply_nsm_overrides(nsm)
         if source_model is None:
             raise NotImplementedError(
                 "JAX setup_simulation currently requires a Model (or an "
@@ -489,7 +486,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         bc = self._rt_bc_op
         flux = self._rt_flux_op
 
-        if self.reconstruction_order >= 2:
+        if self.nsm.reconstruction.order >= 2:
             # SSP-RK2 (Heun) with per-stage BC.
             Q0 = Q
             Q_bc0 = bc(time, Q0, Qaux, parameters)

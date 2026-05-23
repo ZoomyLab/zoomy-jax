@@ -323,7 +323,7 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                 jv_backend, self.fd_eps)
 
         # Select ODE stepper: RK2 for 2nd-order, RK1 for 1st-order
-        ode_step = ode.RK2 if self.reconstruction_order >= 2 else ode.RK1
+        ode_step = ode.RK2 if self.nsm.reconstruction.order >= 2 else ode.RK1
 
         # ── build the full loop ──────────────────────────────────────────
 
@@ -368,7 +368,7 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         has_diff = impl_diffusion is not None
         logger.info(
             f"JIT-compiling IMEX loop (source_mode={source_mode}, "
-            f"jv={jv_backend}, ode={'RK2' if self.reconstruction_order >= 2 else 'RK1'}, "
+            f"jv={jv_backend}, ode={'RK2' if self.nsm.reconstruction.order >= 2 else 'RK1'}, "
             f"diffusion={'CN' if has_diff else 'none'}) ...")
         t_c0 = _time.time()
         lowered = jax.jit(run_loop).lower(
