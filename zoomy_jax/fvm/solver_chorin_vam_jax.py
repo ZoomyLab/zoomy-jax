@@ -180,11 +180,17 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         # 1. Pad SM_pred to square + wrap in NSM with the pressure +
         # corrector sub-systems as ``additional_systems`` so the
         # predictor mesh stencil is sized for the pressure block's
-        # second-derivative requirements.
+        # second-derivative requirements.  Use Audusse HR Rusanov
+        # (``PositiveNonconservativeRusanov``) for LAR balance —
+        # matches the NumPy ChorinSplitVAMSolver default.
+        from zoomy_core.fvm.riemann_solvers import (
+            PositiveNonconservativeRusanov,
+        )
         sm_pred_square = _pad_to_square(self.sm_pred)
         self._sm_pred_square = sm_pred_square
         nsm_pred = NumericalSystemModel.from_system_model(
             sm_pred_square,
+            riemann=PositiveNonconservativeRusanov,
             reconstruction=self._reconstruction_spec,
             additional_systems=[self.sm_press, self.sm_corr],
         )
@@ -342,29 +348,37 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
             return Qaux_work
 
         def _residual(p_vec):
+            """Lambdified elliptic-block source evaluated at
+            Q[e2s] = p_mat (other state frozen at predictor output).
+            Affine in p_vec by construction (split_simple builds the
+            elliptic block to be linear in P)."""
             p_mat = p_vec.reshape(nP, nc)
             Q_try = Q.at[e2s, :].set(p_mat)
             Qaux_work = _refresh_pressure_aux(p_mat, Qaux0)
             R = rt.source(Q_try, Qaux_work, p_full)
-            # source returns (n_eq, n_cells).
             return R.reshape(-1)
 
+        # Data forcing: b = R(P = 0).  Independent of the GMRES iterate.
         b = _residual(jnp.zeros(N))
         b_norm = float(jnp.linalg.norm(b))
         if b_norm < self.pressure_tol:
-            # Skip — exact lake-at-rest case.
             return
 
-        def matvec(p_vec):
-            return _residual(p_vec) - b
+        # JVP-based linear operator.  ``custom_linear_solve`` needs to
+        # transpose-trace the matvec; an explicit JVP at p = 0
+        # extracts the linear part of _residual w.r.t. p, which JAX
+        # transposes natively (= VJP).  This avoids the
+        # AssertionError on full-rt.source closures over frozen state.
+        zero_p = jnp.zeros(N)
 
-        p0 = Q[e2s, :].reshape(-1)
+        def matvec(p_vec):
+            _, jvp_val = jax.jvp(_residual, (zero_p,), (p_vec,))
+            return jvp_val
+
         p_new, info = jax_gmres(
-            matvec, -b, x0=p0,
-            tol=self.pressure_tol,
+            matvec, -b,
+            atol=0.0, tol=self.pressure_tol,
             maxiter=self.pressure_maxit,
-            solve_method="incremental",
-            restart=min(50, N),
         )
         if info != 0:
             logger.warning(
