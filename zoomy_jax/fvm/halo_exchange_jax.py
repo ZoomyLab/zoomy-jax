@@ -75,41 +75,62 @@ def _send_right(x_halo_slab, axis_name, n_devices):
 
 
 def halo_exchange_inplace(Q_pad, halo, axis_name, n_devices):
-    """Refill the halo slabs of ``Q_pad`` with neighbor data via
-    ``lax.ppermute``.
+    """[Surrounding layout] Refill the halo slabs of ``Q_pad`` with
+    neighbor data via ``lax.ppermute``.
 
-    Parameters
-    ----------
-    Q_pad : jnp.ndarray, shape ``(n_var, n_local + 2*halo)``
-        Padded local state with empty (stale) halo slabs at both ends.
-    halo : int
-        Halo width (same on both sides).
-    axis_name : str
-        SPMD axis name (must match the ``shard_map`` mesh axis).
-    n_devices : int
-        Number of devices along ``axis_name``.
+    ``Q_pad`` layout: ``[halo_left | n_local owned | halo_right]``.
 
-    Returns
-    -------
-    Q_pad : jnp.ndarray
-        Same shape, with halo slabs refilled.  At the global domain
-        boundary the corresponding halo slab contains zeros — the
-        caller is responsible for overwriting it with the BC-evaluated
-        face value.
+    Used by the demo SPMD advection / partition tests.  For solver-
+    side LSQ-MUSCL composition (where the existing reconstruction
+    iterates ``jnp.arange(n_inner_cells)`` from index 0), use
+    :func:`halo_exchange_owned_first` instead — its layout matches
+    ``LSQMesh``'s convention (ghosts at the end).
     """
-    # Owned edge slabs (just inside the halo).
     left_owned = Q_pad[:, halo:2 * halo]
     right_owned = Q_pad[:, -2 * halo:-halo]
-
-    # To fill MY left halo I need MY LEFT NEIGHBOR'S right-owned slab.
-    # That arrives via _send_right (data flows RIGHT, so what reaches
-    # me is the right-owned slab from the device to my left).
     fill_left_halo = _send_right(right_owned, axis_name, n_devices)
-    # To fill MY right halo I need MY RIGHT NEIGHBOR'S left-owned slab.
-    # That arrives via _send_left (data flows LEFT, so what reaches
-    # me is the left-owned slab from the device to my right).
     fill_right_halo = _send_left(left_owned, axis_name, n_devices)
-
     Q_pad = Q_pad.at[:, :halo].set(fill_left_halo)
     Q_pad = Q_pad.at[:, -halo:].set(fill_right_halo)
+    return Q_pad
+
+
+def halo_exchange_owned_first(Q_pad, n_local, halo, axis_name, n_devices):
+    """[Owned-first layout, matches LSQMesh convention] Refill the
+    halo slabs of ``Q_pad`` via ``lax.ppermute``.
+
+    Layout::
+
+        [  owned (n_local)  |  left_halo (halo)  |  right_halo (halo)  ]
+           indices 0..n_local-1   n_local..n_local+halo-1   ...
+
+    The owned region is at the **front** so the existing per-cell
+    reconstruction (``jnp.arange(n_inner_cells)`` over owned cells)
+    works directly.  Halo cells live at the end of the array, mirroring
+    how ``LSQMesh`` stores BC ghost cells at indices
+    ``[n_inner_cells .. n_cells)``.
+
+    Send pattern:
+      * MY leftmost slab ``[0:halo]`` → fills LEFT neighbor's
+        right_halo.
+      * MY rightmost slab ``[n_local-halo:n_local]`` → fills RIGHT
+        neighbor's left_halo.
+
+    Receive (after ppermute):
+      * MY left_halo  = LEFT neighbor's rightmost owned slab.
+      * MY right_halo = RIGHT neighbor's leftmost owned slab.
+
+    At the global domain boundary the corresponding halo slab
+    contains zeros — the inline BC kernel on the solver side
+    overwrites them.
+    """
+    my_leftmost = Q_pad[:, 0:halo]
+    my_rightmost = Q_pad[:, n_local - halo:n_local]
+    # MY left_halo = LEFT neighbor's rightmost slab; data flows RIGHT
+    # so I receive it via _send_right.
+    fill_left_halo = _send_right(my_rightmost, axis_name, n_devices)
+    # MY right_halo = RIGHT neighbor's leftmost slab; data flows LEFT.
+    fill_right_halo = _send_left(my_leftmost, axis_name, n_devices)
+    Q_pad = Q_pad.at[:, n_local:n_local + halo].set(fill_left_halo)
+    Q_pad = Q_pad.at[:, n_local + halo:n_local + 2 * halo].set(fill_right_halo)
     return Q_pad
