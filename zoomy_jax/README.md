@@ -101,7 +101,7 @@ jax.distributed.initialize()  # once per process at startup
 
 ### Validation suite
 
-Eight bit-identity tests in `tests/unit/zoomy_jax/`:
+20 bit-identity tests in `tests/unit/zoomy_jax/`:
 
 | File                                | What it pins                       |
 |-------------------------------------|------------------------------------|
@@ -112,6 +112,7 @@ Eight bit-identity tests in `tests/unit/zoomy_jax/`:
 | `test_spmd_lsq_muscl.py`            | LSQ MUSCL reconstruction composes (inter-partition + replicated) |
 | `test_spmd_hyperbolic_solver.py`    | `HyperbolicSolver.get_flux_operator` composes (order=1 + order=2) |
 | `test_spmd_rk2_step.py`             | SSP-RK2 step with per-stage halo exchange |
+| `test_spmd_parameter_mutation.py`   | Parameter changes propagate (not constant-folded) — unblocks param sweeps + `jax.grad` |
 
 Run all with:
 
