@@ -403,17 +403,40 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     def setup_simulation(self, mesh, model):
         """Build all JAX operators from mesh and model.
 
-        Converts mesh to MeshJAX, model to JaxRuntimeModel, and creates
-        closures for flux, source, boundary conditions, and eigenvalue
-        computation. The operators are stored as attributes for use by
-        ``step`` and ``run_simulation``.
+        ``model`` may be a :class:`Model`, a :class:`SystemModel`, or a
+        :class:`NumericalSystemModel`.  Auto-promoted NSMs inherit the
+        solver's current ``reconstruction_order`` / ``limiter`` /
+        ``eigenvalue_regularization`` kwargs; an explicitly-supplied
+        NSM's slots override them.  Either way, the mesh stencil uses
+        ``nsm.resolved_lsq_degree()`` (max spatial derivative order
+        across ``sm.aux_registry`` and any captured
+        ``source_derivative_specs``).
+
+        Until the JAX runtime is wired through
+        ``JaxRuntimeModel.from_system_model`` (next subtask), callers
+        passing a bare SystemModel or an NSM built from one must do so
+        with a source Model — JAX's :class:`Kernel` + Model-based
+        ``JaxRuntimeModel`` paths still need it.
 
         Returns
         -------
         Q, Qaux : jnp.ndarray
             Initial state arrays on device.
         """
-        mesh = ensure_lsq_mesh(mesh, model)
+        nsm, source_model = self._coerce_to_nsm(model)
+        self.nsm = nsm
+        self._apply_nsm_overrides(nsm)
+        if source_model is None:
+            raise NotImplementedError(
+                "JAX setup_simulation currently requires a Model (or an "
+                "NSM auto-promoted from one) — the JaxRuntimeModel + "
+                "Kernel pipeline does not yet accept a bare SystemModel. "
+                "Pass the source Model directly, or wait for the JAX "
+                "runtime to switch to JaxRuntimeModel.from_system_model."
+            )
+        model = source_model
+        mesh = ensure_lsq_mesh(mesh, nsm.sm,
+                               lsq_degree=nsm.resolved_lsq_degree())
         Q, Qaux = self.initialize(mesh, model)
         Q, Qaux, parameters, jax_mesh, runtime_model = self.create_runtime(
             Q, Qaux, mesh, model
