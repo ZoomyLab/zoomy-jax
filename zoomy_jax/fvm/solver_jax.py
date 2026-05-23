@@ -181,26 +181,16 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     # ── Runtime creation ────────────────────────────────────────────────
 
     def initialize(self, mesh, model):
-        """Allocate state arrays sized for the *full* mesh, including the
-        ghost cells that the indexed-BC operator writes into.
+        """Allocate state arrays of shape ``(n_var, n_inner_cells)`` —
+        no ghost cells.  Boundary values are computed inline inside
+        the flux operator from the indexed BC kernel; the LSQ-MUSCL
+        reconstruction sees them via the LSQ-augmented stencil
+        (``lsq_boundary_face_neighbors``) and uses the BC face values
+        as ``Q_R`` at boundary faces (NumPy parity).
 
-        The numpy solver stores only inner cells and recomputes face
-        boundary values inside its flux operator on-demand; the JAX path
-        works the other way round — ghost cells are written by the BC
-        kernel and read directly from Q at boundary faces. If Q is sized
-        to inner-cells-only, those writes target out-of-bounds indices,
-        JAX silently clips them, and every BC degenerates to a clamp on
-        the last interior cell (this was masking real solutions for
-        Periodic / non-Extrapolation BCs entirely).
+        Matches the NumPy contract: ``Q.shape[1] == mesh.n_inner_cells``.
         """
-        Q_in, Qaux_in = super().initialize(mesh, model)
-        n_cells = mesh.n_cells
-        n_vars = Q_in.shape[0]
-        n_aux = Qaux_in.shape[0]
-        Q = np.zeros((n_vars, n_cells), dtype=Q_in.dtype)
-        Qaux = np.zeros((n_aux, n_cells), dtype=Qaux_in.dtype)
-        Q[:, : mesh.n_inner_cells] = Q_in
-        Qaux[:, : mesh.n_inner_cells] = Qaux_in
+        Q, Qaux = super().initialize(mesh, model)
         return Q, Qaux
 
     def create_runtime(self, Q, Qaux, mesh, model):
@@ -302,77 +292,158 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return compute_max_abs_eigenvalue
 
     def _build_reconstruction(self, mesh, symbolic_model):
-        """Build JAX face reconstruction. Override for free-surface variants."""
+        """Build JAX face reconstruction.
+
+        First-order: piecewise-constant.  Second-order: the LSQ-augmented
+        MUSCL (``LSQMUSCLReconstructionJAX``) — mirrors NumPy
+        ``LSQMUSCLReconstruction``, takes ``Q`` of shape
+        ``(n_var, n_inner_cells)`` and uses the BC-provided
+        ``bf_face_values`` for both the limiter bounds and ``Q_R`` at
+        boundary faces.
+        """
         from zoomy_jax.fvm.reconstruction_jax import (
-            ConstantReconstruction, MUSCLReconstruction,
+            ConstantReconstruction, LSQMUSCLReconstructionJAX,
         )
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
-            return MUSCLReconstruction(
+            return LSQMUSCLReconstructionJAX(
                 mesh, dim, limiter=self.nsm.reconstruction.limiter)
         return ConstantReconstruction(mesh, dim)
 
     def get_flux_operator(self, mesh, runtime):
-        """Flux operator using JaxRuntime's symbolic-Riemann
-        numerical_flux + numerical_fluctuations (both vmap'd over the
-        face axis).  Boundary-condition kernel is invoked inline
-        (mirrors NumPy semantically — no separate pre-step BC pass)."""
+        """Flux operator — literal NumPy parity (S5b).
+
+        * ``Q`` has shape ``(n_var, n_inner_cells)`` — no ghost cells.
+        * Boundary face values are evaluated inline from the BC kernel
+          (vmap'd over the boundary face axis).
+        * The LSQ-MUSCL reconstruction is fed ``Q + bf_values`` so its
+          limiter bounds and ``Q_R`` at boundary faces are physically
+          consistent.
+        * Interior + boundary faces are accumulated in separate
+          accumulators (split loops).
+        """
         reconstruct = self._build_reconstruction(mesh, runtime.sm)
         rt_num_flux = runtime.numerical_flux
         rt_num_fluct = runtime.numerical_fluctuations
         rt_bc = runtime.boundary_conditions
+
+        # Precompute face index arrays.
+        fc0 = np.asarray(mesh.face_cells[0])
+        fc1 = np.asarray(mesh.face_cells[1])
+        bf_face_idx = np.asarray(mesh.boundary_face_face_indices)
+        bf_func_no = np.asarray(mesh.boundary_face_function_numbers)
+        n_bf = int(mesh.n_boundary_faces)
+        n_faces = int(mesh.n_faces)
+        bf_set = set(int(f) for f in bf_face_idx)
+        interior_faces = np.array(
+            [f for f in range(n_faces) if f not in bf_set], dtype=np.int32)
+
+        iA_int = jnp.asarray(fc0[interior_faces])
+        iB_int = jnp.asarray(fc1[interior_faces])
+        iInner_bnd = jnp.asarray(fc0[bf_face_idx])
+        interior_faces_j = jnp.asarray(interior_faces)
+        boundary_faces_j = jnp.asarray(bf_face_idx)
+        bf_func_no_j = jnp.asarray(bf_func_no, dtype=jnp.int32)
+
+        face_centers_j = jnp.asarray(mesh.face_centers)
+        face_normals_j = jnp.asarray(mesh.face_normals)
+        face_volumes_j = jnp.asarray(mesh.face_volumes)
+        cell_volumes_j = jnp.asarray(mesh.cell_volumes)
+        cell_centers_j = jnp.asarray(mesh.cell_centers)
+        boundary_face_cells_j = jnp.asarray(
+            mesh.boundary_face_cells, dtype=jnp.int32)
+
+        # Distance from boundary face to inner cell (precomputed).
+        d_face = np.asarray([
+            np.linalg.norm(
+                np.asarray(mesh.face_centers)[bf_face_idx[i], :]
+                - np.asarray(mesh.cell_centers)[:, mesh.boundary_face_cells[i]])
+            for i in range(n_bf)
+        ]) if n_bf > 0 else np.zeros(0)
+        d_face_j = jnp.asarray(d_face)
 
         @jax.jit
         @partial(jax.named_call, name="Flux")
         def flux_operator(dt, time, Q, Qaux, parameters, dQ):
             dQ = jnp.zeros_like(dQ)
 
-            iA = mesh.face_cells[0]
-            iB = mesh.face_cells[1]
-
-            # 1. Inline BC application — write the ghost-cell values
-            # for every boundary face from the BC kernel before
-            # reconstruction sees them.  Equivalent to the NumPy
-            # "evaluate BC face values inline in flux_operator"
-            # pattern; here it still writes into the JAX-padded ghost
-            # slots so reconstruction's stencil walks them naturally.
-            if rt_bc is not None:
-                def _bc_body(i, Q):
-                    i_face = mesh.boundary_face_face_indices[i]
-                    i_bc_func = mesh.boundary_face_function_numbers[i]
-                    cell = mesh.boundary_face_cells[i]
-                    ghost = mesh.boundary_face_ghosts[i]
-                    q_cell = Q[:, cell]
-                    qaux_cell = Qaux[:, cell]
-                    normal = mesh.face_normals[:, i_face]
-                    position = mesh.face_centers[i_face, :]
-                    distance = jnp.linalg.norm(
-                        position - mesh.cell_centers[:, ghost])
-                    q_ghost = rt_bc(
-                        i_bc_func, time, position, distance,
-                        q_cell, qaux_cell, parameters, normal,
+            # 1. Boundary face values via BC kernel (vmap over boundary faces).
+            if rt_bc is not None and n_bf > 0:
+                def _per_bf(i):
+                    cell = boundary_face_cells_j[i]
+                    fidx = boundary_faces_j[i]
+                    return rt_bc(
+                        bf_func_no_j[i], time,
+                        face_centers_j[fidx, :], d_face_j[i],
+                        Q[:, cell], Qaux[:, cell],
+                        parameters, face_normals_j[:, fidx],
                     )
-                    return Q.at[:, ghost].set(q_ghost)
+                # Python loop (vmap interacts poorly with the indexed
+                # BC kernel's structural switch on i_bc_func; the loop
+                # is over ~O(boundary faces) which is small).
+                bf_values_list = [_per_bf(i) for i in range(n_bf)]
+                bf_values = jnp.stack(bf_values_list, axis=-1)
+            else:
+                bf_values = jnp.zeros((Q.shape[0], max(n_bf, 1)))
 
-                Q = jax.lax.fori_loop(0, mesh.n_boundary_faces, _bc_body, Q)
-
-            # 2. Reconstruct face states.
-            Q_L, Q_R = reconstruct(Q)
-            qauxA = Qaux[:, iA]
-            qauxB = Qaux[:, iB]
-            normals = mesh.face_normals
-            face_volumes = mesh.face_volumes
-            cell_volumesA = mesh.cell_volumes[iA]
-            cell_volumesB = mesh.cell_volumes[iB]
+            # 2. Reconstruct with bf_values (LSQ-MUSCL sees boundary
+            # face values for limiter bounds + Q_R override).
+            Q_L, Q_R = reconstruct(Q, bf_values)
+            normals = face_normals_j
+            face_volumes = face_volumes_j
 
             # 3. Symbolic Riemann (jit-vmap'd over face axis).
-            F_num = rt_num_flux(Q_L, Q_R, qauxA, qauxB, parameters, normals)
-            fluct = rt_num_fluct(Q_L, Q_R, qauxA, qauxB, parameters, normals)
-            Dp = fluct[0]
-            Dm = fluct[1]
+            qauxA = Qaux[:, iA_int]
+            qauxB = Qaux[:, iB_int]
+            normals_int = normals[:, interior_faces_j]
+            fv_int = face_volumes[interior_faces_j]
+            cvA_int = cell_volumes_j[iA_int]
+            cvB_int = cell_volumes_j[iB_int]
+            Q_L_int = Q_L[:, interior_faces_j]
+            Q_R_int = Q_R[:, interior_faces_j]
 
-            dQ = dQ.at[:, iA].subtract((F_num + Dm) * face_volumes / cell_volumesA)
-            dQ = dQ.at[:, iB].subtract((-F_num + Dp) * face_volumes / cell_volumesB)
+            F_num_int = rt_num_flux(
+                Q_L_int, Q_R_int, qauxA, qauxB, parameters, normals_int)
+            fluct_int = rt_num_fluct(
+                Q_L_int, Q_R_int, qauxA, qauxB, parameters, normals_int)
+            Dp_int = fluct_int[0]
+            Dm_int = fluct_int[1]
+
+            dQ = dQ.at[:, iA_int].subtract(
+                (F_num_int + Dm_int) * fv_int / cvA_int)
+            dQ = dQ.at[:, iB_int].subtract(
+                (-F_num_int + Dp_int) * fv_int / cvB_int)
+
+            # 4. Boundary face loop — one inner cell only.
+            if n_bf > 0:
+                qauxBnd = Qaux[:, iInner_bnd]
+                normals_bnd = normals[:, boundary_faces_j]
+                fv_bnd = face_volumes[boundary_faces_j]
+                cv_bnd = cell_volumes_j[iInner_bnd]
+                Q_L_bnd = Q_L[:, boundary_faces_j]
+                # Q_R at boundary = BC(Q_L_at_face) — recompute from the
+                # reconstructed inner state to keep the limiter and BC
+                # consistent at face center (mirrors NumPy override).
+                def _per_bf_R(i):
+                    cell = boundary_face_cells_j[i]
+                    fidx = boundary_faces_j[i]
+                    return rt_bc(
+                        bf_func_no_j[i], time,
+                        face_centers_j[fidx, :], d_face_j[i],
+                        Q_L_bnd[:, i], Qaux[:, cell],
+                        parameters, face_normals_j[:, fidx],
+                    )
+                Q_R_bnd_list = [_per_bf_R(i) for i in range(n_bf)]
+                Q_R_bnd = jnp.stack(Q_R_bnd_list, axis=-1)
+
+                F_num_bnd = rt_num_flux(
+                    Q_L_bnd, Q_R_bnd, qauxBnd, qauxBnd, parameters, normals_bnd)
+                fluct_bnd = rt_num_fluct(
+                    Q_L_bnd, Q_R_bnd, qauxBnd, qauxBnd, parameters, normals_bnd)
+                Dm_bnd = fluct_bnd[1]
+                dQ = dQ.at[:, iInner_bnd].subtract(
+                    (F_num_bnd + Dm_bnd) * fv_bnd / cv_bnd)
+
             return dQ
 
         return flux_operator

@@ -76,6 +76,7 @@ class MeshJAX:
     # LSQ reconstruction
     lsq_gradQ: jnp.ndarray
     lsq_neighbors: jnp.ndarray
+    lsq_boundary_face_neighbors: jnp.ndarray  # (n_cells, max_bdy_per_cell)
     lsq_monomial_multi_index: Any  # kept static (small array or int)
     lsq_scale_factors: Any  # kept static
 
@@ -170,6 +171,8 @@ def convert_mesh_to_jax(mesh) -> MeshJAX:
         boundary_conditions_sorted_names=list(mesh.boundary_conditions_sorted_names),
         lsq_gradQ=ga("lsq_gradQ", "_lsq_gradQ"),
         lsq_neighbors=ga("lsq_neighbors", "_lsq_neighbors"),
+        lsq_boundary_face_neighbors=ga(
+            "lsq_boundary_face_neighbors", "_lsq_boundary_face_neighbors"),
         lsq_monomial_multi_index=_get_attr(mesh, "lsq_monomial_multi_index", "_lsq_monomial_multi_index"),
         lsq_scale_factors=_get_attr(mesh, "lsq_scale_factors", "_lsq_scale_factors"),
         z_ordering=jnp.array(mesh.z_ordering),
@@ -201,6 +204,7 @@ def _meshjax_flatten(mesh: MeshJAX):
         mesh.boundary_conditions_sorted_physical_tags,
         mesh.lsq_gradQ,
         mesh.lsq_neighbors,
+        mesh.lsq_boundary_face_neighbors,
         mesh.z_ordering,
     )
     aux_data = (
@@ -257,9 +261,10 @@ def _meshjax_unflatten(aux_data, children):
         boundary_conditions_sorted_names=boundary_conditions_sorted_names,
         lsq_gradQ=children[19],
         lsq_neighbors=children[20],
+        lsq_boundary_face_neighbors=children[21],
         lsq_monomial_multi_index=lsq_monomial_multi_index,
         lsq_scale_factors=lsq_scale_factors,
-        z_ordering=children[21],
+        z_ordering=children[22],
     )
 
 

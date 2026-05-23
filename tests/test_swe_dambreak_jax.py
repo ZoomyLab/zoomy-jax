@@ -52,20 +52,21 @@ logger.remove()
 # Will be set from the JAX HyperbolicSolver below.
 from zoomy_jax.fvm.solver_jax import HyperbolicSolver
 from zoomy_jax.fvm.reconstruction_jax import (
-    ConstantReconstruction, FreeSurfaceMUSCL,
+    ConstantReconstruction, FreeSurfaceLSQMUSCLJAX,
 )
 
 
 class SWEHyperbolicSolver(HyperbolicSolver):
-    """JAX HyperbolicSolver that uses ``FreeSurfaceMUSCL`` for O2 so the
-    wet/dry dam-break doesn't produce negative h at faces near the dry
-    front."""
+    """JAX HyperbolicSolver that uses ``FreeSurfaceLSQMUSCLJAX`` for O2 so
+    the wet/dry dam-break doesn't produce negative h at faces near the
+    dry front (LSQ-augmented stencil; mirrors NumPy
+    ``FreeSurfaceLSQMUSCL``)."""
 
     def _build_reconstruction(self, mesh, symbolic_model):
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
             # h is variable index 0 for our SWE1D model (state = [h, hu]).
-            return FreeSurfaceMUSCL(
+            return FreeSurfaceLSQMUSCLJAX(
                 mesh, dim, h_index=0, eps_wet=1e-6,
                 limiter=self.nsm.reconstruction.limiter,
             )
