@@ -183,16 +183,36 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         # second-derivative requirements.  Use Audusse HR Rusanov
         # (``PositiveNonconservativeRusanov``) for LAR balance —
         # matches the NumPy ChorinSplitVAMSolver default.
+        #
+        # The Audusse rescaling ``h*/h`` must apply only to momentum
+        # densities, NOT to pressure modes ``P_k`` (amplitudes) or
+        # bathymetry ``b`` (static).  Mirror NumPy: exclude h, b, and
+        # every state index that the pressure splitter owns.
         from zoomy_core.fvm.riemann_solvers import (
             PositiveNonconservativeRusanov,
         )
         sm_pred_square = _pad_to_square(self.sm_pred)
         self._sm_pred_square = sm_pred_square
+
+        state_names = [str(s) for s in sm_pred_square.state]
+        excluded = set()
+        if "h" in state_names:
+            excluded.add(state_names.index("h"))
+        if "b" in state_names:
+            excluded.add(state_names.index("b"))
+        excluded.update(
+            int(i) for i in self.sm_press.equation_to_state_index)
+        scaled_q_indices = [
+            i for i in range(sm_pred_square.n_variables)
+            if i not in excluded
+        ]
+
         nsm_pred = NumericalSystemModel.from_system_model(
             sm_pred_square,
             riemann=PositiveNonconservativeRusanov,
             reconstruction=self._reconstruction_spec,
             additional_systems=[self.sm_press, self.sm_corr],
+            scaled_q_indices=scaled_q_indices,
         )
 
         # 2. Run the parent JAX HyperbolicSolver setup on the predictor.

@@ -34,9 +34,11 @@ from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
 from zoomy_jax.fvm.solver_jax import HyperbolicSolver
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 from zoomy_jax.fvm.reconstruction_jax import (
-    ConstantReconstruction, FreeSurfaceMUSCL,
+    ConstantReconstruction, FreeSurfaceLSQMUSCLJAX,
 )
-from zoomy_jax.fvm.nonconservative_flux import Zero as ZeroNCFlux
+# Legacy ``ZeroNCFlux`` no longer needed — flat-bed SWE2D has a
+# zero NCP block on the SystemModel, so the symbolic-Riemann path
+# produces zero fluctuations automatically.
 
 
 # ── 2D SWE model — pure h, hu, hv; flat bed ──────────────────────────────────
@@ -80,7 +82,7 @@ class SWE2DHyperbolicSolver(HyperbolicSolver):
     def _build_reconstruction(self, mesh, symbolic_model):
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
-            return FreeSurfaceMUSCL(
+            return FreeSurfaceLSQMUSCLJAX(
                 mesh, dim, h_index=0, eps_wet=1e-6,
                 limiter=self.nsm.reconstruction.limiter,
             )
@@ -127,7 +129,6 @@ def _run(order: int) -> tuple[LSQMesh, np.ndarray]:
     solver = SWE2DHyperbolicSolver(
         time_end=T_END,
         compute_dt=timestepping.adaptive(CFL=0.3),
-        nc_flux=ZeroNCFlux(),     # flat-bed SWE has no nonconservative term
     )
     Q, _ = solver.solve(mesh, nsm, write_output=False)
     return mesh, np.asarray(Q)
