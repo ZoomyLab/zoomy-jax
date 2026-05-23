@@ -314,24 +314,49 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
     def get_flux_operator(self, mesh, runtime):
         """Flux operator using JaxRuntime's symbolic-Riemann
-        numerical_flux + numerical_fluctuations (both vmap'd over
-        the face axis).  Mirrors the NumPy solver's symbolic path —
-        no more legacy CenteredFlux / NonconservativeRusanov JAX
-        wrappers."""
-        # Build reconstruction (resolved once, not per step).
+        numerical_flux + numerical_fluctuations (both vmap'd over the
+        face axis).  Boundary-condition kernel is invoked inline
+        (mirrors NumPy semantically — no separate pre-step BC pass)."""
         reconstruct = self._build_reconstruction(mesh, runtime.sm)
         rt_num_flux = runtime.numerical_flux
         rt_num_fluct = runtime.numerical_fluctuations
-        n_eq = runtime.n_state
+        rt_bc = runtime.boundary_conditions
 
         @jax.jit
         @partial(jax.named_call, name="Flux")
-        def flux_operator(dt, Q, Qaux, parameters, dQ):
+        def flux_operator(dt, time, Q, Qaux, parameters, dQ):
             dQ = jnp.zeros_like(dQ)
 
             iA = mesh.face_cells[0]
             iB = mesh.face_cells[1]
 
+            # 1. Inline BC application — write the ghost-cell values
+            # for every boundary face from the BC kernel before
+            # reconstruction sees them.  Equivalent to the NumPy
+            # "evaluate BC face values inline in flux_operator"
+            # pattern; here it still writes into the JAX-padded ghost
+            # slots so reconstruction's stencil walks them naturally.
+            if rt_bc is not None:
+                def _bc_body(i, Q):
+                    i_face = mesh.boundary_face_face_indices[i]
+                    i_bc_func = mesh.boundary_face_function_numbers[i]
+                    cell = mesh.boundary_face_cells[i]
+                    ghost = mesh.boundary_face_ghosts[i]
+                    q_cell = Q[:, cell]
+                    qaux_cell = Qaux[:, cell]
+                    normal = mesh.face_normals[:, i_face]
+                    position = mesh.face_centers[i_face, :]
+                    distance = jnp.linalg.norm(
+                        position - mesh.cell_centers[:, ghost])
+                    q_ghost = rt_bc(
+                        i_bc_func, time, position, distance,
+                        q_cell, qaux_cell, parameters, normal,
+                    )
+                    return Q.at[:, ghost].set(q_ghost)
+
+                Q = jax.lax.fori_loop(0, mesh.n_boundary_faces, _bc_body, Q)
+
+            # 2. Reconstruct face states.
             Q_L, Q_R = reconstruct(Q)
             qauxA = Qaux[:, iA]
             qauxB = Qaux[:, iB]
@@ -340,10 +365,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             cell_volumesA = mesh.cell_volumes[iA]
             cell_volumesB = mesh.cell_volumes[iB]
 
-            # Symbolic Riemann (jit-vmap'd over face axis on the
-            # runtime).  F_num: (n_eq, n_faces); fluct: (2, n_eq,
-            # n_faces) — outer axis selects (Dp, Dm) per the
-            # ``ZArray([Dp, Dm])`` layout of ``numerical_fluctuations``.
+            # 3. Symbolic Riemann (jit-vmap'd over face axis).
             F_num = rt_num_flux(Q_L, Q_R, qauxA, qauxB, parameters, normals)
             fluct = rt_num_fluct(Q_L, Q_R, qauxA, qauxB, parameters, normals)
             Dp = fluct[0]
@@ -432,23 +454,23 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         errs ≈ O(dx)).
         """
         parameters = self._rt_parameters
-        bc = self._rt_bc_op
         flux = self._rt_flux_op
 
+        # BC is now applied INSIDE flux_operator at the right time
+        # (just before reconstruction), so step() no longer pre-fills
+        # ghost cells.  Mirrors the NumPy solver — one BC kernel
+        # invocation per face per stage, no stale-ghost reads.
         if self.nsm.reconstruction.order >= 2:
-            # SSP-RK2 (Heun) with per-stage BC.
+            # SSP-RK2 (Heun).
             Q0 = Q
-            Q_bc0 = bc(time, Q0, Qaux, parameters)
-            dQ = flux(dt, Q_bc0, Qaux, parameters, jnp.zeros_like(Q))
-            Q1 = Q_bc0 + dt * dQ
-            Q_bc1 = bc(time + dt, Q1, Qaux, parameters)
-            dQ = flux(dt, Q_bc1, Qaux, parameters, jnp.zeros_like(Q))
-            Q2 = Q_bc1 + dt * dQ
+            dQ = flux(dt, time, Q0, Qaux, parameters, jnp.zeros_like(Q))
+            Q1 = Q0 + dt * dQ
+            dQ = flux(dt, time + dt, Q1, Qaux, parameters, jnp.zeros_like(Q))
+            Q2 = Q1 + dt * dQ
             Q = 0.5 * (Q0 + Q2)
         else:
-            Q_bc = bc(time, Q, Qaux, parameters)
-            dQ = flux(dt, Q_bc, Qaux, parameters, jnp.zeros_like(Q))
-            Q = Q_bc + dt * dQ
+            dQ = flux(dt, time, Q, Qaux, parameters, jnp.zeros_like(Q))
+            Q = Q + dt * dQ
 
         # Source step (explicit Euler is fine — source is treated as O1).
         Q = ode.RK1(self._rt_source_op, Q, Qaux, parameters, dt)
@@ -483,8 +505,8 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         model = self._rt_model
         parameters = self._rt_parameters
 
-        # Boundary conditions
-        Q = self._rt_bc_op(time, Q, Qaux, parameters)
+        # No separate post-step BC application — the BC kernel runs
+        # inside flux_operator at the right moment of each RK stage.
 
         # Update variables (clamp, etc.)
         Q = self.update_q(Q, Qaux, mesh, model, parameters)
