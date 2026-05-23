@@ -219,8 +219,22 @@ class JaxRuntime:
 
         # Per-cell operators on the SystemModel.
         self._build_cell_operators()
-        # Per-face Riemann numerics (numerical_flux + fluctuations).
-        self._build_face_operators()
+        # Per-face Riemann numerics — only meaningful for square
+        # (hyperbolic) SystemModels.  Rectangular sub-systems from
+        # splitter operations (sm_press, sm_corr) carry no flux of
+        # their own; skip and set the slots to None.
+        sm = self.sm
+        if sm.n_equations == sm.n_state and sm.flux is not None:
+            try:
+                self._build_face_operators()
+            except (ValueError, KeyError, AttributeError, TypeError):
+                self.numerical_flux = None
+                self.numerical_fluctuations = None
+                self._numerics = None
+        else:
+            self.numerical_flux = None
+            self.numerical_fluctuations = None
+            self._numerics = None
         # Indexed boundary-condition kernels.
         self._build_bc()
 
@@ -272,6 +286,17 @@ class JaxRuntime:
             _lambdify_array(_to_array_of_exprs(sm.source), std, self.module),
             n_extra=0, squeeze_trailing=True,
         )
+        # ── state_update: split-system corrector update (n_eq, 1) →
+        # collapse trailing 1.  Optional — some sub-systems carry no
+        # state_update slot, in which case the attribute is None.
+        su = getattr(sm, "state_update", None)
+        if su is not None:
+            self.state_update = self._vmap_cell(
+                _lambdify_array(_to_array_of_exprs(su), std, self.module),
+                n_extra=0, squeeze_trailing=True,
+            )
+        else:
+            self.state_update = None
         # ── mass_matrix: (n_eq, n_state)
         self.mass_matrix = self._vmap_cell(
             _lambdify_array(_to_array_of_exprs(sm.mass_matrix),
@@ -290,18 +315,40 @@ class JaxRuntime:
                             std, self.module),
             n_extra=0,
         )
-        # ── eigenvalues: takes normal — signature (Q, Qaux, p, n)
+        # ── eigenvalues: takes normal — signature (Q, Qaux, p, n).
+        # Two paths:
+        #   * symbolic eigenvalues present → lambdify directly.
+        #   * eigenvalues is None (chain Chorin convention) → fall
+        #     back to numerical eigvals(quasilinear · n) per cell.
         eig_def = sm.eigenvalues
         eig_arr = _to_array_of_exprs(eig_def)
-        eig_fn = _lambdify_array(eig_arr, eig, self.module)
-        # vmap over cell axis for Q/Qaux/n; parameters broadcast.
-        @jax.jit
-        def _eig_full(Q, Qaux, parameters, normal):
-            def per_cell(q, qaux, n):
-                return eig_fn(q, qaux, parameters, n)
-            return jax.vmap(per_cell, in_axes=(1, 1, 1),
-                            out_axes=-1)(Q, Qaux, normal)
-        self.eigenvalues = _eig_full
+        eig_shape_cell = _shape(eig_arr)
+        if eig_shape_cell and all(s > 0 for s in eig_shape_cell):
+            eig_fn = _lambdify_array(eig_arr, eig, self.module)
+
+            @jax.jit
+            def _eig_full(Q, Qaux, parameters, normal):
+                def per_cell(q, qaux, n):
+                    return eig_fn(q, qaux, parameters, n)
+                return jax.vmap(per_cell, in_axes=(1, 1, 1),
+                                out_axes=-1)(Q, Qaux, normal)
+            self.eigenvalues = _eig_full
+        else:
+            ql_arr = _to_array_of_exprs(sm.quasilinear_matrix)
+            ql_fn = _lambdify_array(ql_arr, std, self.module)
+            n_state = self.n_state
+            n_dim = self.n_dim
+
+            @jax.jit
+            def _eig_full_num(Q, Qaux, parameters, normal):
+                def per_cell(q, qaux, n):
+                    ql = jnp.asarray(ql_fn(q, qaux, parameters))
+                    ql = ql.reshape(n_state, n_state, n_dim)
+                    A_n = jnp.einsum("ijk,k->ij", ql, n)
+                    return jnp.real(jnp.linalg.eigvals(A_n))
+                return jax.vmap(per_cell, in_axes=(1, 1, 1),
+                                out_axes=-1)(Q, Qaux, normal)
+            self.eigenvalues = _eig_full_num
 
     def _vmap_cell(self, per_cell_fn, *, n_extra=0, squeeze_trailing=False):
         """Wrap a per-cell ``fn(q, qaux, p, *extra)`` into a JIT'd
@@ -335,31 +382,66 @@ class JaxRuntime:
         # right are *separate* invocations inside the symbolic body,
         # each with arity ``n_state + n_aux + n_p + n_n``).  Build a
         # plug that consumes those flat scalar args and returns the
-        # per-side max |eigenvalue| via the per-cell eigenvalues
-        # lambdified callable.
+        # per-side max |eigenvalue|.
+        #
+        # Two paths, mirroring NumPy:
+        #   * If ``sm.eigenvalues`` is non-empty (symbolic): lambdify
+        #     it and take ``max(|eigs|)``.
+        #   * If ``sm.eigenvalues`` is None (chain Chorin convention):
+        #     fall back to numerical eigenvalues from the quasilinear
+        #     matrix — ``A_n = sum_d ql[:, :, d] * n[d]``, then
+        #     ``max(|jnp.linalg.eigvals(A_n)|)``.  Mirrors NumPy's
+        #     ``eigenvalue_mode = "numerical"`` fallback.
         n_state = self.n_state
         n_aux = self.n_aux
         n_p = len(self._p_syms)
         n_n = len(self._n_syms)
-        # Build per-cell eigenvalue lambdified callable (un-vmapped).
-        eig_arr = _to_array_of_exprs(self.sm.eigenvalues)
-        _eig_scalar = _lambdify_array(
-            eig_arr,
-            (self._q_syms, self._qaux_syms, self._p_syms, self._n_syms),
-            self.module,
-        )
 
-        def _max_wavespeed(*all_args):
-            # all_args = [q_scalars..., qaux_scalars...,
-            #             p_scalars..., n_scalars...] (one side).
-            q = jnp.asarray(all_args[:n_state])
-            qaux = jnp.asarray(all_args[n_state:n_state + n_aux])
-            p = jnp.asarray(
-                all_args[n_state + n_aux:n_state + n_aux + n_p])
-            n = jnp.asarray(
-                all_args[n_state + n_aux + n_p:
-                         n_state + n_aux + n_p + n_n])
-            return jnp.abs(_eig_scalar(q, qaux, p, n)).max()
+        eig_arr = _to_array_of_exprs(self.sm.eigenvalues)
+        eig_shape = _shape(eig_arr)
+        has_symbolic_eig = (
+            bool(eig_shape) and all(s > 0 for s in eig_shape))
+
+        if has_symbolic_eig:
+            _eig_scalar = _lambdify_array(
+                eig_arr,
+                (self._q_syms, self._qaux_syms, self._p_syms, self._n_syms),
+                self.module,
+            )
+
+            def _max_wavespeed(*all_args):
+                q = jnp.asarray(all_args[:n_state])
+                qaux = jnp.asarray(all_args[n_state:n_state + n_aux])
+                p = jnp.asarray(
+                    all_args[n_state + n_aux:n_state + n_aux + n_p])
+                n = jnp.asarray(
+                    all_args[n_state + n_aux + n_p:
+                             n_state + n_aux + n_p + n_n])
+                return jnp.abs(_eig_scalar(q, qaux, p, n)).max()
+
+        else:
+            # Numerical fallback: per-cell quasilinear → eigvals.
+            ql_arr = _to_array_of_exprs(self.sm.quasilinear_matrix)
+            _ql_scalar = _lambdify_array(
+                ql_arr,
+                (self._q_syms, self._qaux_syms, self._p_syms),
+                self.module,
+            )
+            n_dim = self.n_dim
+
+            def _max_wavespeed(*all_args):
+                q = jnp.asarray(all_args[:n_state])
+                qaux = jnp.asarray(all_args[n_state:n_state + n_aux])
+                p = jnp.asarray(
+                    all_args[n_state + n_aux:n_state + n_aux + n_p])
+                n = jnp.asarray(
+                    all_args[n_state + n_aux + n_p:
+                             n_state + n_aux + n_p + n_n])
+                ql = jnp.asarray(_ql_scalar(q, qaux, p))
+                ql = ql.reshape(n_state, n_state, n_dim)
+                A_n = jnp.einsum("ijk,k->ij", ql, n)
+                evs = jnp.linalg.eigvals(A_n)
+                return jnp.max(jnp.abs(evs.real))
 
         # Inject before lambdifying numerics.
         self.module["max_wavespeed"] = _max_wavespeed
