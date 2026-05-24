@@ -481,7 +481,7 @@ def extract_local_mesh(mesh, partition: PartitionInfo):
     dim = mesh.dimension
     lsq_degree = 1
 
-    lsq_gradQ, lsq_neighbors, lsq_monomial_multi_index = (
+    lsq_gradQ, lsq_neighbors, lsq_bdy_neighbors, lsq_monomial_multi_index = (
         least_squares_reconstruction_local(
             n_local_cells, dim, cell_neighbors_local, cell_centers[:dim, :].T, lsq_degree
         )
@@ -530,6 +530,7 @@ def extract_local_mesh(mesh, partition: PartitionInfo):
         # LSQMesh precomputed stencils
         _lsq_gradQ=lsq_gradQ,
         _lsq_neighbors=lsq_neighbors,
+        _lsq_boundary_face_neighbors=lsq_bdy_neighbors,
         _lsq_monomial_multi_index=lsq_monomial_multi_index,
         _lsq_scale_factors=lsq_scale_factors,
         _face_neighbors=face_neighbors,
