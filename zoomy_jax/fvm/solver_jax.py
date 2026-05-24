@@ -25,6 +25,7 @@ import param
 from zoomy_core.misc.logger_config import logger
 
 import zoomy_core.misc.io as io
+import zoomy_core.misc.misc as _misc
 import zoomy_jax.misc.io as jax_io
 from zoomy_core.misc.misc import Zstruct, Settings
 import zoomy_jax.fvm.ode as ode
@@ -483,6 +484,10 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         # Store runtime state for step / run_simulation
         self._rt_mesh = jax_mesh
+        # Keep the source LSQMesh for HDF5 output — MeshJAX has no
+        # write_to_hdf5; the original NumPy LSQMesh is the only thing
+        # that knows how to serialise itself (mesh + LSQ stencils).
+        self._rt_mesh_np = mesh
         self._rt_model = runtime_model
         self._rt_parameters = parameters
 
@@ -631,7 +636,15 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             io.init_output_directory(
                 self.settings.output.directory, self.settings.output.clean_directory
             )
-            mesh.write_to_hdf5(output_hdf5_path)
+            # MeshJAX has no write_to_hdf5; use the source NumPy
+            # LSQMesh stashed in setup_simulation.  init_output_directory
+            # prepends main_dir; write_to_hdf5 expects an absolute path
+            # (h5py.File doesn't auto-resolve relative-to-main_dir).
+            self._rt_mesh_np.write_to_hdf5(
+                os.path.join(
+                    _misc.get_main_directory(), output_hdf5_path
+                )
+            )
             io.save_settings(self.settings)
             save_fields = jax_io.get_save_fields(output_hdf5_path, write_all=False)
         else:
@@ -768,7 +781,15 @@ class PoissonSolver(SolverNumpy):
             output_hdf5_path = os.path.join(
                 self.settings.output.directory, f"{self.settings.output.filename}.h5"
             )
-            mesh.write_to_hdf5(output_hdf5_path)
+            # MeshJAX has no write_to_hdf5; use the source NumPy
+            # LSQMesh stashed in setup_simulation.  init_output_directory
+            # prepends main_dir; write_to_hdf5 expects an absolute path
+            # (h5py.File doesn't auto-resolve relative-to-main_dir).
+            self._rt_mesh_np.write_to_hdf5(
+                os.path.join(
+                    _misc.get_main_directory(), output_hdf5_path
+                )
+            )
             save_fields = jax_io.get_save_fields(output_hdf5_path, True)
         else:
 
