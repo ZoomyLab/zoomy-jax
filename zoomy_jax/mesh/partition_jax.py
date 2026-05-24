@@ -47,12 +47,12 @@ existing graph-based ``zoomy_jax.mesh.partition.partition_mesh``.
 """
 from __future__ import annotations
 
-from typing import List
+from typing import List, Tuple
 
 import jax.numpy as jnp
 import numpy as np
 
-from zoomy_jax.mesh.mesh import MeshJAX
+from zoomy_jax.mesh.mesh import MeshJAX, convert_mesh_to_jax
 
 
 def _g2l(g_idx: int, p: int, n_local: int, halo: int) -> int:
@@ -317,6 +317,248 @@ def partition_1d_contiguous(
             lsq_monomial_multi_index=mesh.lsq_monomial_multi_index,
             lsq_scale_factors=mesh.lsq_scale_factors,
             z_ordering=jnp.zeros(n_padded, dtype=jnp.int32),
+        )
+        parts.append(part)
+    return parts
+
+
+# ─────────────────────────────────────────────────────────────────────
+# x-axis decomposition for structured 1D / 2D / 3D meshes
+# ─────────────────────────────────────────────────────────────────────
+
+
+def partition_xaxis_structured(
+    global_mesh: MeshJAX,
+    n_parts: int,
+    halo: int,
+    domain: Tuple[float, ...],
+    shape: Tuple[int, ...],
+) -> List[MeshJAX]:
+    """SPMD x-axis decomposition for a uniform structured mesh in
+    1D, 2D, or 3D.  Generalises :func:`partition_1d_contiguous` —
+    each rank gets a padded x-strip / x-slab whose faces, geometry,
+    and (interior) LSQ stencils are built via ``LSQMesh.create_Nd``;
+    boundary-aware LSQ data for cells whose stencil fits in the
+    slab is then OVERRIDDEN with the global mesh's data
+    (index-remapped) so face reconstruction at inter-partition faces
+    is bit-identical to a single-device run.
+
+    Cell ordering follows the LSQMesh convention:
+      * 1D: ``ic = ix``
+      * 2D: ``ic = ix * ny + iy``
+      * 3D: ``ic = ix * ny * nz + iy * nz + iz``
+
+    The padded slab's cells are contiguous in this linear cell index,
+    so :func:`halo_exchange_inplace` works UNCHANGED — pass
+    ``halo_cell = halo * x_stride`` where ``x_stride = ny`` in 2D and
+    ``ny * nz`` in 3D.
+
+    Parameters
+    ----------
+    global_mesh : MeshJAX
+        Global uniform structured mesh.  Must satisfy
+        ``shape[0] % n_parts == 0``.
+    n_parts : int
+        Number of x-partitions.
+    halo : int
+        Halo width in **x cells** on each side.  ``halo >= 2`` is
+        needed to keep order-2 LSQ-MUSCL reconstruction bit-identical
+        at inter-partition x-faces.
+    domain : tuple of float
+        Global domain extent.  ``(x_min, x_max)`` for 1D,
+        ``(x_min, x_max, y_min, y_max)`` for 2D,
+        ``(x_min, x_max, y_min, y_max, z_min, z_max)`` for 3D.
+    shape : tuple of int
+        Global structured mesh shape.  ``(nx,)`` for 1D,
+        ``(nx, ny)`` for 2D, ``(nx, ny, nz)`` for 3D.
+
+    Returns
+    -------
+    list of MeshJAX
+        ``n_parts`` per-partition padded slabs.  The slab geometry is
+        built via ``LSQMesh.create_Nd`` so face_cells / face_centers /
+        normals are automatically correct.  ``n_inner_cells =
+        n_padded_x * x_stride`` (the full slab); the flux operator is
+        responsible for restricting cell updates to owned cells.
+
+    Limitations (current)
+    ---------------------
+    * Owned cells whose global LSQ stencil reaches a global y- or
+      z-boundary have their ``lsq_boundary_face_neighbors`` set to
+      ``-1`` rather than mapped to the slab's y/z BC face index.  For
+      ICs that are constant in y/z this has no effect; for true
+      cross-axis BC-aware reconstruction at owned cells, a per-cell
+      face-position lookup is needed (TODO).
+    """
+    from zoomy_core.mesh import LSQMesh
+    dim = len(shape)
+    if not 1 <= dim <= 3:
+        raise ValueError(f"shape must have 1-3 entries, got {shape}")
+    if int(global_mesh.dimension) != dim:
+        raise ValueError(
+            f"shape implies dim={dim} but global_mesh.dimension="
+            f"{int(global_mesh.dimension)}"
+        )
+    if len(domain) != 2 * dim:
+        raise ValueError(
+            f"domain must have 2*dim={2*dim} entries, got {domain}"
+        )
+
+    nx_global = int(shape[0])
+    if nx_global % n_parts != 0:
+        raise ValueError(
+            f"partition_xaxis_structured: nx_global={nx_global} not "
+            f"divisible by n_parts={n_parts}."
+        )
+    n_local_x = nx_global // n_parts
+    n_padded_x = n_local_x + 2 * halo
+    x_stride = int(np.prod([int(s) for s in shape[1:]])) if dim > 1 else 1
+
+    x_min = float(domain[0])
+    x_max = float(domain[1])
+    dx = (x_max - x_min) / nx_global
+
+    g_neighbors = np.asarray(global_mesh.lsq_neighbors)
+    g_gradQ = np.asarray(global_mesh.lsq_gradQ)
+    g_bdy = np.asarray(global_mesh.lsq_boundary_face_neighbors)
+    n_cells_global = int(global_mesh.n_inner_cells)
+    max_nbr = g_neighbors.shape[1]
+    max_bdy = g_bdy.shape[1]
+
+    parts: List[MeshJAX] = []
+    for p in range(n_parts):
+        # Slab x-extent (may extend outside global domain for rank-0
+        # left halo or rank-(N-1) right halo).
+        x_min_slab = x_min + (p * n_local_x - halo) * dx
+        x_max_slab = x_min_slab + n_padded_x * dx
+
+        if dim == 1:
+            slab_lsq = LSQMesh.create_1d(
+                (x_min_slab, x_max_slab), n_padded_x
+            )
+        elif dim == 2:
+            slab_lsq = LSQMesh.create_2d(
+                (x_min_slab, x_max_slab, float(domain[2]), float(domain[3])),
+                n_padded_x, int(shape[1]),
+            )
+        else:  # dim == 3
+            slab_lsq = LSQMesh.create_3d(
+                (x_min_slab, x_max_slab, float(domain[2]), float(domain[3]),
+                 float(domain[4]), float(domain[5])),
+                n_padded_x, int(shape[1]), int(shape[2]),
+            )
+        slab_mesh = convert_mesh_to_jax(slab_lsq)
+        n_slab = int(slab_mesh.n_inner_cells)
+        assert n_slab == n_padded_x * x_stride, (
+            f"slab cell count {n_slab} != n_padded_x * x_stride "
+            f"{n_padded_x * x_stride}"
+        )
+
+        # ── Helper: global → local cell index in this partition ──
+        def _g2l_xaxis(ic_global: int) -> int:
+            ix_g, rest = divmod(ic_global, x_stride)
+            ix_l = ix_g - p * n_local_x + halo
+            if 0 <= ix_l < n_padded_x and 0 <= ic_global < n_cells_global:
+                return ix_l * x_stride + rest
+            return -1
+
+        # ── LSQ override (owned + remappable halo cells) ──
+        slab_gradQ = np.asarray(slab_mesh.lsq_gradQ).copy()
+        slab_nbr = np.asarray(slab_mesh.lsq_neighbors).copy()
+        slab_bdy_local = np.asarray(
+            slab_mesh.lsq_boundary_face_neighbors
+        ).copy()
+
+        for ic_local in range(n_slab):
+            ic_global_candidate = (
+                ic_local + (p * n_local_x - halo) * x_stride
+            )
+            ix_g_cand = ic_global_candidate // x_stride
+            if not (0 <= ix_g_cand < nx_global):
+                # Outside global mesh (rank-0 left halo or rank-(N-1)
+                # right halo on a non-periodic domain) — keep slab's
+                # auto-built LSQ.  These cells never feed an owned-cell
+                # update via reconstruction (faces between halo cells
+                # are not consumed).
+                continue
+            ic_global = ic_global_candidate
+            # Try to remap all neighbors.
+            tmp_nbrs = []
+            ok = True
+            for k in range(max_nbr):
+                gnbr = int(g_neighbors[ic_global, k])
+                lnbr = _g2l_xaxis(gnbr)
+                if lnbr < 0:
+                    ok = False
+                    break
+                tmp_nbrs.append(lnbr)
+            if not ok:
+                # Outer halo cell with stencil reach beyond the slab.
+                continue
+            for k in range(max_nbr):
+                slab_nbr[ic_local, k] = tmp_nbrs[k]
+            slab_gradQ[ic_local, :, :] = g_gradQ[ic_global, :, :]
+            # Boundary-face neighbors: clear them.  For owned cells
+            # touching a y- or z-boundary the proper mapping would
+            # point at the slab's y/z BC face index, but this
+            # requires a per-cell face-position lookup — TODO.  Until
+            # that lands, ICs that are constant in y/z are unaffected
+            # (the would-be BC delta is zero).
+            for k in range(max_bdy):
+                slab_bdy_local[ic_local, k] = -1
+
+        # ── Boundary face filtering ──
+        # Drop slab x-BC faces that are actually inter-partition.
+        slab_bf_idx = np.asarray(slab_mesh.boundary_face_face_indices)
+        slab_face_centers = np.asarray(slab_mesh.face_centers)
+        tol = dx * 1e-6
+        keep_mask = np.ones(len(slab_bf_idx), dtype=bool)
+        for i_bf, fidx in enumerate(slab_bf_idx):
+            fc_x = slab_face_centers[fidx, 0]
+            if abs(fc_x - x_min_slab) < tol and p != 0:
+                keep_mask[i_bf] = False
+            elif abs(fc_x - x_max_slab) < tol and p != n_parts - 1:
+                keep_mask[i_bf] = False
+
+        kept_idx = np.where(keep_mask)[0]
+        n_bf = len(kept_idx)
+        bf_face_idx = np.asarray(
+            slab_mesh.boundary_face_face_indices
+        )[kept_idx]
+        bf_cells = np.asarray(slab_mesh.boundary_face_cells)[kept_idx]
+        bf_ghosts = np.asarray(slab_mesh.boundary_face_ghosts)[kept_idx]
+        bf_func_no = np.asarray(
+            slab_mesh.boundary_face_function_numbers
+        )[kept_idx]
+        bf_phys_tags = np.asarray(
+            slab_mesh.boundary_face_physical_tags
+        )[kept_idx]
+
+        # Update lsq_boundary_face_neighbors entries that still
+        # reference the slab's BC face list (= cells we didn't
+        # override above).  Old slab-BC index → new index in kept_idx.
+        old_to_new = -np.ones(len(slab_bf_idx), dtype=np.int32)
+        old_to_new[kept_idx] = np.arange(n_bf, dtype=np.int32)
+        for ic_local in range(n_slab):
+            for k in range(max_bdy):
+                v = int(slab_bdy_local[ic_local, k])
+                if v >= 0:
+                    slab_bdy_local[ic_local, k] = int(old_to_new[v])
+                # -1 stays -1.
+
+        # ── Build the per-partition MeshJAX (replace LSQ + BC bits) ──
+        from dataclasses import replace
+        part = replace(
+            slab_mesh,
+            n_boundary_faces=n_bf,
+            boundary_face_cells=jnp.asarray(bf_cells),
+            boundary_face_ghosts=jnp.asarray(bf_ghosts),
+            boundary_face_function_numbers=jnp.asarray(bf_func_no),
+            boundary_face_physical_tags=jnp.asarray(bf_phys_tags),
+            boundary_face_face_indices=jnp.asarray(bf_face_idx),
+            lsq_gradQ=jnp.asarray(slab_gradQ),
+            lsq_neighbors=jnp.asarray(slab_nbr),
+            lsq_boundary_face_neighbors=jnp.asarray(slab_bdy_local),
         )
         parts.append(part)
     return parts
