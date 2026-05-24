@@ -24,11 +24,14 @@ from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.numerics.numerical_system_model import ReconstructionSpec
 from zoomy_core.model.models.system_model import SystemModel
 from zoomy_jax.fvm.solver_jax import HyperbolicSolver
-from zoomy_jax.mesh.partition_jax import partition_1d_contiguous
+from zoomy_jax.mesh.partition_jax import (
+    partition_1d_contiguous,         # 1D-only, custom slab layout
+    partition_xaxis_structured,      # 1D / 2D / 3D structured, x-axis split
+)
 from zoomy_jax.fvm.halo_exchange_jax import halo_exchange_inplace
 
 # 1. Build the solver once on a global mesh — extract the runtime.
-mesh_global = LSQMesh.create_1d(domain=(0., 1.), n_inner_cells=N)
+mesh_global = LSQMesh.create_2d(domain=(0., 1., 0., 1.), nx=NX, ny=NY)
 nsm = NumericalSystemModel.from_system_model(
     SystemModel.from_model(model),
     reconstruction=ReconstructionSpec(order=2, limiter="venkatakrishnan"),
@@ -37,18 +40,23 @@ solver = HyperbolicSolver()
 Q, Qaux = solver.setup_simulation(mesh_global, nsm)
 runtime = solver._rt_model
 
-# 2. Partition the global jax_mesh; build the per-partition flux op.
-parts = partition_1d_contiguous(solver._rt_mesh, n_parts=4, halo=2)
+# 2. x-axis decomposition.  In 2D/3D, halo cells form strips/slabs
+#    of `halo * ny` (or `halo * ny * nz`) cells in the flat cell axis.
+parts = partition_xaxis_structured(
+    solver._rt_mesh, n_parts=4, halo=2,
+    domain=(0., 1., 0., 1.), shape=(NX, NY),
+)
 flux_op_part = solver.get_flux_operator(parts[1], runtime)
 
 # 3. Wrap in shard_map with halo exchange before each stage.
 spmd_mesh = Mesh(np.array(jax.devices()), axis_names=("cells",))
+halo_cells = 2 * NY    # halo_x * x_stride; x_stride = NY in 2D, NY*NZ in 3D.
 
 @partial(shard_map, mesh=spmd_mesh,
          in_specs=(P(None, "cells"), P(None, "cells")),
          out_specs=P(None, "cells"), check_rep=False)
 def spmd_step(Q_pad, Qaux_pad):
-    Q_pad = halo_exchange_inplace(Q_pad, halo=2,
+    Q_pad = halo_exchange_inplace(Q_pad, halo=halo_cells,
                                   axis_name="cells", n_devices=4)
     dQ = flux_op_part(dt, time, Q_pad, Qaux_pad, parameters,
                       jnp.zeros_like(Q_pad))
@@ -58,6 +66,27 @@ def spmd_step(Q_pad, Qaux_pad):
 For SSP-RK2 / RK3, call halo exchange **before each stage** —
 stage-1's local update writes nonsense at halo cells, so stage-2
 must re-fetch from neighbors.
+
+### 1D / 2D / 3D and which partition function to use
+
+* **1D structured mesh** — either `partition_1d_contiguous(mesh,
+  n_parts, halo)` (the original, hand-built slab layout) or
+  `partition_xaxis_structured(mesh, n_parts, halo, domain=(x_min,
+  x_max), shape=(nx,))` (the unified path).  Both produce
+  bit-identical results.
+* **2D structured mesh** — `partition_xaxis_structured(mesh,
+  n_parts, halo, domain=(x_min, x_max, y_min, y_max), shape=(nx,
+  ny))`.  Decomposes only along x; y stays whole.  Halo cells form
+  a `halo * ny`-cell strip on each side of the owned slab in the
+  flat cell-axis indexing.
+* **3D structured mesh** — `partition_xaxis_structured(mesh,
+  n_parts, halo, domain=(x_min, x_max, y_min, y_max, z_min,
+  z_max), shape=(nx, ny, nz))`.  Halo slabs are `halo * ny * nz`
+  cells each.
+
+In every case the same `halo_exchange_inplace` primitive works —
+the cell axis is flat, the halo is whatever number of cells is on
+either side.
 
 ### Layout
 
@@ -101,7 +130,7 @@ jax.distributed.initialize()  # once per process at startup
 
 ### Validation suite
 
-20 bit-identity tests in `tests/unit/zoomy_jax/`:
+24 bit-identity tests in `tests/unit/zoomy_jax/`:
 
 | File                                | What it pins                       |
 |-------------------------------------|------------------------------------|
@@ -113,6 +142,7 @@ jax.distributed.initialize()  # once per process at startup
 | `test_spmd_hyperbolic_solver.py`    | `HyperbolicSolver.get_flux_operator` composes (order=1 + order=2) |
 | `test_spmd_rk2_step.py`             | SSP-RK2 step with per-stage halo exchange |
 | `test_spmd_parameter_mutation.py`   | Parameter changes propagate (not constant-folded) — unblocks param sweeps + `jax.grad` |
+| `test_spmd_xaxis_structured.py`     | 2D + 3D x-axis SPMD (order=1 + order=2) bit-identity |
 
 Run all with:
 
