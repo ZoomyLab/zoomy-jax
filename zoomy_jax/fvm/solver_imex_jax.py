@@ -23,6 +23,8 @@ from zoomy_core.misc.logger_config import logger
 from zoomy_jax.fvm.jvp_jax import analytic_source_jvp_jax
 from zoomy_jax.mesh.mesh import compute_derivatives, convert_mesh_to_jax
 from zoomy_core.mesh import ensure_lsq_mesh
+from zoomy_core.numerics import NumericalSystemModel
+from zoomy_jax.transformation.jax_runtime import JaxRuntime
 from zoomy_jax.transformation.to_jax import JaxRuntimeModel
 
 
@@ -40,10 +42,22 @@ class IMEXStats:
 
 
 def _param_value(model, name, default=None):
-    """Extract a scalar parameter value from a symbolic model."""
-    if hasattr(model, 'parameters'):
-        if model.parameters.contains(name):
-            return float(getattr(model.parameters, name))
+    """Extract a scalar parameter value from a symbolic model.
+
+    The canonical Model carries Symbols in ``model.parameters`` and the
+    numeric values in ``model.parameter_values``. Read from the values
+    side; fall back to the symbolic side only for legacy models that
+    populate ``parameters`` numerically.
+    """
+    pv = getattr(model, "parameter_values", None)
+    if pv is not None and pv.contains(name):
+        return float(getattr(pv, name))
+    ps = getattr(model, "parameters", None)
+    if ps is not None and ps.contains(name):
+        try:
+            return float(getattr(ps, name))
+        except (TypeError, ValueError):
+            return default
     return default
 
 
@@ -109,15 +123,29 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         object.__setattr__(self, "last_stats", IMEXStats(source_mode=self.source_mode))
 
     def create_runtime(self, Q, Qaux, mesh, model):
-        """Create runtime."""
+        """Create runtime.
+
+        The runtime is the canonical :class:`JaxRuntime`, lambdified from
+        the NSM's SystemModel matrices. This is the single bridge between
+        the symbolic side (``model.parameters`` carries Symbols,
+        ``model.parameter_values`` carries the numeric values) and the
+        numerical side (``runtime.parameters`` is a jnp array of values).
+        Earlier IMEX-jax revisions used :class:`JaxRuntimeModel(model)`,
+        which lambdified the Model's pre-aux-substitution functions and
+        choked on bare ``Derivative(b, x)`` / ``tau(t, x, σ)`` atoms.
+        """
         mesh = ensure_lsq_mesh(mesh, model)
         if hasattr(mesh, "resolve_periodic_bcs"):
             mesh.resolve_periodic_bcs(model.boundary_conditions)
         jax_mesh = convert_mesh_to_jax(mesh)
         Q = jnp.asarray(Q)
         Qaux = jnp.asarray(Qaux)
-        parameters = jnp.asarray(list(model.parameters.values()))
-        runtime_model = JaxRuntimeModel(model)
+        if not isinstance(model, NumericalSystemModel):
+            self.nsm = NumericalSystemModel.from_system_model(model)
+        else:
+            self.nsm = model
+        runtime_model = JaxRuntime.from_nsm(self.nsm)
+        parameters = runtime_model.parameters
         return Q, Qaux, parameters, jax_mesh, runtime_model
 
     def _resolve_source_mode(self, model):
@@ -341,8 +369,14 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                     Qn, Qan, parameters, h_face, ev_op)
                 dt = jnp.minimum(dt, time_end - t)
 
-                # Explicit flux step (RK1 or RK2)
-                Qe = ode_step(flux_op, Qn, Qan, parameters, dt)
+                # Explicit flux step (RK1 or RK2). The base
+                # HyperbolicSolver.get_flux_operator returns a
+                # ``(dt, time, Q, Qaux, p, dQ)`` callable, but the
+                # ``ode.RK*`` helpers only thread ``(dt, Q, Qaux, p, dQ)``
+                # — close the time slot at the current step.
+                def _flux_at_t(dt_, Q_, Qaux_, p_, dQ_):
+                    return flux_op(dt_, t, Q_, Qaux_, p_, dQ_)
+                Qe = ode_step(_flux_at_t, Qn, Qan, parameters, dt)
                 Qe = bc_op(t, Qe, Qan, parameters)
 
                 # Implicit diffusion step (Crank-Nicolson)
