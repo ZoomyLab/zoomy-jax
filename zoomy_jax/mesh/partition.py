@@ -483,7 +483,9 @@ def extract_local_mesh(mesh, partition: PartitionInfo):
 
     lsq_gradQ, lsq_neighbors, lsq_bdy_neighbors, lsq_monomial_multi_index = (
         least_squares_reconstruction_local(
-            n_local_cells, dim, cell_neighbors_local, cell_centers[:dim, :].T, lsq_degree
+            n_local_cells, dim, cell_neighbors_local, cell_centers[:dim, :].T, lsq_degree,
+            n_inner_cells=n_owned,
+            cell_vertices=cell_vertices_local,
         )
     )
     lsq_scale_factors = scale_lsq_derivative(lsq_monomial_multi_index)
