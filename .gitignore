@@ -1,3 +1,6 @@
 __pycache__
 *.egg-info
 .jupyterlite.doit.db
+
+# JAX persistent compilation cache
+.cache/
