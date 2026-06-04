@@ -212,6 +212,14 @@ class JaxRuntime:
         self._qaux_syms = _flat_symbols(self.sm.aux_state)
         self._p_syms = _flat_symbols(self.sm.parameters)
         self._n_syms = _flat_symbols(self.sm.normal)
+        # 3D position symbols (X0, X1, X2) used by project_2d_to_3d.
+        # SystemModel.position may be a Zstruct from Model.position
+        # (length 3 even for 2D models) or None when no such operator
+        # is attached.
+        if getattr(self.sm, "position", None) is not None:
+            self._pos_syms = _flat_symbols(self.sm.position)
+        else:
+            self._pos_syms = []
 
         # JAX module dict — local copy so per-instance ``max_wavespeed``
         # injection doesn't leak across runtimes.
@@ -261,6 +269,14 @@ class JaxRuntime:
     def parameter_symbols(self) -> List[sp.Symbol]:
         return list(self.sm.parameters.values())
 
+    # Convenience alias for code that wants the source Model's API surface
+    # ("dimension", etc.) but only has a JaxRuntime in hand. The Model's
+    # `.dimension` equals the SystemModel's `n_dim` (both are the spatial
+    # dimensionality of the PDE).
+    @property
+    def dimension(self) -> int:
+        return self.n_dim
+
     # ── Per-cell operator construction ───────────────────────────
 
     def _build_cell_operators(self):
@@ -303,6 +319,98 @@ class JaxRuntime:
                             std, self.module),
             n_extra=0,
         )
+        # ── source_jacobian_wrt_variables: (n_eq, n_state) — ∂S/∂Q.
+        # The SystemModel auto-derives `source_jacobian` in __post_init__;
+        # we lambdify it here so IMEX (and any other solver that needs a
+        # cell-local Newton on the source) can call it directly.
+        sj = getattr(sm, "source_jacobian", None)
+        if sj is not None:
+            self.source_jacobian_wrt_variables = self._vmap_cell(
+                _lambdify_array(_to_array_of_exprs(sj), std, self.module),
+                n_extra=0,
+            )
+        else:
+            self.source_jacobian_wrt_variables = None
+        # ── update_variables: (n_eq, 1) per-cell state hygiene
+        # transform — squeeze the trailing 1 so callers get
+        # ``(n_eq, n_cells)``.  Optional; ``None`` means identity, in
+        # which case the slot stays ``None`` and the solver's
+        # ``update_q`` short-circuits to a no-op via ``getattr``.
+        uv = getattr(sm, "update_variables", None)
+        if uv is not None and _shape(_to_array_of_exprs(uv)):
+            self.update_variables = self._vmap_cell(
+                _lambdify_array(_to_array_of_exprs(uv),
+                                std, self.module),
+                n_extra=0, squeeze_trailing=True,
+            )
+        else:
+            self.update_variables = None
+        # ── diffusion_matrix / diffusion_matrix_explicit:
+        # ``(n_eq, n_state, n_dim, n_dim)`` rank-4 tensors.  Optional —
+        # ``None`` when the SystemModel carries no diffusion.  Solvers
+        # that wire diffusion through the runtime use these; FV paths
+        # that fold diffusion into the convective flux can ignore them.
+        dm = getattr(sm, "diffusion_matrix", None)
+        if dm is not None and _shape(_to_array_of_exprs(dm)):
+            self.diffusion_matrix = self._vmap_cell(
+                _lambdify_array(_to_array_of_exprs(dm),
+                                std, self.module),
+                n_extra=0,
+            )
+        else:
+            self.diffusion_matrix = None
+        dme = getattr(sm, "diffusion_matrix_explicit", None)
+        if dme is not None and _shape(_to_array_of_exprs(dme)):
+            self.diffusion_matrix_explicit = self._vmap_cell(
+                _lambdify_array(_to_array_of_exprs(dme),
+                                std, self.module),
+                n_extra=0,
+            )
+        else:
+            self.diffusion_matrix_explicit = None
+        # ── project_2d_to_3d: (n_3d_components,)  signature
+        # ``(Q, Qaux, p, position)`` where ``position = [X0, X1, X2]``.
+        # Vmapped over the cell axis with ``position`` broadcast per
+        # cell so callers can hand in a per-cell ``(3, n_cells)``
+        # position array (typically constant ``(x_cell, y_cell, z*)``
+        # for a chosen vertical level ``z*``).  Returns the 3D
+        # reconstruction at ``z*`` per cell.
+        p23 = getattr(sm, "project_2d_to_3d", None)
+        # Treat the all-zero default (``Model.project_2d_to_3d``
+        # returns ``ZArray.zeros(6)`` by default) as "no projection
+        # defined" — callers fall back to a model-agnostic
+        # depth-averaged ``hu/h`` instead of getting silently-zero
+        # AD/FD sensitivities.
+        if p23 is not None:
+            p23_arr = _to_array_of_exprs(p23)
+            if _shape(p23_arr) and all(int(bool(e)) == 0
+                                       for e in p23_arr.tolist()):
+                p23 = None
+        if (p23 is not None and _shape(_to_array_of_exprs(p23))
+                and self._pos_syms):
+            p23_sig = (self._q_syms, self._qaux_syms, self._p_syms,
+                       self._pos_syms)
+            try:
+                p23_fn = _lambdify_array(_to_array_of_exprs(p23),
+                                         p23_sig, self.module)
+            except Exception:
+                # Recent SME / VAM / MLSME slot may carry raw spatial
+                # Derivative atoms that the JAX printer can't lambdify
+                # (e.g. Derivative(b, x), Derivative(q_k/h, x)). The
+                # 2D-to-3D projection is post-simulation reconstruction,
+                # not needed by the explicit FVM solver — drop the slot
+                # gracefully and continue. Re-raise on any other failure.
+                self.project_2d_to_3d = None
+            else:
+                @jax.jit
+                def _project_2d_to_3d(Q, Qaux, parameters, position):
+                    def per_cell(q, qaux, pos):
+                        return p23_fn(q, qaux, parameters, pos)
+                    return jax.vmap(per_cell, in_axes=(1, 1, 1),
+                                    out_axes=-1)(Q, Qaux, position)
+                self.project_2d_to_3d = _project_2d_to_3d
+        else:
+            self.project_2d_to_3d = None
         # ── nonconservative_matrix: (n_eq, n_state, n_dim)
         self.nonconservative_matrix = self._vmap_cell(
             _lambdify_array(_to_array_of_exprs(sm.nonconservative_matrix),

@@ -171,6 +171,34 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     Inherits param definitions from the NumPy base class.
     """
 
+    # ── Free-surface-aware reconstruction (Audusse-Bouchut 2005,
+    # Kurganov-Petrova 2007, Xing-Zhang 2013).  When
+    # ``free_surface_h_index`` is set AND ``reconstruction_variables``
+    # is one of ``"eta"`` / ``"xz"``, the order≥2 reconstruction
+    # switches from plain conservative-variable LSQ-MUSCL to a
+    # wet/dry-aware variant.  At order=1 these flags have no effect
+    # (constant reconstruction is already cell-wise positive).
+    # Caller-driven — the solver does not auto-detect from state
+    # variable names.
+    free_surface_h_index = param.Integer(default=None, allow_None=True,
+        doc="State-vector index of h.  Enables wet-dry MUSCL fallback.")
+    free_surface_b_index = param.Integer(default=0, allow_None=True,
+        doc="State-vector index of bathymetry b.  Used only when "
+            "``reconstruction_variables='eta'`` to form η = h + b.")
+    free_surface_eps_wet = param.Number(default=1e-3, bounds=(0, None),
+        doc="Wet/dry threshold (m) for the MUSCL fallback.")
+    free_surface_momentum_indices = param.List(default=None, allow_None=True,
+        doc="Indices of momentum components.  Defaults to "
+            "``h_index+1 … h_index+1+dim``.")
+    reconstruction_variables = param.Selector(
+        default="conservative", objects=["conservative", "eta", "xz"],
+        doc="What to reconstruct at order≥2.  ``conservative`` = the "
+            "plain LSQ-MUSCL on (b, h, hu, hv).  ``eta`` = primitive-"
+            "variable MUSCL on (b, η = h + b, hu, hv), the standard "
+            "Audusse-Bouchut 2005 / Kurganov-Petrova 2007 well-balanced "
+            "wet/dry recipe.  ``xz`` = Xing-Zhang 2013 cell-mean "
+            "positivity scaling on the conservative reconstruction.")
+
     def __init__(self, **kwargs):
         # Riemann numerics are now owned by the NSM (nsm.riemann is the
         # symbolic class; nsm.build_numerics() instantiates it).  The
@@ -213,19 +241,19 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     # ── State update (vmap over cells) ──────────────────────────────────
 
     def update_q(self, Q, Qaux, mesh, model, parameters):
-        """JIT-compatible update_variables via vmap (replaces NumPy cell loop)."""
-        if not hasattr(model, 'update_variables'):
+        """Apply the SystemModel's per-cell ``update_variables`` to every cell.
+
+        Uses ``model.update_variables`` as a **full-grid** callable —
+        the JaxRuntime now lambdifies + vmaps that slot once at
+        construction time, so this is a single JIT'd call (was: a
+        Python-side ``jax.vmap`` per invocation that retraces every step).
+        ``None`` on the runtime means the SystemModel had no
+        ``update_variables`` slot ⇒ identity; we short-circuit.
+        """
+        fn = getattr(model, "update_variables", None)
+        if fn is None:
             return Q
-        n_vars = Q.shape[0]
-        has_aux = Qaux.shape[0] > 0
-
-        def _update_cell(q_col, qaux_col):
-            qaux_arg = qaux_col if has_aux else jnp.array([])
-            updated = model.update_variables(q_col, qaux_arg, parameters)
-            return jnp.asarray(updated).ravel()[:n_vars]
-
-        Q_updated = jax.vmap(_update_cell, in_axes=(1, 1), out_axes=1)(Q, Qaux)
-        return Q_updated
+        return fn(Q, Qaux, parameters)
 
     # ── Operator builders ───────────────────────────────────────────────
 
@@ -301,14 +329,64 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         ``(n_var, n_inner_cells)`` and uses the BC-provided
         ``bf_face_values`` for both the limiter bounds and ``Q_R`` at
         boundary faces.
+
+        Free-surface / positivity-preserving path: when
+        ``self.free_surface_h_index`` is set the order≥2 branch
+        instead uses :class:`PositivityPreservingLSQMUSCLJAX`, which
+        adds a per-cell Xing–Zhang 2013 slope-scaling pass on top of
+        the standard limiter so the reconstructed ``h`` at every face
+        of every cell stays ``≥ 0``.  Combined with the standard CFL
+        bound (``dt · α / h_inradius ≤ 1/(2k+1)`` for degree-``k``
+        reconstruction, so ``1/3`` for linear LSQ-MUSCL), this is
+        sufficient to keep the cell-mean ``h`` non-negative over each
+        explicit step — the gap that the face-clamp + dry-cell-
+        fallback in :class:`FreeSurfaceLSQMUSCLJAX` leaves open over
+        long horizons on real wet/dry meshes (Malpasset T = 100 s).
         """
         from zoomy_jax.fvm.reconstruction_jax import (
             ConstantReconstruction, LSQMUSCLReconstructionJAX,
+            PositivityPreservingLSQMUSCLJAX,
+            EtaWellBalancedLSQMUSCLJAX,
         )
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
+            mode = self.reconstruction_variables
+            limiter = self.nsm.reconstruction.limiter
+            if mode == "eta":
+                assert self.free_surface_h_index is not None, (
+                    "reconstruction_variables='eta' requires "
+                    "free_surface_h_index to be set")
+                return EtaWellBalancedLSQMUSCLJAX(
+                    mesh, dim,
+                    b_index=int(self.free_surface_b_index),
+                    h_index=int(self.free_surface_h_index),
+                    momentum_indices=self.free_surface_momentum_indices,
+                    eps_wet=float(self.free_surface_eps_wet),
+                    limiter=limiter,
+                )
+            if mode == "xz":
+                assert self.free_surface_h_index is not None, (
+                    "reconstruction_variables='xz' requires "
+                    "free_surface_h_index to be set")
+                return PositivityPreservingLSQMUSCLJAX(
+                    mesh, dim,
+                    h_index=int(self.free_surface_h_index),
+                    momentum_indices=self.free_surface_momentum_indices,
+                    limiter=limiter,
+                )
+            # mode == "conservative" — plain LSQ-MUSCL on (b, h, hu, hv).
+            # Back-compat: if free_surface_h_index is set without an
+            # explicit mode, default to xz (matches the prior behavior
+            # introduced when free_surface_h_index was first added).
+            if self.free_surface_h_index is not None:
+                return PositivityPreservingLSQMUSCLJAX(
+                    mesh, dim,
+                    h_index=int(self.free_surface_h_index),
+                    momentum_indices=self.free_surface_momentum_indices,
+                    limiter=limiter,
+                )
             return LSQMUSCLReconstructionJAX(
-                mesh, dim, limiter=self.nsm.reconstruction.limiter)
+                mesh, dim, limiter=limiter)
         return ConstantReconstruction(mesh, dim)
 
     def get_flux_operator(self, mesh, runtime):

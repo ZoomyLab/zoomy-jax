@@ -349,6 +349,34 @@ class LSQMUSCLReconstructionJAX:
         else:
             self._lsq_bdy_nbr = None
 
+        # ``mesh.lsq_monomial_multi_index`` lists the polynomial
+        # monomial each column of ``lsq_gradQ`` produces.  For degree-1
+        # LSQ the multi-indices are the unit vectors ``e_0 = (1, 0, …)``
+        # (∂/∂x), ``e_1 = (0, 1, …)`` (∂/∂y), and so on — but their
+        # *ordering* in ``lsq_monomial_multi_index`` is **not**
+        # guaranteed to be ``[e_0, e_1, …]``.  Empirically in
+        # ``LSQMesh.create_2d`` it comes out as ``[(0, 1), (1, 0)]`` —
+        # i.e. column 0 of ``lsq_gradQ`` is ``∂/∂y`` and column 1 is
+        # ``∂/∂x``.  The NumPy ``compute_derivatives`` consults the
+        # multi-index via ``find_derivative_indices`` and permutes;
+        # the JAX port was just slicing ``coeffs[:dim]`` and so
+        # silently swapped x and y on 2D meshes — making the
+        # reconstruction extrapolate the y-slope in the x-direction
+        # and vice versa, killing convergence to anything physical.
+        # Build the permutation once here.
+        mon_idx = np.asarray(mesh.lsq_monomial_multi_index)
+        eye = np.eye(dim, dtype=int)
+        grad_perm = np.empty(dim, dtype=np.int32)
+        for d in range(dim):
+            matches = np.where(
+                (mon_idx == eye[d]).all(axis=1))[0]
+            if matches.size == 0:
+                raise RuntimeError(
+                    f"LSQ stencil has no monomial for ∂/∂x_{d}; "
+                    f"available multi-indices: {mon_idx.tolist()}")
+            grad_perm[d] = int(matches[0])
+        self._grad_perm = jnp.asarray(grad_perm)
+
         # Venkatakrishnan smoothing: eps² = h².
         cell_vols = np.asarray(mesh.cell_volumes[:nc])
         h = cell_vols ** (1.0 / max(dim, 1))
@@ -400,6 +428,8 @@ class LSQMUSCLReconstructionJAX:
         has_bdy = self._lsq_has_bdy
         bdy_nbr = self._lsq_bdy_nbr
 
+        grad_perm = self._grad_perm
+
         def per_cell(i):
             A_loc = A_glob[i]
             nbr_idx = neighbors[i]
@@ -417,7 +447,12 @@ class LSQMUSCLReconstructionJAX:
             else:
                 delta_u = u_cells
             coeffs = scale * (A_loc.T @ delta_u)
-            return coeffs[:dim]
+            # Permute from monomial-multi-index order to
+            # ``(∂/∂x, ∂/∂y, …)`` so downstream consumers can dot
+            # ``grads[:, d, :]`` against ``r[d]`` for face
+            # extrapolation without worrying about the LSQ stencil's
+            # internal ordering.
+            return coeffs[grad_perm]
 
         return jax.vmap(per_cell)(jnp.arange(nc)).T   # (dim, nc)
 
@@ -632,10 +667,13 @@ class FreeSurfaceLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
 
     def __call__(self, Q, bf_face_values):
         # Drop to first order in dry cells: zero φ for h < eps_wet.
+        # ``phi`` is sized for inner cells only (``self._nc``); the
+        # SPMD path may pass a full local mesh ``Q`` of shape
+        # ``(n_var, n_inner + n_halo)``, so slice ``dry`` to match.
         n_var = Q.shape[0]
         grads = self._compute_gradients(Q, n_var, bf_face_values)
         phi = self._compute_phi(Q, n_var, bf_face_values, grads)
-        dry = Q[self._h_idx, :] < self._eps_wet
+        dry = Q[self._h_idx, :self._nc] < self._eps_wet
         phi = jnp.where(dry[jnp.newaxis, :], 0.0, phi)
         Q_L, Q_R = self._reconstruct(Q, grads, phi, bf_face_values)
         Q_L = self._wet_dry_clamp(Q_L)
@@ -650,6 +688,249 @@ class FreeSurfaceLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
             Q_face = Q_face.at[mi, :].set(
                 jnp.where(dry, 0.0, Q_face[mi, :]))
         return Q_face
+
+
+class PositivityPreservingLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
+    """LSQ-MUSCL with Xing–Zhang 2013 cell-mean positivity preservation.
+
+    Mathematical recipe
+    -------------------
+    Given a cell ``K`` with cell-mean ``h̄ = Q[h, K]`` and the standard
+    limiter ``φ ∈ [0, 1]^{n_var × n_inner}`` already applied, evaluate
+    the reconstructed depth at every face midpoint of ``K``::
+
+        h_f = h̄ + φ_h · grad_h · (x_f − x_K),   f ∈ faces(K).
+
+    If ``min_f h_f < 0``, scale the **deviation polynomial** uniformly
+    by ``θ_K ∈ [0, 1)`` so the new face minimum is exactly zero::
+
+        θ_K  =  h̄ / (h̄ − min_f h_f).
+
+    Apply ``θ_K`` not just to ``φ_h`` but to **every momentum
+    component** ``φ_{hu_i}``: scaling the linear polynomial uniformly
+    preserves the cell-mean of every variable AND keeps the
+    reconstructed velocity ``u_f = (hu)_f / h_f`` bounded as
+    ``h_f → 0``.
+
+    Why this is the right fix for cell-mean positivity over a CFL-
+    bounded step (Xing & Zhang, J. Sci. Comput. 57(1):19–41, 2013,
+    Theorem 3.1): given a Rusanov / HLL flux with HR, the
+    instantaneous flux through a face depends only on the face-state
+    values ``h_L, h_R``.  If those are non-negative and the time step
+    satisfies the standard CFL ``dt · α_max / h_inradius ≤ 1/(2k+1)``
+    for piecewise-degree-``k`` reconstruction (so ``1/3`` for our
+    linear LSQ-MUSCL), the FV update ``h̄_K^{n+1} = h̄_K^n − dt/|K|
+    Σ_f F_f · area_f`` stays ``≥ 0``.  Bathymetry ``b`` is **not**
+    rescaled (stationary by the model contract).
+
+    Difference from :class:`FreeSurfaceLSQMUSCLJAX`: that class
+    clamps ``h_face ≥ 0`` **after** reconstruction (a face-state
+    safety net) and drops to 1st order in cells with
+    ``h̄ < eps_wet``.  Neither of those guarantees the cell-mean
+    update stays positive over a finite ``dt`` — for Malpasset over
+    T = 100 s the wet/dry front drains thin cells to ``h̄ < 0``.
+    The Xing–Zhang clip prevents the drain at source by ensuring the
+    high-side face value can't exceed the cell's mass budget over the
+    CFL-bounded step.
+
+    Parameters
+    ----------
+    mesh, dim, limiter, unlimited_indices : see :class:`LSQMUSCLReconstructionJAX`.
+    h_index : int
+        Row index of ``h`` in the state vector.
+    momentum_indices : sequence of int, optional
+        Row indices of momentum components scaled by the same θ_K as
+        ``h``.  Defaults to ``range(h_index+1, h_index+1+dim)`` (the
+        ``[h, hu, hv]`` convention).
+    eps_positivity : float
+        Floating-point regularisation in the θ denominator.  Should be
+        ≪ the model's wet/dry threshold so it only fires at strictly
+        zero ``h̄``.
+    """
+
+    def __init__(self, mesh, dim, h_index, momentum_indices=None,
+                 eps_positivity=1e-14,
+                 limiter="venkatakrishnan", unlimited_indices=None):
+        super().__init__(mesh, dim, limiter=limiter,
+                         unlimited_indices=unlimited_indices)
+        self._h_idx = int(h_index)
+        self._mom_idx = (
+            tuple(momentum_indices) if momentum_indices is not None
+            else tuple(range(h_index + 1, h_index + 1 + dim))
+        )
+        self._eps_positivity = float(eps_positivity)
+        # ── Precompute cell→face displacement vectors for the θ_K
+        # evaluation.  ``mesh.cell_faces`` has shape
+        # ``(n_faces_per_cell, n_inner_cells)`` and lists each inner
+        # cell's face indices.  ``mesh.face_centers`` is
+        # ``(n_faces, 3)``.  We build ``r_cf`` of shape
+        # ``(dim, n_faces_per_cell, n_inner_cells)``:
+        #     r_cf[:, f, c] = face_centers[cell_faces[f, c]] - cell_centers[c]
+        nc = self._nc
+        cell_faces = np.asarray(mesh.cell_faces)[:, :nc]
+        face_ctrs = np.asarray(mesh.face_centers)[:, :dim].T  # (dim, n_faces)
+        cell_ctrs = np.asarray(mesh.cell_centers)[:dim, :nc]   # (dim, nc)
+        face_ctrs_at_cf = face_ctrs[:, cell_faces]              # (dim, nfc, nc)
+        r_cf = face_ctrs_at_cf - cell_ctrs[:, np.newaxis, :]    # (dim, nfc, nc)
+        self._r_cf_xz = jnp.asarray(r_cf)
+        self._n_faces_per_cell_xz = int(mesh.n_faces_per_cell)
+
+    def _xing_zhang_scale_phi(self, Q, grads, phi):
+        """Compute θ_K per inner cell, return phi with h + momentum rows scaled."""
+        nc = self._nc
+        h_idx = self._h_idx
+        eps = self._eps_positivity
+
+        h_bar = Q[h_idx, :nc]                          # (nc,)
+        grad_h = grads[h_idx]                          # (dim, nc)
+        phi_h = phi[h_idx]                             # (nc,)
+
+        # h_face[f, c] = h_bar[c] + (φ_h grad_h) · r_cf[:, f, c]
+        scaled_grad_h = grad_h * phi_h[jnp.newaxis, :]
+        delta = jnp.einsum("dc,dfc->fc", scaled_grad_h, self._r_cf_xz)
+        h_face = h_bar[jnp.newaxis, :] + delta         # (nfc, nc)
+
+        h_face_min = jnp.min(h_face, axis=0)           # (nc,)
+        # θ rescales the slope so that the new face-min equals zero.
+        # Guard the denominator: when h_face_min ≥ 0 there is no
+        # violation and θ = 1 by construction (the jnp.where below).
+        denom = jnp.maximum(h_bar - h_face_min, eps)
+        theta = jnp.where(
+            h_face_min < 0.0,
+            jnp.clip(h_bar / denom, 0.0, 1.0),
+            jnp.ones_like(h_bar),
+        )
+
+        new_phi = phi.at[h_idx, :].multiply(theta)
+        for mi in self._mom_idx:
+            new_phi = new_phi.at[mi, :].multiply(theta)
+        return new_phi
+
+    def __call__(self, Q, bf_face_values):
+        n_var = Q.shape[0]
+        grads = self._compute_gradients(Q, n_var, bf_face_values)
+        phi = self._compute_phi(Q, n_var, bf_face_values, grads)
+        phi = self._xing_zhang_scale_phi(Q, grads, phi)
+        return self._reconstruct(Q, grads, phi, bf_face_values)
+
+
+class EtaWellBalancedLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
+    """Primitive-variable LSQ-MUSCL on ``(b, η, hu, hv)`` with
+    ``η = h + b`` (Audusse-Bouchut 2005, Kurganov-Petrova 2007).
+
+    The reconstruction problem on conservative ``(b, h, hu, hv)`` is
+    ill-conditioned at a wet/dry shoreline on non-flat bathymetry:
+    ``h`` drops to zero discontinuously at the shore line while ``b``
+    rises out of the water, so a linear LSQ fit through ``h`` sees a
+    huge slope that the limiter cannot fully tame — face values
+    extrapolated from a wet cell into a dry cell land well below zero
+    (we measured ``h_face = -0.8`` in a 1D probe at slope = -0.2).
+
+    Reconstructing the **free surface** ``η = h + b`` instead is the
+    standard remedy.  At lake-at-rest ``η`` is exactly constant
+    (slope = 0 everywhere — well-balanced by construction).  At a
+    wet/dry shore ``η`` is continuous up to the shoreline, so the
+    slope it sees is finite and the limiter clips it cleanly.  After
+    the linear extrapolation gives face states ``(b_f, η_f, hu_f,
+    hv_f)``, the depth is recovered as ::
+
+        h_f = max(η_f - b_f, 0)
+
+    The outer ``max(·, 0)`` is the Audusse-Bouchut face-state
+    positivity clip and is conservation-safe — at the face we use
+    ``h_f = 0`` to compute the flux, and the upstream cell still
+    drains at the rate determined by ``α`` and the cell's own face
+    value.  Combined with the HR step that
+    :class:`PositiveNonconservativeHLL` performs on these face
+    states, the discrete scheme is provably positivity-preserving
+    and well-balanced under the standard CFL bound.
+
+    Parameters
+    ----------
+    mesh, dim, limiter, unlimited_indices : see
+        :class:`LSQMUSCLReconstructionJAX`.
+    b_index : int
+        Row index of bathymetry ``b`` (defaults to 0 for the
+        ``[b, h, hu, hv]`` convention).
+    h_index : int
+        Row index of depth ``h`` (defaults to 1).  This row carries
+        ``η = h + b`` during the reconstruction pass and is converted
+        back to ``h`` at the face afterwards.
+    """
+
+    def __init__(self, mesh, dim, b_index=0, h_index=1,
+                 momentum_indices=None, eps_wet=1e-3,
+                 limiter="venkatakrishnan", unlimited_indices=None):
+        super().__init__(mesh, dim, limiter=limiter,
+                         unlimited_indices=unlimited_indices)
+        self._b_idx = int(b_index)
+        self._h_idx = int(h_index)
+        self._eps_wet = float(eps_wet)
+        self._mom_idx = (
+            tuple(momentum_indices) if momentum_indices is not None
+            else tuple(range(h_index + 1, h_index + 1 + dim))
+        )
+
+    def __call__(self, Q, bf_face_values):
+        # Q -> W: replace h with η = h + b.
+        W = Q.at[self._h_idx, :].set(
+            Q[self._h_idx, :] + Q[self._b_idx, :])
+        bf_W = bf_face_values
+        if bf_face_values is not None:
+            bf_W = bf_face_values.at[self._h_idx, :].set(
+                bf_face_values[self._h_idx, :]
+                + bf_face_values[self._b_idx, :])
+
+        # Compute slope + limiter per variable on W = (b, η, hu, hv).
+        n_var = Q.shape[0]
+        grads = self._compute_gradients(W, n_var, bf_W)
+        phi = self._compute_phi(W, n_var, bf_W, grads)
+
+        # Drop limiter to 1st order in dry cells (h_bar < eps_wet) so
+        # the reconstruction can't push η far across the shoreline.
+        dry = Q[self._h_idx, :self._nc] < self._eps_wet
+        phi = jnp.where(dry[jnp.newaxis, :], 0.0, phi)
+
+        # **Critical: tie phi_b to phi_η.**  At the shoreline the η-row
+        # limiter clips to 0 (η has the wet/dry discontinuity), but b
+        # is globally smooth so the b-row limiter would leave phi_b=1.
+        # The back-transform ``h_face = η_face − b_face`` then sees an
+        # inconsistent pair: ``η_face = η_cell`` (no slope, from
+        # phi_η=0) but ``b_face = b_cell + grad_b·r`` (full slope,
+        # phi_b=1), so ``h_face = h_cell − grad_b·r`` — a spurious
+        # non-zero h at the dry-side face of the shoreline cell that
+        # bleeds mass into the dry region over many steps.
+        # Audusse-Bouchut 2005 §3 uses a single per-cell ``φ_K`` across
+        # all reconstruction variables; here we tie ``phi_b`` to the
+        # smaller of (its own minmod result, phi_η) so smooth-bath
+        # regions away from the shoreline keep their full O2 b-slope
+        # while shoreline cells consistently drop b's slope alongside
+        # η's.  Same reasoning applies to the momentum rows.
+        phi_eta = phi[self._h_idx]
+        for var_idx in (self._b_idx, *self._mom_idx):
+            phi = phi.at[var_idx, :].set(
+                jnp.minimum(phi[var_idx, :], phi_eta))
+
+        W_L, W_R = self._reconstruct(W, grads, phi, bf_W)
+
+        # W_face -> Q_face: h_f = max(η_f - b_f, 0).  Audusse-Bouchut
+        # 2005 §4: at dry-side faces (h_f < eps_wet) zero the momentum
+        # components so ``u = hu/h`` stays finite when the Riemann sees
+        # nearly-zero face depth.
+        h_L = jnp.maximum(
+            W_L[self._h_idx, :] - W_L[self._b_idx, :], 0.0)
+        h_R = jnp.maximum(
+            W_R[self._h_idx, :] - W_R[self._b_idx, :], 0.0)
+        Q_L = W_L.at[self._h_idx, :].set(h_L)
+        Q_R = W_R.at[self._h_idx, :].set(h_R)
+        dry_L = h_L < self._eps_wet
+        dry_R = h_R < self._eps_wet
+        for mi in self._mom_idx:
+            Q_L = Q_L.at[mi, :].set(
+                jnp.where(dry_L, 0.0, Q_L[mi, :]))
+            Q_R = Q_R.at[mi, :].set(
+                jnp.where(dry_R, 0.0, Q_R[mi, :]))
+        return Q_L, Q_R
 
 
 class FreeSurfaceMUSCL(MUSCLReconstruction):
