@@ -38,7 +38,7 @@ import param
 
 from zoomy_core.misc.logger_config import logger
 from zoomy_core.misc.misc import Zstruct
-from zoomy_core.model.models.system_model import SystemModel
+from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 from zoomy_core.fvm.solver_chorin_vam_numpy import (
     _pad_to_square, _substitute_dt,
