@@ -212,7 +212,7 @@ class JaxRuntime:
         self._qaux_syms = _flat_symbols(self.sm.aux_state)
         self._p_syms = _flat_symbols(self.sm.parameters)
         self._n_syms = _flat_symbols(self.sm.normal)
-        # 3D position symbols (X0, X1, X2) used by interpolate_3d.
+        # 3D position symbols (X0, X1, X2) used by interpolate_to_3d.
         # SystemModel.position may be a Zstruct from Model.position
         # (length 3 even for 2D models) or None when no such operator
         # is attached.
@@ -368,15 +368,15 @@ class JaxRuntime:
             )
         else:
             self.diffusion_matrix_explicit = None
-        # ── interpolate_3d: (n_3d_components,)  signature
+        # ── interpolate_to_3d: (n_3d_components,)  signature
         # ``(Q, Qaux, p, position)`` where ``position = [X0, X1, X2]``.
         # Vmapped over the cell axis with ``position`` broadcast per
         # cell so callers can hand in a per-cell ``(3, n_cells)``
         # position array (typically constant ``(x_cell, y_cell, z*)``
         # for a chosen vertical level ``z*``).  Returns the 3D
         # reconstruction at ``z*`` per cell.
-        p23 = getattr(sm, "interpolate_3d", None)
-        # Treat the all-zero default (``Model.interpolate_3d``
+        p23 = getattr(sm, "interpolate_to_3d", None)
+        # Treat the all-zero default (``Model.interpolate_to_3d``
         # returns ``ZArray.zeros(6)`` by default) as "no projection
         # defined" — callers fall back to a model-agnostic
         # depth-averaged ``hu/h`` instead of getting silently-zero
@@ -400,17 +400,17 @@ class JaxRuntime:
                 # 2D-to-3D projection is post-simulation reconstruction,
                 # not needed by the explicit FVM solver — drop the slot
                 # gracefully and continue. Re-raise on any other failure.
-                self.interpolate_3d = None
+                self.interpolate_to_3d = None
             else:
                 @jax.jit
-                def _interpolate_3d(Q, Qaux, parameters, position):
+                def _interpolate_to_3d(Q, Qaux, parameters, position):
                     def per_cell(q, qaux, pos):
                         return p23_fn(q, qaux, parameters, pos)
                     return jax.vmap(per_cell, in_axes=(1, 1, 1),
                                     out_axes=-1)(Q, Qaux, position)
-                self.interpolate_3d = _interpolate_3d
+                self.interpolate_to_3d = _interpolate_to_3d
         else:
-            self.interpolate_3d = None
+            self.interpolate_to_3d = None
         # ── nonconservative_matrix: (n_eq, n_state, n_dim)
         self.nonconservative_matrix = self._vmap_cell(
             _lambdify_array(_to_array_of_exprs(sm.nonconservative_matrix),
