@@ -406,6 +406,19 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         rt_num_fluct = runtime.numerical_fluctuations
         rt_bc = runtime.boundary_conditions
 
+        # Cell-interior non-conservative integral (path-conservative,
+        # order ≥ 2) — mirrors NumPy ``solver_numpy.get_flux_operator``:
+        # ∫_cell B(Q)·∂_x Q dx ≈ B(Q_c)·s_c with the limited slope s_c.
+        # REQUIRED for well-balancing at order ≥ 2 (the face fluctuations
+        # carry only the inter-cell jump; this is the intra-cell smooth
+        # part).  Active only when the reconstruction exposes its limited
+        # gradient (plain LSQ-MUSCL); order 1 has slope ≡ 0.
+        rt_ncm = getattr(runtime, "nonconservative_matrix", None)
+        use_interior_ncp = bool(
+            self.nsm.reconstruction.order >= 2
+            and rt_ncm is not None
+            and hasattr(reconstruct, "reconstruct_with_grad"))
+
         # Precompute face index arrays.
         fc0 = np.asarray(mesh.face_cells[0])
         fc1 = np.asarray(mesh.face_cells[1])
@@ -467,7 +480,18 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
             # 2. Reconstruct with bf_values (LSQ-MUSCL sees boundary
             # face values for limiter bounds + Q_R override).
-            Q_L, Q_R = reconstruct(Q, bf_values)
+            if use_interior_ncp:
+                Q_L, Q_R, lim_grad = reconstruct.reconstruct_with_grad(
+                    Q, bf_values)
+                # 2b. Cell-interior NCP integral: dQ_c −= Σ_d B(Q_c)[:,:,d]
+                # · s_c[:,d].  No |cell| division — the volume factor
+                # cancels against the per-unit-volume residual (NumPy
+                # parity).
+                B_all = rt_ncm(Q, Qaux, parameters)   # (n_eq, n_state, dim, nc)
+                interior_ncp = jnp.einsum("ijdc,jdc->ic", B_all, lim_grad)
+                dQ = dQ.at[:, :interior_ncp.shape[1]].subtract(interior_ncp)
+            else:
+                Q_L, Q_R = reconstruct(Q, bf_values)
             normals = face_normals_j
             face_volumes = face_volumes_j
 

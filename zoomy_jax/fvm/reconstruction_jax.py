@@ -415,6 +415,17 @@ class LSQMUSCLReconstructionJAX:
         phi = self._compute_phi(Q, n_var, bf_face_values, grads)
         return self._reconstruct(Q, grads, phi, bf_face_values)
 
+    def reconstruct_with_grad(self, Q, bf_face_values):
+        """Like ``__call__`` but additionally returns the LIMITED cell
+        gradient ``phi·grads`` of shape ``(n_var, dim, n_cells)`` —
+        required by the order ≥ 2 cell-interior non-conservative
+        integral (mirrors NumPy ``LSQMUSCLReconstruction._limited_grad``)."""
+        n_var = Q.shape[0]
+        grads = self._compute_gradients(Q, n_var, bf_face_values)
+        phi = self._compute_phi(Q, n_var, bf_face_values, grads)
+        Q_L, Q_R = self._reconstruct(Q, grads, phi, bf_face_values)
+        return Q_L, Q_R, phi[:, jnp.newaxis, :] * grads
+
     # ── LSQ gradient via vmap over cells ────────────────────────────
 
     def _lsq_gradient_scalar(self, u, u_bf):
