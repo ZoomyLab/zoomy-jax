@@ -418,6 +418,18 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             self.nsm.reconstruction.order >= 2
             and rt_ncm is not None
             and hasattr(reconstruct, "reconstruct_with_grad"))
+        if (self.nsm.reconstruction.order >= 2 and rt_ncm is not None
+                and not use_interior_ncp):
+            # Silently dropping the interior NCP at order >= 2 loses
+            # well-balancing for NCP-bearing models (review note on
+            # e67fc78): any reconstruction variant used here must expose
+            # its limited gradient like LSQMUSCLReconstructionJAX does.
+            raise NotImplementedError(
+                f"order-{self.nsm.reconstruction.order} with a nonzero "
+                "nonconservative_matrix requires the reconstruction to "
+                "provide reconstruct_with_grad (limited cell gradient) "
+                "for the cell-interior NCP integral; "
+                f"{type(reconstruct).__name__} does not.")
 
         # Precompute face index arrays.
         fc0 = np.asarray(mesh.face_cells[0])
