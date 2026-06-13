@@ -486,8 +486,12 @@ class JaxRuntime:
             def per_cell(q, qaux):
                 return per_cell_fn(q, qaux, parameters)
             out = jax.vmap(per_cell, in_axes=(1, 1), out_axes=-1)(Q, Qaux)
-            if squeeze_trailing and out.ndim >= 2 and out.shape[-2] == 1:
-                # (n_eq, 1, n_cells) → (n_eq, n_cells)
+            if squeeze_trailing and out.ndim >= 3 and out.shape[-2] == 1:
+                # (n_eq, 1, n_cells) → (n_eq, n_cells): drop the trailing
+                # singleton of a vmapped COLUMN operator (ndim==3).  Guard on
+                # ndim>=3 (not >=2): a genuinely 1-D single-element slot
+                # (e.g. a 1-row update_aux_variables) vmaps to (1, n_cells)
+                # and must NOT be squeezed to (n_cells,).
                 out = jnp.squeeze(out, axis=-2)
             return out
         return full_grid
