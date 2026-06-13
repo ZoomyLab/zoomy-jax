@@ -33,7 +33,7 @@ import zoomy_core.fvm.timestepping as timestepping
 from zoomy_core.fvm.solver_numpy import HyperbolicSolver as HyperbolicSolverNumpy
 from zoomy_core.fvm.solver_numpy import Solver as SolverNumpy
 from zoomy_jax.transformation.jax_runtime import JaxRuntime
-from zoomy_jax.mesh.mesh import convert_mesh_to_jax
+from zoomy_jax.mesh.mesh import convert_mesh_to_jax, lsq_gradient_per_field
 from zoomy_core.mesh import ensure_lsq_mesh
 
 
@@ -272,15 +272,34 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         post_step/residual call-sites (setup, predictor, Newton) all route
         through this one method, so they pick the aux update up uniformly.
         """
+        out = Qaux
+        # (1) LOCAL aux formula leg (e.g. KP hinv) — written as a PREFIX slice
+        # so the non-local derivative-aux tail (rows >= n_local) survives.
         fn = getattr(model, "update_aux_variables", None)
-        if fn is None:
-            return Qaux
-        # Write the local-formula rows as a PREFIX slice; never replace the
-        # whole Qaux — a model can carry update_aux_variables (n_local rows)
-        # AND a non-local derivative-aux tail (n_aux > n_local), and the tail
-        # must survive this call (it is filled by the derivative-aux leg).
-        local = fn(Q, Qaux, parameters)
-        return Qaux.at[:local.shape[0]].set(local)
+        if fn is not None:
+            local = fn(Q, Qaux, parameters)
+            out = out.at[:local.shape[0]].set(local)
+        # (2) DERIVATIVE aux leg — LSQ gradients of state/function fields, the
+        # non-local rows the SystemModel gathered in aux_registry.  Same
+        # contract as the numpy Solver.update_qaux walk; jit-traceable via the
+        # shared BC-aware kernel (registry is static → the loop unrolls).
+        sm = getattr(model, "sm", None)
+        registry = getattr(sm, "aux_registry", None) if sm is not None else None
+        if registry:
+            for e in registry:
+                if e["kind"] != "derivative":
+                    continue
+                tk = e["target_kind"]
+                if tk == "state":
+                    field = Q[e["state_index"]]
+                elif tk == "function":
+                    field = out[e["function_row"]]
+                else:
+                    continue
+                grad = lsq_gradient_per_field(
+                    mesh, field, u_bf=None, multi_index=e["multi_index"])
+                out = out.at[e["row"], :grad.shape[0]].set(grad)
+        return out
 
     # ── Operator builders ───────────────────────────────────────────────
 
