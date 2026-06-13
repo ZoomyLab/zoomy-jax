@@ -345,6 +345,20 @@ class JaxRuntime:
             )
         else:
             self.update_variables = None
+        # ── update_aux_variables: (n_aux, 1) per-cell aux formula (e.g. the
+        # KP-desingularized hinv = sqrt(2) h / sqrt(h^4 + max(h,eps)^4)).
+        # Lowered exactly like ``update_variables``; the solver applies it to
+        # Qaux each step (post_step / update_qaux).  ``None`` ⇒ identity (the
+        # model declares no per-cell aux formula), and the slot short-circuits.
+        uav = getattr(sm, "update_aux_variables", None)
+        if uav is not None and _shape(_to_array_of_exprs(uav)):
+            self.update_aux_variables = self._vmap_cell(
+                _lambdify_array(_to_array_of_exprs(uav),
+                                std, self.module),
+                n_extra=0, squeeze_trailing=True,
+            )
+        else:
+            self.update_aux_variables = None
         # ── diffusion_matrix / diffusion_matrix_explicit:
         # ``(n_eq, n_state, n_dim, n_dim)`` rank-4 tensors.  Optional —
         # ``None`` when the SystemModel carries no diffusion.  Solvers
