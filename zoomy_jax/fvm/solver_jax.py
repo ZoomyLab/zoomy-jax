@@ -255,6 +255,28 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             return Q
         return fn(Q, Qaux, parameters)
 
+    def update_qaux(self, Q, Qaux, Qold, Qauxold, mesh, model,
+                    parameters, time, dt):
+        """Apply the SystemModel's per-cell ``update_aux_variables`` to every
+        cell — the aux leg of ``post_step``, symmetric to :meth:`update_q`.
+
+        The JaxRuntime lambdifies + vmaps the ``update_aux_variables`` slot
+        once at construction (a single JIT'd, traceable call), so e.g. the
+        KP-desingularized ``hinv = √2·h/√(h⁴+max(h,eps)⁴)`` is recomputed from
+        the current ``h`` every step.  ``None`` on the runtime ⇒ the model
+        declared no per-cell aux formula ⇒ identity; short-circuit.
+
+        This OVERRIDES the inherited NumPy ``Solver.update_qaux`` registry
+        walker, which is a guaranteed no-op on JAX (no ``self.sm`` /
+        ``_chain_systemmodel``) and is not JIT-traceable.  The other
+        post_step/residual call-sites (setup, predictor, Newton) all route
+        through this one method, so they pick the aux update up uniformly.
+        """
+        fn = getattr(model, "update_aux_variables", None)
+        if fn is None:
+            return Qaux
+        return fn(Q, Qaux, parameters)
+
     # ── Operator builders ───────────────────────────────────────────────
 
     def get_compute_source(self, mesh, runtime):
