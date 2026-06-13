@@ -275,7 +275,12 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         fn = getattr(model, "update_aux_variables", None)
         if fn is None:
             return Qaux
-        return fn(Q, Qaux, parameters)
+        # Write the local-formula rows as a PREFIX slice; never replace the
+        # whole Qaux — a model can carry update_aux_variables (n_local rows)
+        # AND a non-local derivative-aux tail (n_aux > n_local), and the tail
+        # must survive this call (it is filled by the derivative-aux leg).
+        local = fn(Q, Qaux, parameters)
+        return Qaux.at[:local.shape[0]].set(local)
 
     # ── Operator builders ───────────────────────────────────────────────
 
