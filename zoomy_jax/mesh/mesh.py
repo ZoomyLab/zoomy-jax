@@ -35,6 +35,55 @@ def compute_derivatives(u, mesh, derivatives_multi_index=None):
     return jax.vmap(reconstruct_cell)(A_glob, neighbors, u)[:, indices]
 
 
+def lsq_gradient_per_field(mesh, u_inner, u_bf=None, multi_index=(1,)):
+    """JAX LSQ derivative for a single scalar field via the mesh's precomputed
+    stencil — the BC-aware kernel (boundary-face neighbours via ``u_bf``;
+    ``u_bf=None`` ⇒ extrapolation/Neumann-zero).  ``u_inner`` is the full state
+    row (inner + sentinel); returns ``(n_inner_cells,)``.
+
+    Shared canonical kernel for the unified derivative-aux applicator
+    (``solver_jax.update_qaux``) and the Chorin pressure split.  jit-traceable:
+    the stencil arrays are ``jnp.ndarray`` on a :class:`MeshJAX`; the
+    ``multi_index`` → monomial-column lookup is host-side/static."""
+    nc = int(mesh.n_inner_cells)
+    A_glob = mesh.lsq_gradQ[:nc]
+    neighbors = mesh.lsq_neighbors[:nc]
+    scale = mesh.lsq_scale_factors
+    bdy_nbr = mesh.lsq_boundary_face_neighbors
+    has_bdy = bdy_nbr is not None
+    if has_bdy:
+        bdy_nbr = bdy_nbr[:nc]
+
+    mi_list = [tuple(int(k) for k in mi)
+               for mi in mesh.lsq_monomial_multi_index]
+    try:
+        target = mi_list.index(tuple(int(k) for k in multi_index))
+    except ValueError:
+        raise ValueError(
+            f"LSQ stencil does not carry multi_index {multi_index}; "
+            f"available: {mi_list}")
+
+    def per_cell(i):
+        A_loc = A_glob[i]
+        nbr = neighbors[i]
+        u_i = u_inner[i]
+        u_cells = u_inner[nbr] - u_i
+        if has_bdy:
+            bf = bdy_nbr[i]
+            if u_bf is not None:
+                u_bf_i = jnp.where(bf >= 0, u_bf[jnp.maximum(bf, 0)], u_i)
+            else:
+                u_bf_i = jnp.full_like(bf, u_i, dtype=u_i.dtype)
+            u_bf_delta = jnp.where(bf >= 0, u_bf_i - u_i, 0.0)
+            delta_u = jnp.concatenate([u_cells, u_bf_delta])
+        else:
+            delta_u = u_cells
+        coeffs = scale * (A_loc.T @ delta_u)
+        return coeffs[target]
+
+    return jax.vmap(per_cell)(jnp.arange(nc))
+
+
 @dataclass(frozen=True)
 class MeshJAX:
     """Immutable JAX mesh container.  All numeric fields are jnp.ndarray."""
