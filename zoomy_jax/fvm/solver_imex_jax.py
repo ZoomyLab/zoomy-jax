@@ -21,7 +21,8 @@ from zoomy_core.model.derivative_workflow import DerivativeAwareSolverMixin
 from zoomy_core.misc.logger_config import logger
 
 from zoomy_jax.fvm.jvp_jax import analytic_source_jvp_jax
-from zoomy_jax.mesh.mesh import compute_derivatives, convert_mesh_to_jax
+from zoomy_jax.mesh.mesh import (
+    compute_derivatives, convert_mesh_to_jax, lsq_gradient_per_field)
 from zoomy_core.mesh import ensure_lsq_mesh
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_jax.transformation.jax_runtime import JaxRuntime
@@ -163,18 +164,61 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
     # ── pure closures for JIT tracing ────────────────────────────────────
 
     @staticmethod
-    def _build_update_qaux(runtime_model, mesh):
-        """Return (Q, Qaux, Qold, dt) -> Qaux_new, fully JAX-traceable."""
+    def _build_update_qaux(runtime_model, mesh, parameters=None):
+        """Return ``(Q, Qaux, Qold, dt) -> Qaux_new``, fully JAX-traceable.
+
+        UNIFIED with the canonical jax ``HyperbolicSolver.update_qaux``
+        (solver_jax.py): three composed legs, all no-ops when absent so the
+        builder works for any model.
+
+        1. LOCAL ``update_aux_variables`` prefix leg (e.g. KP ``hinv``) —
+           previously MISSING here, so canonical aux models had their aux
+           frozen at the IC across the whole IMEX run.
+        2. NON-LOCAL ``aux_registry`` spatial-derivative leg via the shared
+           BC-aware ``lsq_gradient_per_field`` (state + function-aux targets).
+        3. LEGACY ``derivative_specs`` overlay — kept for StructuredDerivative/
+           Green-Naghdi models, the ONLY path that can express a time
+           derivative ``(Q-Qold)/dt`` (``aux_registry`` encodes spatial order
+           only).  Additive: a no-op for canonical aux_registry models.
+
+        ``parameters`` defaults to ``runtime_model.parameters`` so the
+        gnn_blueprint children that call ``_build_update_qaux(rmodel, jmesh)``
+        inherit the improved closure with no call-site change.
+        """
+        if parameters is None:
+            parameters = getattr(runtime_model, "parameters", None)
+        local_fn = getattr(runtime_model, "update_aux_variables", None)
+        sm = getattr(runtime_model, "sm", None)
+        registry = [
+            e for e in (getattr(sm, "aux_registry", None) or [])
+            if e.get("kind") == "derivative"
+            and e.get("target_kind") in ("state", "function")
+        ]
         sym = runtime_model.model if hasattr(runtime_model, "model") else runtime_model
-        if not hasattr(sym, "derivative_specs") or not sym.derivative_specs:
+        specs = list(getattr(sym, "derivative_specs", None) or [])
+        field_idx = ({n: i for i, n in enumerate(sym.variables.keys())}
+                     if specs else {})
+        key_idx = getattr(sym, "derivative_key_to_index", {}) if specs else {}
+
+        if local_fn is None and not registry and not specs:
             return lambda Q, Qaux, Qold, dt: Qaux
 
-        field_idx = {n: i for i, n in enumerate(sym.variables.keys())}
-        specs = list(sym.derivative_specs)
-        key_idx = sym.derivative_key_to_index
-
         def _uq(Q, Qaux, Qold, dt):
-            out = jnp.array(Qaux)
+            out = Qaux
+            # (1) local update_aux_variables prefix leg
+            if local_fn is not None:
+                local = local_fn(Q, Qaux, parameters)
+                out = out.at[:local.shape[0]].set(local)
+            # (2) aux_registry spatial-derivative leg (BC-aware LSQ)
+            for e in registry:
+                if e["target_kind"] == "state":
+                    field = Q[e["state_index"]]
+                else:
+                    field = out[e["function_row"]]
+                grad = lsq_gradient_per_field(
+                    mesh, field, u_bf=None, multi_index=e["multi_index"])
+                out = out.at[e["row"], :grad.shape[0]].set(grad)
+            # (3) legacy derivative_specs overlay (incl. time derivative)
             for sp in specs:
                 i_aux = key_idx[sp.key]
                 i_q = field_idx[sp.field]
@@ -312,7 +356,14 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         jv_backend = self._resolve_jv_backend()
         n_vars = Q.shape[0]
 
-        uq = self._build_update_qaux(rmodel, jmesh)
+        # Canonical state hygiene leg (update_variables / update_q), previously
+        # never applied in the IMEX loop.  None (identity) for models without
+        # a per-cell transform; a clamp/ramp for those that declare one.
+        uv = getattr(rmodel, "update_variables", None)
+
+        uq = self._build_update_qaux(rmodel, jmesh, parameters)
+        if uv is not None:                       # update_q THEN update_qaux
+            Q = uv(Q, Qaux, parameters)
         Qaux = uq(Q, Qaux, Q, jnp.asarray(1.0, dtype=Q.dtype))
 
         ev_op = self.get_compute_max_abs_eigenvalue(jmesh, rmodel)
@@ -391,6 +442,8 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                     Qi = impl(Qe, Qan, Qn, t, dt)
 
                 Qn2 = bc_op(t + dt, Qi, Qan, parameters)
+                if uv is not None:               # update_q THEN update_qaux
+                    Qn2 = uv(Qn2, Qan, parameters)
                 Qan2 = uq(Qn2, Qan, Qn, dt)
                 return (t + dt, Qn2, Qan2, ns + 1)
 
