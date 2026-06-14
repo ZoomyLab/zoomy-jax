@@ -759,23 +759,47 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     # coupled (preCICE) subclass share the SAME physics per step
     # (``_advance``) and differ only in the loop wrapper + the two hooks.
     def _advance(self, time, Q, Qaux, *, time_end):
-        """One time step: adaptive dt → explicit RK ``step`` → ``post_step``.
+        """One time step: adaptive dt → explicit RK ``step`` → ``post_step``,
+        with coupling hooks interleaved.
 
-        The reusable per-step building block — pure JAX, no I/O, no loop
-        control.  A coupled solver reuses this verbatim and wraps its own
-        loop + data exchange around it.  Returns ``(time_new, dt, Q, Qaux)``.
+        The reusable per-step building block.  Uncoupled, the hooks are
+        no-ops/identity so this is the plain physics step; a coupled
+        (preCICE) subclass fills the hooks and reuses everything else.
+        Returns ``(time_new, dt, Q, Qaux)``.
         """
         Qold = Q
         dt = self.compute_timestep(Q, Qaux)
         dt = jnp.minimum(dt, time_end - time)
+        dt = self._couple_dt(dt)                          # cap by partner dt
+        Q = self._couple_pre_step(time, dt, Q, Qaux)      # read partner → BC
         Q_stepped = self.step(dt, time, Q, Qaux)
         Q, Qaux = self.post_step(time + dt, dt, Q_stepped, Qold, Qaux)
+        self._couple_post_step(time + dt, dt, Q, Qaux)    # write partner + advance
         return time + dt, dt, Q, Qaux
 
+    # ── coupling hooks (no-op/identity uncoupled; preCICE overrides) ────
     def _couple_setup(self):
-        """Hook: coupling bootstrap (e.g. preCICE participant + mesh +
-        handshake) BEFORE the time loop.  No-op for an uncoupled run."""
+        """Bootstrap (preCICE participant + mesh + handshake) BEFORE the loop."""
         return None
+
+    def _couple_dt(self, dt):
+        """Cap dt by the partner/coupling timestep.  Identity uncoupled."""
+        return dt
+
+    def _couple_pre_step(self, time, dt, Q, Qaux):
+        """Read partner data and inject it into the boundary state BEFORE the
+        explicit step.  Returns Q unchanged uncoupled."""
+        return Q
+
+    def _couple_post_step(self, time, dt, Q, Qaux):
+        """Write this step's result to the partner + advance the coupling.
+        No-op uncoupled."""
+        return None
+
+    def _couple_proceed(self, time, time_end):
+        """Loop-continue predicate.  ``time < time_end`` uncoupled; a coupled
+        subclass returns 'coupling ongoing'."""
+        return time < time_end
 
     def compute_timestep(self, Q, Qaux):
         """Compute the adaptive time step using the stored eigenvalue operator.
@@ -843,8 +867,9 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # subclass overrides it (participant init + mesh + handshake).
         self._couple_setup()
 
-        # Capture the per-step building block for the JIT closure.
+        # Capture the per-step building block + loop predicate for the closure.
         _advance = self._advance
+        _couple_proceed = self._couple_proceed
 
         @jax.jit
         @partial(jax.named_call, name="time_loop")
@@ -880,7 +905,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             def proceed(loop_val):
                 """Check if simulation should continue."""
                 time, iteration, i_snapshot, Qnew, Qaux = loop_val
-                return time < time_end
+                return _couple_proceed(time, time_end)
 
             (time, iteration, i_snapshot, Qnew, Qauxnew) = jax.lax.while_loop(
                 proceed, loop_body, loop_val
