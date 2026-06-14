@@ -754,6 +754,29 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return Q, Qaux
 
+    # ── per-step building block + coupling hooks ────────────────────────
+    # These make the time loop composable: the uncoupled solver and a
+    # coupled (preCICE) subclass share the SAME physics per step
+    # (``_advance``) and differ only in the loop wrapper + the two hooks.
+    def _advance(self, time, Q, Qaux, *, time_end):
+        """One time step: adaptive dt → explicit RK ``step`` → ``post_step``.
+
+        The reusable per-step building block — pure JAX, no I/O, no loop
+        control.  A coupled solver reuses this verbatim and wraps its own
+        loop + data exchange around it.  Returns ``(time_new, dt, Q, Qaux)``.
+        """
+        Qold = Q
+        dt = self.compute_timestep(Q, Qaux)
+        dt = jnp.minimum(dt, time_end - time)
+        Q_stepped = self.step(dt, time, Q, Qaux)
+        Q, Qaux = self.post_step(time + dt, dt, Q_stepped, Qold, Qaux)
+        return time + dt, dt, Q, Qaux
+
+    def _couple_setup(self):
+        """Hook: coupling bootstrap (e.g. preCICE participant + mesh +
+        handshake) BEFORE the time loop.  No-op for an uncoupled run."""
+        return None
+
     def compute_timestep(self, Q, Qaux):
         """Compute the adaptive time step using the stored eigenvalue operator.
 
@@ -816,10 +839,12 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         i_snapshot = save_fields(0.0, 0.0, 0.0, Q, Qaux)
         time_end = self.time_end
 
-        # Capture self references for the JIT closure
-        _step = self.step
-        _post_step = self.post_step
-        _compute_timestep = self.compute_timestep
+        # Coupling bootstrap hook — no-op for an uncoupled run; a preCICE
+        # subclass overrides it (participant init + mesh + handshake).
+        self._couple_setup()
+
+        # Capture the per-step building block for the JIT closure.
+        _advance = self._advance
 
         @jax.jit
         @partial(jax.named_call, name="time_loop")
@@ -832,18 +857,10 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 """Single iteration of the time loop."""
                 time, iteration, i_snapshot, Qnew, Qauxnew = init_value
 
-                Qold = Qnew
-
-                dt = _compute_timestep(Qnew, Qauxnew)
-                dt = jnp.minimum(dt, time_end - time)
-
-                # Explicit step (per-stage BCs applied inside).
-                Q_stepped = _step(dt, time, Qnew, Qauxnew)
-
-                # Post-step: BCs + update_q + update_qaux
-                time_new = time + dt
-                Q_final, Qaux_final = _post_step(
-                    time_new, dt, Q_stepped, Qold, Qauxnew
+                # One step of physics (dt → step → post_step), the shared
+                # building block.
+                time_new, dt, Q_final, Qaux_final = _advance(
+                    time, Qnew, Qauxnew, time_end=time_end
                 )
 
                 iteration_new = iteration + 1
