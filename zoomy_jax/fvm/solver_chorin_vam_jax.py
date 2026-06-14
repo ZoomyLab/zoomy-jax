@@ -45,60 +45,14 @@ from zoomy_core.fvm.solver_chorin_vam_numpy import (
 )
 
 from zoomy_jax.fvm.solver_jax import HyperbolicSolver as HyperbolicSolverJax
+from zoomy_jax.mesh.mesh import lsq_gradient_per_field
 from zoomy_jax.transformation.jax_runtime import JaxRuntime
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
-
-
-def _lsq_gradient_per_field(mesh, u_inner, u_bf=None, multi_index=(1,)):
-    """JAX LSQ derivative for a single scalar field via the mesh's
-    precomputed stencil.  ``u_inner`` shape ``(n_inner_cells,)``;
-    ``u_bf`` shape ``(n_boundary_faces,)`` or None (extrapolation).
-
-    The mesh stencil arrays are already ``jnp.ndarray`` on a
-    :class:`MeshJAX`, so no host-side coercion is needed (avoids
-    TracerArrayConversionError under JIT)."""
-    nc = int(mesh.n_inner_cells)
-    A_glob = mesh.lsq_gradQ[:nc]
-    neighbors = mesh.lsq_neighbors[:nc]
-    scale = mesh.lsq_scale_factors
-    bdy_nbr = mesh.lsq_boundary_face_neighbors
-    has_bdy = bdy_nbr is not None
-    if has_bdy:
-        bdy_nbr = bdy_nbr[:nc]
-
-    # Pick the monomial index whose powers match `multi_index` —
-    # done host-side; the lsq_monomial_multi_index is small/static.
-    mi_list = [tuple(int(k) for k in mi)
-               for mi in mesh.lsq_monomial_multi_index]
-    try:
-        target = mi_list.index(tuple(int(k) for k in multi_index))
-    except ValueError:
-        raise ValueError(
-            f"LSQ stencil does not carry multi_index {multi_index}; "
-            f"available: {mi_list}")
-
-    def per_cell(i):
-        A_loc = A_glob[i]
-        nbr = neighbors[i]
-        u_i = u_inner[i]
-        u_cells = u_inner[nbr] - u_i
-        if has_bdy:
-            bf = bdy_nbr[i]
-            if u_bf is not None:
-                u_bf_i = jnp.where(
-                    bf >= 0, u_bf[jnp.maximum(bf, 0)], u_i)
-            else:
-                u_bf_i = jnp.full_like(bf, u_i, dtype=u_i.dtype)
-            u_bf_delta = jnp.where(bf >= 0, u_bf_i - u_i, 0.0)
-            delta_u = jnp.concatenate([u_cells, u_bf_delta])
-        else:
-            delta_u = u_cells
-        coeffs = scale * (A_loc.T @ delta_u)
-        return coeffs[target]
-
-    return jax.vmap(per_cell)(jnp.arange(nc))
+# (The per-field LSQ derivative kernel formerly duplicated here is now the
+#  shared ``zoomy_jax.mesh.mesh.lsq_gradient_per_field`` — same contract —
+#  imported above and used by both the aux refresh and the pressure matvec.)
 
 
 # ── The solver ───────────────────────────────────────────────────────
@@ -298,22 +252,14 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         return p.at[-1].set(jnp.asarray(dt, dtype=p.dtype))
 
     def _refresh_aux_for_sm(self, Qaux, sm, Q):
-        """LSQ-recompute every state-derivative aux entry for ``sm``.
-
-        Pure function — returns a new Qaux array.  Safe to call inside
-        ``jax.jit`` / ``jax.lax.scan``."""
-        mesh = self._rt_mesh
-        for entry in (sm.aux_registry or []):
-            if (entry.get("kind") not in ("derivative", "limited_derivative")
-                    or entry.get("target_kind") != "state"):
-                continue
-            row = int(entry["row"])
-            state_i = int(entry["state_index"])
-            mi = tuple(entry["multi_index"])
-            grad = _lsq_gradient_per_field(
-                mesh, Q[state_i, :], u_bf=None, multi_index=mi)
-            Qaux = Qaux.at[row, :].set(grad)
-        return Qaux
+        """LSQ-recompute every state-derivative aux entry for ``sm`` via the
+        shared :meth:`HyperbolicSolver._walk_derivative_aux` (state-only, both
+        derivative kinds — Chorin's historical scope).  Pure function — returns
+        a new Qaux array.  Safe inside ``jax.jit`` / ``jax.lax.scan``."""
+        return self._walk_derivative_aux(
+            sm, Qaux, Q, self._rt_mesh,
+            kinds=("derivative", "limited_derivative"),
+            target_kinds=("state",))
 
     def update_aux_variables(self):
         """Host-side wrapper that mutates ``self`` — convenience for
@@ -411,7 +357,7 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         def _refresh_pressure_aux(p_mat, Qaux_work):
             for spec in press_aux_specs:
                 k = local_of_state[spec["state_index"]]
-                grad = _lsq_gradient_per_field(
+                grad = lsq_gradient_per_field(
                     mesh, p_mat[k, :], u_bf=None,
                     multi_index=spec["multi_index"])
                 Qaux_work = Qaux_work.at[spec["row"], :].set(grad)

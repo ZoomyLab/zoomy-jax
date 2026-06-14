@@ -279,26 +279,37 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         if fn is not None:
             local = fn(Q, Qaux, parameters)
             out = out.at[:local.shape[0]].set(local)
-        # (2) DERIVATIVE aux leg — LSQ gradients of state/function fields, the
-        # non-local rows the SystemModel gathered in aux_registry.  Same
-        # contract as the numpy Solver.update_qaux walk; jit-traceable via the
-        # shared BC-aware kernel (registry is static → the loop unrolls).
-        sm = getattr(model, "sm", None)
+        # (2) DERIVATIVE aux leg — the non-local LSQ-gradient rows the
+        # SystemModel gathered in aux_registry, via the shared walk (the SINGLE
+        # source the Chorin per-pool refresh also calls).
+        out = self._walk_derivative_aux(getattr(model, "sm", None), out, Q, mesh)
+        return out
+
+    @staticmethod
+    def _walk_derivative_aux(sm, Qaux, Q, mesh, *, kinds=("derivative",),
+                             target_kinds=("state", "function")):
+        """Fill ``aux_registry`` derivative rows of ONE SystemModel via the
+        shared BC-aware LSQ kernel — the single source the canonical
+        :meth:`update_qaux` AND ``ChorinSplitVAMSolverJax._refresh_aux_for_sm``
+        both call.  ``kinds`` / ``target_kinds`` keep each caller's exact scope
+        (canonical: spatial ``derivative``, state+function; Chorin: also
+        ``limited_derivative``, state only).  jit-traceable — the registry is
+        static so the loop unrolls at trace time."""
+        out = Qaux
         registry = getattr(sm, "aux_registry", None) if sm is not None else None
-        if registry:
-            for e in registry:
-                if e["kind"] != "derivative":
-                    continue
-                tk = e["target_kind"]
-                if tk == "state":
-                    field = Q[e["state_index"]]
-                elif tk == "function":
-                    field = out[e["function_row"]]
-                else:
-                    continue
-                grad = lsq_gradient_per_field(
-                    mesh, field, u_bf=None, multi_index=e["multi_index"])
-                out = out.at[e["row"], :grad.shape[0]].set(grad)
+        if not registry:
+            return out
+        for e in registry:
+            if e["kind"] not in kinds:
+                continue
+            tk = e["target_kind"]
+            if tk not in target_kinds:
+                continue
+            field = (Q[e["state_index"]] if tk == "state"
+                     else out[e["function_row"]])
+            grad = lsq_gradient_per_field(
+                mesh, field, u_bf=None, multi_index=e["multi_index"])
+            out = out.at[e["row"], :grad.shape[0]].set(grad)
         return out
 
     # ── Operator builders ───────────────────────────────────────────────
