@@ -62,6 +62,11 @@ _JAX_MODULE_BASE: dict = {
     # callable built from the SystemModel's ``eigenvalues``.  Set by
     # ``JaxRuntime`` in __init__.
     "max_wavespeed": None,
+    # NON-LOCAL spatial derivative aux — the solver injects the mesh-bound
+    # impl (lsq_gradient_per_field) before the update_aux_variables slot is
+    # lambdified, mirroring max_wavespeed.  Requires that slot to be lowered
+    # WHOLE-GRID (field arrives as the full row, not a per-cell scalar).
+    "compute_derivative": None,
 }
 
 
