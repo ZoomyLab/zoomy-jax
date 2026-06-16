@@ -230,6 +230,34 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
                 "multi_index": tuple(entry["multi_index"]),
             })
 
+        # Boundary-face BC machinery for the PRESSURE step.  Each sub-system
+        # must apply its own BCs: the predictor does so in its flux op, but the
+        # pressure elliptic solve builds the P gradients with the bare LSQ
+        # kernel (``u_bf=None`` ⇒ Neumann-zero on EVERY field, incl. P).  With no
+        # P reference at the outflow the pressure floats and the corrector turns
+        # it into a depth pile-up.  Precompute the per-boundary-face arrays so
+        # ``_bc_boundary_face_values`` can replicate the predictor's per-face BC
+        # evaluation (solver_jax flux_operator, step 1) and feed the P boundary
+        # values (e.g. the outflow Dirichlet P=0) into the gradient kernel.
+        mesh = self._rt_mesh
+        self._bf_n = int(getattr(mesh, "n_boundary_faces", 0))
+        if self._bf_n > 0 and self.rt_press.boundary_conditions is not None:
+            self._bf_rt_bc = self.rt_press.boundary_conditions
+            bf_faces = np.asarray(mesh.boundary_face_face_indices)
+            bf_cells = np.asarray(mesh.boundary_face_cells)
+            fcen = np.asarray(mesh.face_centers)
+            ccen = np.asarray(mesh.cell_centers)
+            self._bf_func_no = jnp.asarray(mesh.boundary_face_function_numbers, dtype=jnp.int32)
+            self._bf_cells = jnp.asarray(bf_cells, dtype=jnp.int32)
+            self._bf_faces = jnp.asarray(bf_faces)
+            self._bf_face_centers = jnp.asarray(fcen)
+            self._bf_normals = jnp.asarray(mesh.face_normals)
+            self._bf_d = jnp.asarray([
+                np.linalg.norm(fcen[bf_faces[i], :] - ccen[:, bf_cells[i]])
+                for i in range(self._bf_n)])
+        else:
+            self._bf_rt_bc = None
+
         logger.info(
             "ChorinSplitVAMSolverJax setup: pred → %s, press → %s, corr → %s "
             "in %.2fs",
@@ -250,6 +278,21 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         """Return rt.parameters with the last (dt) slot updated."""
         p = rt.parameters
         return p.at[-1].set(jnp.asarray(dt, dtype=p.dtype))
+
+    def _bc_boundary_face_values(self, Q, Qaux, params):
+        """Per-boundary-face ghost values ``(n_state, n_bf)`` from the pressure
+        sub-system's BC — the same per-face evaluation the predictor's flux op
+        does (solver_jax ``flux_operator`` step 1).  Used to give the pressure
+        gradient kernel BC-aware boundary neighbours (e.g. the outflow Dirichlet
+        ``P=0``) instead of Neumann-zero.  Python loop over the (small) boundary
+        face set — the indexed BC kernel's structural switch resists vmap."""
+        rt_bc = self._bf_rt_bc
+        vals = [rt_bc(self._bf_func_no[i], 0.0,
+                      self._bf_face_centers[self._bf_faces[i], :], self._bf_d[i],
+                      Q[:, self._bf_cells[i]], Qaux[:, self._bf_cells[i]],
+                      params, self._bf_normals[:, self._bf_faces[i]])
+                for i in range(self._bf_n)]
+        return jnp.stack(vals, axis=-1)
 
     def _refresh_aux_for_sm(self, Qaux, sm, Q):
         """LSQ-recompute every state-derivative aux entry for ``sm`` via the
@@ -355,10 +398,16 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         mesh = self._rt_mesh
 
         def _refresh_pressure_aux(p_mat, Qaux_work):
+            # BC-aware boundary neighbours for the P gradients (outflow P=0 etc.);
+            # falls back to Neumann-zero if no BC machinery (e.g. 1-D periodic).
+            bf = (self._bc_boundary_face_values(
+                      Q.at[e2s, :].set(p_mat), Qaux_work, p_full)
+                  if self._bf_rt_bc is not None else None)
             for spec in press_aux_specs:
                 k = local_of_state[spec["state_index"]]
+                u_bf = None if bf is None else bf[spec["state_index"], :]
                 grad = lsq_gradient_per_field(
-                    mesh, p_mat[k, :], u_bf=None,
+                    mesh, p_mat[k, :], u_bf=u_bf,
                     multi_index=spec["multi_index"])
                 Qaux_work = Qaux_work.at[spec["row"], :].set(grad)
             return Qaux_work
