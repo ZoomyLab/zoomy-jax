@@ -882,7 +882,13 @@ class EtaWellBalancedLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
             else tuple(range(h_index + 1, h_index + 1 + dim))
         )
 
-    def __call__(self, Q, bf_face_values):
+    def _eta_core(self, Q, bf_face_values):
+        """Shared η reconstruction core for ``__call__`` and
+        ``reconstruct_with_grad`` — returns ``(Q_L, Q_R, grads, phi)`` where
+        ``grads`` / ``phi`` are the slopes + tied, dry-aware limiter on
+        ``W = (b, η, hu, hv)``.  Exposing them lets the order≥2 interior NCP
+        integral reuse the *same* limited slopes the η face flux was built
+        from (well-balanced + wet/dry-safe)."""
         # Q -> W: replace h with η = h + b.
         W = Q.at[self._h_idx, :].set(
             Q[self._h_idx, :] + Q[self._b_idx, :])
@@ -941,7 +947,38 @@ class EtaWellBalancedLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
                 jnp.where(dry_L, 0.0, Q_L[mi, :]))
             Q_R = Q_R.at[mi, :].set(
                 jnp.where(dry_R, 0.0, Q_R[mi, :]))
+        return Q_L, Q_R, grads, phi
+
+    def __call__(self, Q, bf_face_values):
+        Q_L, Q_R, _grads, _phi = self._eta_core(Q, bf_face_values)
         return Q_L, Q_R
+
+    def reconstruct_with_grad(self, Q, bf_face_values):
+        """η-consistent limited cell gradient for the order≥2 cell-interior
+        NCP integral ``B(Q_c)·s_c`` (well-balanced + positivity-safe on
+        wet/dry beds).
+
+        The base ``reconstruct_with_grad`` returns the slope of the
+        *conservative* ``h`` row, whose limiter sees the wet/dry
+        discontinuity (a huge slope, only partly tamed) — inconsistent with
+        the ``η = h + b`` face flux.  That mismatch (a) breaks order-2
+        lake-at-rest well-balancing and (b) injects a large spurious
+        bed-slope momentum at the shoreline that drains thin cells to
+        ``h < 0`` (the failure shared by all three face variants, since they
+        all reused this base gradient).
+
+        Returning the η-consistent slope instead: the conservative ``h``
+        slope is ``∂η − ∂b``, carrying the SAME tied, dry-aware limiter the
+        face states use — so at lake-at-rest (``∂η = 0``) it reduces to
+        ``−∂b`` and the interior NCP exactly cancels the η hydrostatic face
+        flux.  ``b`` and the momentum rows already carry their tied limited
+        slopes ``φ·grad``."""
+        Q_L, Q_R, grads, phi = self._eta_core(Q, bf_face_values)
+        lim_grad = phi[:, jnp.newaxis, :] * grads     # slopes on (b, η, hu, hv)
+        # η row → conservative h slope ∂η − ∂b (tied limiter on both rows).
+        lim_grad = lim_grad.at[self._h_idx].set(
+            lim_grad[self._h_idx] - lim_grad[self._b_idx])
+        return Q_L, Q_R, lim_grad
 
 
 class FreeSurfaceMUSCL(MUSCLReconstruction):
