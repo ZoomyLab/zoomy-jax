@@ -198,6 +198,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             "Audusse-Bouchut 2005 / Kurganov-Petrova 2007 well-balanced "
             "wet/dry recipe.  ``xz`` = Xing-Zhang 2013 cell-mean "
             "positivity scaling on the conservative reconstruction.")
+    positivity_method = param.Selector(
+        default="", objects=["", "zhang_shu"],
+        doc="A-priori cell-mean positivity at order≥2.  '' = none; "
+            "'zhang_shu' = Xing-Zhang-Shu 2010 deviation cap so h≥0 holds for "
+            "the cell mean under CFL ≤ 1/(2k+1), with NO a-posteriori step and "
+            "NO dt-halving.  Currently wired for ``reconstruction_variables="
+            "'eta'`` (the well-balanced wet/dry recipe).")
 
     def __init__(self, **kwargs):
         # Riemann numerics are now owned by the NSM (nsm.riemann is the
@@ -419,6 +426,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                     h_index=int(self.free_surface_h_index),
                     momentum_indices=self.free_surface_momentum_indices,
                     eps_wet=float(self.free_surface_eps_wet),
+                    positivity=(self.positivity_method or None),
                     limiter=limiter,
                 )
             if mode == "xz":

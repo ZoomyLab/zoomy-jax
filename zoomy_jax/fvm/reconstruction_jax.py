@@ -701,7 +701,44 @@ class FreeSurfaceLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
         return Q_face
 
 
-class PositivityPreservingLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
+class _ZhangShuPP:
+    """Xing-Zhang-Shu 2010 a-priori cell-mean positivity limiter (shared).
+
+    Scales the reconstruction *deviation* by a per-cell θ ∈ [0, 1] so the
+    reconstructed depth at every face midpoint of the cell stays ≥ 0.  The cell
+    mean (hence conservation) is untouched, and θ = 1 (no-op) wherever the
+    reconstruction is already non-negative — in particular at still water, so
+    well-balancing is preserved.  Mixed into the conservative-h
+    (:class:`PositivityPreservingLSQMUSCLJAX`) and η=h+b
+    (:class:`EtaWellBalancedLSQMUSCLJAX`) reconstructions.
+    """
+
+    def _build_cell_face_rays(self, mesh, dim):
+        """``r_cf[:, f, c] = face_centers[cell_faces[f, c]] − cell_centers[c]``,
+        shape ``(dim, n_faces_per_cell, n_inner_cells)`` — the rays from each
+        cell centre to its own face midpoints, for evaluating the
+        reconstruction at the cell's faces."""
+        nc = self._nc
+        cell_faces = np.asarray(mesh.cell_faces)[:, :nc]
+        face_ctrs = np.asarray(mesh.face_centers)[:, :dim].T  # (dim, n_faces)
+        cell_ctrs = np.asarray(mesh.cell_centers)[:dim, :nc]   # (dim, nc)
+        self._r_cf = jnp.asarray(
+            face_ctrs[:, cell_faces] - cell_ctrs[:, np.newaxis, :])
+
+    def _pp_theta(self, h_bar, h_slope, eps=1e-14):
+        """Per-cell θ so ``min_face(h_bar + h_slope·r_cf) ≥ 0`` (θ=1 if already
+        ≥ 0).  ``h_slope`` is the LIMITED conservative depth slope ``(dim, nc)``
+        — ``φ_h·∇h`` for the plain reconstruction, ``φ_η·∇η − φ_b·∇b`` for η.
+        Rescales the deviation, never the mean, so conservation is exact."""
+        delta = jnp.einsum("dc,dfc->fc", h_slope, self._r_cf)
+        h_min = jnp.min(h_bar[jnp.newaxis, :] + delta, axis=0)
+        denom = jnp.maximum(h_bar - h_min, eps)
+        return jnp.where(h_min < 0.0,
+                         jnp.clip(h_bar / denom, 0.0, 1.0),
+                         jnp.ones_like(h_bar))
+
+
+class PositivityPreservingLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
     """LSQ-MUSCL with Xing–Zhang 2013 cell-mean positivity preservation.
 
     Mathematical recipe
@@ -770,48 +807,15 @@ class PositivityPreservingLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
             else tuple(range(h_index + 1, h_index + 1 + dim))
         )
         self._eps_positivity = float(eps_positivity)
-        # ── Precompute cell→face displacement vectors for the θ_K
-        # evaluation.  ``mesh.cell_faces`` has shape
-        # ``(n_faces_per_cell, n_inner_cells)`` and lists each inner
-        # cell's face indices.  ``mesh.face_centers`` is
-        # ``(n_faces, 3)``.  We build ``r_cf`` of shape
-        # ``(dim, n_faces_per_cell, n_inner_cells)``:
-        #     r_cf[:, f, c] = face_centers[cell_faces[f, c]] - cell_centers[c]
-        nc = self._nc
-        cell_faces = np.asarray(mesh.cell_faces)[:, :nc]
-        face_ctrs = np.asarray(mesh.face_centers)[:, :dim].T  # (dim, n_faces)
-        cell_ctrs = np.asarray(mesh.cell_centers)[:dim, :nc]   # (dim, nc)
-        face_ctrs_at_cf = face_ctrs[:, cell_faces]              # (dim, nfc, nc)
-        r_cf = face_ctrs_at_cf - cell_ctrs[:, np.newaxis, :]    # (dim, nfc, nc)
-        self._r_cf_xz = jnp.asarray(r_cf)
-        self._n_faces_per_cell_xz = int(mesh.n_faces_per_cell)
+        self._build_cell_face_rays(mesh, dim)
 
     def _xing_zhang_scale_phi(self, Q, grads, phi):
-        """Compute θ_K per inner cell, return phi with h + momentum rows scaled."""
-        nc = self._nc
+        """Scale the h + momentum rows by the Xing-Zhang-Shu θ so the
+        reconstructed depth stays ≥ 0 at every face of the cell."""
         h_idx = self._h_idx
-        eps = self._eps_positivity
-
-        h_bar = Q[h_idx, :nc]                          # (nc,)
-        grad_h = grads[h_idx]                          # (dim, nc)
-        phi_h = phi[h_idx]                             # (nc,)
-
-        # h_face[f, c] = h_bar[c] + (φ_h grad_h) · r_cf[:, f, c]
-        scaled_grad_h = grad_h * phi_h[jnp.newaxis, :]
-        delta = jnp.einsum("dc,dfc->fc", scaled_grad_h, self._r_cf_xz)
-        h_face = h_bar[jnp.newaxis, :] + delta         # (nfc, nc)
-
-        h_face_min = jnp.min(h_face, axis=0)           # (nc,)
-        # θ rescales the slope so that the new face-min equals zero.
-        # Guard the denominator: when h_face_min ≥ 0 there is no
-        # violation and θ = 1 by construction (the jnp.where below).
-        denom = jnp.maximum(h_bar - h_face_min, eps)
-        theta = jnp.where(
-            h_face_min < 0.0,
-            jnp.clip(h_bar / denom, 0.0, 1.0),
-            jnp.ones_like(h_bar),
-        )
-
+        h_slope = grads[h_idx] * phi[h_idx][jnp.newaxis, :]   # φ_h ∇h, (dim, nc)
+        theta = self._pp_theta(
+            Q[h_idx, :self._nc], h_slope, self._eps_positivity)
         new_phi = phi.at[h_idx, :].multiply(theta)
         for mi in self._mom_idx:
             new_phi = new_phi.at[mi, :].multiply(theta)
@@ -825,7 +829,7 @@ class PositivityPreservingLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
         return self._reconstruct(Q, grads, phi, bf_face_values)
 
 
-class EtaWellBalancedLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
+class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
     """Primitive-variable LSQ-MUSCL on ``(b, η, hu, hv)`` with
     ``η = h + b`` (Audusse-Bouchut 2005, Kurganov-Petrova 2007).
 
@@ -870,7 +874,7 @@ class EtaWellBalancedLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
     """
 
     def __init__(self, mesh, dim, b_index=0, h_index=1,
-                 momentum_indices=None, eps_wet=1e-3,
+                 momentum_indices=None, eps_wet=1e-3, positivity=None,
                  limiter="venkatakrishnan", unlimited_indices=None):
         super().__init__(mesh, dim, limiter=limiter,
                          unlimited_indices=unlimited_indices)
@@ -881,6 +885,11 @@ class EtaWellBalancedLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
             tuple(momentum_indices) if momentum_indices is not None
             else tuple(range(h_index + 1, h_index + 1 + dim))
         )
+        # ``positivity="zhang_shu"`` adds the a-priori Xing-Zhang-Shu cell-mean
+        # cap on top of the η reconstruction → a-priori h≥0 under CFL ≤ 1/(2k+1)
+        # with NO a-posteriori step.  ``None`` → WB + Audusse face clip only.
+        self._positivity = positivity
+        self._build_cell_face_rays(mesh, dim)
 
     def _eta_core(self, Q, bf_face_values):
         """Shared η reconstruction core for ``__call__`` and
@@ -927,6 +936,25 @@ class EtaWellBalancedLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
         for var_idx in (self._b_idx, *self._mom_idx):
             phi = phi.at[var_idx, :].set(
                 jnp.minimum(phi[var_idx, :], phi_eta))
+
+        # A-priori Xing-Zhang-Shu cell-mean positivity (optional): cap the
+        # CONSERVATIVE depth deviation so the reconstructed h stays ≥ 0 at every
+        # face — while keeping the BED reconstruction FAITHFUL (b is fixed
+        # topography; scaling it corrupts b_face and the Audusse h*).  Net depth
+        # slope is sh = φ_η·∇η − φ_b·∇b; we want the capped slope θ·sh with the
+        # bed keeping φ_b·∇b, i.e. the η slope becomes φ_b·∇b + θ·sh.  We fold
+        # the limiter into grad and set φ_η=1 so the back-transform
+        # h_f = η_f − b_f sees exactly h̄ + θ·sh·r.  Dry cells already have φ=0 ⇒
+        # sh=0 ⇒ untouched; at still water ∇η=0 and h̄≥0 ⇒ θ=1 ⇒ WB preserved.
+        # Branchless ⇒ GPU-friendly; the interior-NCP gradient inherits θ·sh.
+        if self._positivity == "zhang_shu":
+            bslope = phi[self._b_idx][jnp.newaxis, :] * grads[self._b_idx]
+            sh = phi[self._h_idx][jnp.newaxis, :] * grads[self._h_idx] - bslope
+            theta = self._pp_theta(Q[self._h_idx, :self._nc], sh)
+            grads = grads.at[self._h_idx].set(bslope + theta[jnp.newaxis, :] * sh)
+            phi = phi.at[self._h_idx, :].set(jnp.ones_like(phi[self._h_idx]))
+            for mi in self._mom_idx:
+                phi = phi.at[mi, :].multiply(theta)
 
         W_L, W_R = self._reconstruct(W, grads, phi, bf_W)
 
