@@ -698,7 +698,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return Q, Qaux
 
-    def step(self, dt, time, Q, Qaux):
+    def step(self, dt, time, Q, Qaux, parameters=None):
         """Perform a single explicit time step.
 
         Each RK stage starts by refreshing the boundary ghost cells from
@@ -710,7 +710,10 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         though the interior is fine (interior errs ≈ O(dx²), boundary
         errs ≈ O(dx)).
         """
-        parameters = self._rt_parameters
+        # ``parameters=None`` → the baked runtime params (all existing
+        # callers); passing a traced array makes the step differentiable
+        # w.r.t. physical parameters (forward-mode jvp/jacfwd).
+        parameters = self._rt_parameters if parameters is None else parameters
         flux = self._rt_flux_op
 
         # BC is now applied INSIDE flux_operator at the right time
@@ -734,7 +737,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return Q
 
-    def post_step(self, time, dt, Q, Qold, Qaux):
+    def post_step(self, time, dt, Q, Qold, Qaux, parameters=None):
         """Post-step processing: BCs, update_q, update_qaux.
 
         Separated from ``step`` so that subclasses (e.g. IMEX) can insert
@@ -760,7 +763,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         """
         mesh = self._rt_mesh
         model = self._rt_model
-        parameters = self._rt_parameters
+        parameters = self._rt_parameters if parameters is None else parameters
 
         # No separate post-step BC application — the BC kernel runs
         # inside flux_operator at the right moment of each RK stage.
@@ -779,7 +782,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     # These make the time loop composable: the uncoupled solver and a
     # coupled (preCICE) subclass share the SAME physics per step
     # (``_advance``) and differ only in the loop wrapper + the two hooks.
-    def _advance(self, time, Q, Qaux, *, time_end):
+    def _advance(self, time, Q, Qaux, *, time_end, parameters=None):
         """One time step: adaptive dt → explicit RK ``step`` → ``post_step``,
         with coupling hooks interleaved.
 
@@ -789,12 +792,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         Returns ``(time_new, dt, Q, Qaux)``.
         """
         Qold = Q
-        dt = self.compute_timestep(Q, Qaux)
+        dt = self.compute_timestep(Q, Qaux, parameters)
         dt = jnp.minimum(dt, time_end - time)
         dt = self._couple_dt(dt)                          # cap by partner dt
         Q = self._couple_pre_step(time, dt, Q, Qaux)      # read partner → BC
-        Q_stepped = self.step(dt, time, Q, Qaux)
-        Q, Qaux = self.post_step(time + dt, dt, Q_stepped, Qold, Qaux)
+        Q_stepped = self.step(dt, time, Q, Qaux, parameters)
+        Q, Qaux = self.post_step(
+            time + dt, dt, Q_stepped, Qold, Qaux, parameters)
         self._couple_post_step(time + dt, dt, Q, Qaux)    # write partner + advance
         return time + dt, dt, Q, Qaux
 
@@ -822,7 +826,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         subclass returns 'coupling ongoing'."""
         return time < time_end
 
-    def compute_timestep(self, Q, Qaux):
+    def compute_timestep(self, Q, Qaux, parameters=None):
         """Compute the adaptive time step using the stored eigenvalue operator.
 
         JIT-compatible. Uses ``self.compute_dt`` (from param) with the
@@ -833,11 +837,12 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         dt : scalar
         """
         return self.compute_dt(
-            Q, Qaux, self._rt_parameters,
+            Q, Qaux,
+            (self._rt_parameters if parameters is None else parameters),
             self._rt_min_inradius, self._rt_eigenvalue_op,
         )
 
-    def run_simulation(self, Q, Qaux, write_output=True):
+    def run_simulation(self, Q, Qaux, write_output=True, parameters=None):
         """JIT-compiled time loop using jax.lax.while_loop.
 
         Calls ``compute_timestep`` -> ``step`` -> ``post_step`` in a
@@ -849,12 +854,20 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             Initial state (from ``setup_simulation``).
         write_output : bool
             Whether to write snapshots to HDF5.
+        parameters : jnp.ndarray, optional
+            Physical-parameter vector.  ``None`` → the baked
+            ``self._rt_parameters`` (all existing callers).  Pass a traced
+            array to make the whole run differentiable w.r.t. parameters
+            (``jax.jvp``/``jacfwd``; forward mode works through the
+            ``while_loop``).
 
         Returns
         -------
         Q, Qaux : jnp.ndarray
             Final state.
         """
+        parameters = (self._rt_parameters if parameters is None
+                      else parameters)
         mesh = self._rt_mesh
 
         if write_output:
@@ -894,7 +907,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         @jax.jit
         @partial(jax.named_call, name="time_loop")
-        def time_loop(time, iteration, i_snapshot, Q, Qaux):
+        def time_loop(time, iteration, i_snapshot, Q, Qaux, parameters):
             """JIT-compiled time loop."""
             loop_val = (time, iteration, i_snapshot, Q, Qaux)
 
@@ -906,7 +919,8 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 # One step of physics (dt → step → post_step), the shared
                 # building block.
                 time_new, dt, Q_final, Qaux_final = _advance(
-                    time, Qnew, Qauxnew, time_end=time_end
+                    time, Qnew, Qauxnew, time_end=time_end,
+                    parameters=parameters,
                 )
 
                 iteration_new = iteration + 1
@@ -941,7 +955,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
             return Qnew, Qauxnew
 
-        Q, Qaux = time_loop(0.0, 0.0, i_snapshot, Q, Qaux)
+        Q, Qaux = time_loop(0.0, 0.0, i_snapshot, Q, Qaux, parameters)
         return Q, Qaux
 
     # ── solve (top-level entry point) ───────────────────────────────────
