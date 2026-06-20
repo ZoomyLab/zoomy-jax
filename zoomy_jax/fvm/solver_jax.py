@@ -547,11 +547,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                         Q[:, cell], Qaux[:, cell],
                         parameters, face_normals_j[:, fidx],
                     )
-                # Python loop (vmap interacts poorly with the indexed
-                # BC kernel's structural switch on i_bc_func; the loop
-                # is over ~O(boundary faces) which is small).
-                bf_values_list = [_per_bf(i) for i in range(n_bf)]
-                bf_values = jnp.stack(bf_values_list, axis=-1)
+                # vmap over the boundary faces.  The generated BC kernel is a
+                # sympy Piecewise over ``i_bc_func`` (lowers to a jnp.where
+                # chain), which vectorises cleanly under vmap.  A Python loop
+                # here instead UNROLLED n_bf copies of the whole BC kernel into
+                # the JIT graph — quadratic compile + a slow per-step boundary
+                # pass on meshes with a large perimeter (e.g. Malpasset).
+                bf_values = jax.vmap(_per_bf)(jnp.arange(n_bf)).T
             else:
                 bf_values = jnp.zeros((Q.shape[0], max(n_bf, 1)))
 
@@ -914,9 +916,16 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                     time_new, time_stamp, i_snapshot, Q_final, Qaux_final
                 )
 
-                jax.experimental.io_callback(
-                    log_callback_hyperbolic, None,
-                    iteration_new, time_new, dt, time_stamp,
+                # jax.debug.print is transparent under autodiff; the previous
+                # jax.experimental.io_callback has NO JVP rule and blocked
+                # jax.jvp / jax.grad through the whole time loop (forward-mode
+                # sensitivity, segment-wise per write).  Logged every 10 steps.
+                jax.lax.cond(
+                    (iteration_new % 10) == 0,
+                    lambda: jax.debug.print(
+                        "iteration: {i}, time: {t:.6f}, dt: {d:.6f}",
+                        i=iteration_new, t=time_new, d=dt),
+                    lambda: None,
                 )
 
                 return (time_new, iteration_new, i_snapshot_new, Q_final, Qaux_final)
