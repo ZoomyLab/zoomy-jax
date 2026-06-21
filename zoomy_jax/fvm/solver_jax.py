@@ -725,6 +725,52 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return Q, Qaux
 
+    def _explicit_hyperbolic_step(self, dt, time, Q, Qaux, parameters, flux, nc):
+        """The explicit hyperbolic (flux) sub-step, MOOD-aware — WITHOUT the
+        source.  Factored out of ``step`` so the IMEX solver's explicit stage
+        reuses the SAME a-priori front pre-detector (which rides inside the
+        reconstruction) AND a-posteriori MOOD corrector (the ``lax.cond`` re-run
+        here).  ``flux`` is the ``(dt, time, Q, Qaux, p, dQ, force_o1)``
+        operator; ``nc`` = #inner cells (for the troubled-cell mask).  order≥2 =
+        SSP-RK2 (Heun); order 1 = explicit Euler.  The caller applies the source
+        afterwards (explicit RK1 in ``step``, implicit in the IMEX loop).
+        """
+        if self.nsm.reconstruction.order >= 2:
+            # SSP-RK2 (Heun).  ``force_o1`` (or None) is threaded through both
+            # stages so the a-posteriori MOOD re-run demotes the SAME troubled
+            # cells in both — the a-priori front pre-detector lives inside the
+            # reconstruction and applies on every call regardless.
+            def _rk2(force_o1):
+                Q0 = Q
+                dQ = flux(dt, time, Q0, Qaux, parameters,
+                          jnp.zeros_like(Q), force_o1)
+                Q1 = Q0 + dt * dQ
+                dQ = flux(dt, time + dt, Q1, Qaux, parameters,
+                          jnp.zeros_like(Q), force_o1)
+                Q2 = Q1 + dt * dQ
+                return 0.5 * (Q0 + Q2)
+
+            if self.mood:
+                # A-posteriori MOOD: take the order-2 candidate, detect troubled
+                # cells (PAD h<0 + CAD non-finite), and — only if any cell is
+                # troubled — re-run forcing those cells to 1st order.  The re-run
+                # is conservative (shared face flux) and the demoted cells are
+                # positivity-preserving (XZS 1st-order lemma + Audusse face
+                # clip).  With the front pre-detector on, troubled cells rarely
+                # form, so the lax.cond branch is rarely taken.
+                Q_cand = _rk2(None)
+                h_idx = int(self.free_surface_h_index)
+                troubled = ((Q_cand[h_idx, :nc] < 0.0)
+                            | (~jnp.isfinite(Q_cand[:, :nc]).all(axis=0)))
+                return jax.lax.cond(
+                    jnp.any(troubled),
+                    lambda: _rk2(troubled),
+                    lambda: Q_cand,
+                )
+            return _rk2(None)
+        dQ = flux(dt, time, Q, Qaux, parameters, jnp.zeros_like(Q))
+        return Q + dt * dQ
+
     def step(self, dt, time, Q, Qaux, parameters=None):
         """Perform a single explicit time step.
 
@@ -747,44 +793,12 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # (just before reconstruction), so step() no longer pre-fills
         # ghost cells.  Mirrors the NumPy solver — one BC kernel
         # invocation per face per stage, no stale-ghost reads.
-        if self.nsm.reconstruction.order >= 2:
-            # SSP-RK2 (Heun).  ``force_o1`` (or None) is threaded through both
-            # stages so the a-posteriori MOOD re-run demotes the SAME troubled
-            # cells in both — the a-priori front pre-detector lives inside the
-            # reconstruction and applies on every call regardless.
-            def _rk2(force_o1):
-                Q0 = Q
-                dQ = flux(dt, time, Q0, Qaux, parameters,
-                          jnp.zeros_like(Q), force_o1)
-                Q1 = Q0 + dt * dQ
-                dQ = flux(dt, time + dt, Q1, Qaux, parameters,
-                          jnp.zeros_like(Q), force_o1)
-                Q2 = Q1 + dt * dQ
-                return 0.5 * (Q0 + Q2)
-
-            if self.mood:
-                # A-posteriori MOOD: take the order-2 candidate, detect troubled
-                # cells (PAD h<0 + CAD non-finite), and — only if any cell is
-                # troubled — re-run the step forcing those cells to 1st order.
-                # The re-run is conservative (shared face flux) and the demoted
-                # cells are positivity-preserving (XZS 1st-order lemma + Audusse
-                # face clip).  With the front pre-detector on, troubled cells
-                # rarely form, so the lax.cond branch is rarely taken.
-                Q_cand = _rk2(None)
-                h_idx = int(self.free_surface_h_index)
-                nc = int(self._rt_mesh.n_inner_cells)
-                troubled = ((Q_cand[h_idx, :nc] < 0.0)
-                            | (~jnp.isfinite(Q_cand[:, :nc]).all(axis=0)))
-                Q = jax.lax.cond(
-                    jnp.any(troubled),
-                    lambda: _rk2(troubled),
-                    lambda: Q_cand,
-                )
-            else:
-                Q = _rk2(None)
-        else:
-            dQ = flux(dt, time, Q, Qaux, parameters, jnp.zeros_like(Q))
-            Q = Q + dt * dQ
+        # The explicit hyperbolic (flux) sub-step, MOOD-aware — factored into
+        # ``_explicit_hyperbolic_step`` so the IMEX solver reuses the SAME
+        # front pre-detector + MOOD corrector for its explicit stage.
+        Q = self._explicit_hyperbolic_step(
+            dt, time, Q, Qaux, parameters, flux,
+            int(self._rt_mesh.n_inner_cells))
 
         # Source step (explicit Euler is fine — source is treated as O1).
         Q = ode.RK1(self._rt_source_op, Q, Qaux, parameters, dt)

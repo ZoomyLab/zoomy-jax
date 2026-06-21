@@ -345,8 +345,13 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
 
         # Keep reference to NumPy mesh for diffusion operator assembly
         mesh_numpy = ensure_lsq_mesh(mesh, model)
+        # Accept a NumericalSystemModel (it wraps its SystemModel in the ``.sm``
+        # field) — the base ``setup_simulation`` accepts NSM, so ``solve`` must
+        # too (else passing an order-2 NSM here raises AttributeError on
+        # ``.boundary_conditions``).
+        bc_model = model.sm if hasattr(model, "sm") else model
         if hasattr(mesh_numpy, "resolve_periodic_bcs"):
-            mesh_numpy.resolve_periodic_bcs(model.boundary_conditions)
+            mesh_numpy.resolve_periodic_bcs(bc_model.boundary_conditions)
 
         Q, Qaux = self.initialize(mesh_numpy, model)
         Q, Qaux, parameters, jmesh, rmodel = self.create_runtime(
@@ -420,14 +425,16 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                     Qn, Qan, parameters, h_face, ev_op)
                 dt = jnp.minimum(dt, time_end - t)
 
-                # Explicit flux step (RK1 or RK2). The base
-                # HyperbolicSolver.get_flux_operator returns a
-                # ``(dt, time, Q, Qaux, p, dQ)`` callable, but the
-                # ``ode.RK*`` helpers only thread ``(dt, Q, Qaux, p, dQ)``
-                # — close the time slot at the current step.
-                def _flux_at_t(dt_, Q_, Qaux_, p_, dQ_):
-                    return flux_op(dt_, t, Q_, Qaux_, p_, dQ_)
-                Qe = ode_step(_flux_at_t, Qn, Qan, parameters, dt)
+                # Explicit hyperbolic step — reuse the base solver's MOOD-aware
+                # _explicit_hyperbolic_step so the IMEX explicit stage gets the
+                # SAME a-priori front pre-detector + a-posteriori MOOD corrector
+                # (RK2 for order≥2, Euler for order 1).  The IMPLICIT source
+                # below then handles the stiff friction that the old explicit
+                # RK1 source could not — together: MOOD = flux positivity,
+                # IMEX = source stiffness (orthogonal axes).
+                Qe = self._explicit_hyperbolic_step(
+                    dt, t, Qn, Qan, parameters, flux_op,
+                    int(jmesh.n_inner_cells))
                 Qe = bc_op(t, Qe, Qan, parameters)
 
                 # Implicit diffusion step (Crank-Nicolson)
