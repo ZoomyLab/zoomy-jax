@@ -873,8 +873,15 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         back to ``h`` at the face afterwards.
     """
 
+    # This reconstruction honours an external per-cell ``force_o1`` mask
+    # (zero the slope → constant reconstruction) — used by the solver's
+    # a-posteriori MOOD corrector to demote troubled cells.  The flux
+    # operator checks this flag before threading the mask through.
+    supports_force_o1 = True
+
     def __init__(self, mesh, dim, b_index=0, h_index=1,
                  momentum_indices=None, eps_wet=1e-3, positivity=None,
+                 front_tol=None,
                  limiter="venkatakrishnan", unlimited_indices=None):
         super().__init__(mesh, dim, limiter=limiter,
                          unlimited_indices=unlimited_indices)
@@ -889,9 +896,18 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         # cap on top of the η reconstruction → a-priori h≥0 under CFL ≤ 1/(2k+1)
         # with NO a-posteriori step.  ``None`` → WB + Audusse face clip only.
         self._positivity = positivity
+        # ``front_tol`` ∈ (0, 1]: a-priori wet/dry-front PRE-DETECTOR.  Demote a
+        # cell to genuine 1st order (φ:=0) wherever the positivity indicator
+        # θ_front < front_tol — i.e. wherever the η reconstruction WOULD push h
+        # negative at a face (the wet/dry shoreline + steep h extrema).  Reuses
+        # the same _pp_theta as the a-priori cap, but instead of *scaling* the
+        # deviation it *zeroes* it, so the cell is exactly piecewise-constant
+        # (Gallardo-Parés-Castro: 1st order near wet/dry transitions).  ``None``
+        # → off.  Lets the run use the linear-stability CFL instead of 1/(2k+1).
+        self._front_tol = front_tol
         self._build_cell_face_rays(mesh, dim)
 
-    def _eta_core(self, Q, bf_face_values):
+    def _eta_core(self, Q, bf_face_values, force_o1=None):
         """Shared η reconstruction core for ``__call__`` and
         ``reconstruct_with_grad`` — returns ``(Q_L, Q_R, grads, phi)`` where
         ``grads`` / ``phi`` are the slopes + tied, dry-aware limiter on
@@ -937,6 +953,22 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
             phi = phi.at[var_idx, :].set(
                 jnp.minimum(phi[var_idx, :], phi_eta))
 
+        # Per-cell 1st-order demotion mask = (a-priori front pre-detector) ∪
+        # (external a-posteriori MOOD ``force_o1``).  Computed from the
+        # PRE-positivity tied slopes (the raw "would h go negative at a face"
+        # indicator), so it is independent of whether the zhang_shu cap below
+        # also runs.  Applied as φ:=0 just before reconstruction → genuine
+        # constant reconstruction (the Audusse h_f = max(η_f−b_f, 0) clip then
+        # makes such a cell positivity-preserving by the XZS 1st-order lemma,
+        # and the shared face flux keeps it conservative).
+        o1_mask = force_o1
+        if self._front_tol is not None:
+            bslope0 = phi[self._b_idx][jnp.newaxis, :] * grads[self._b_idx]
+            sh0 = phi[self._h_idx][jnp.newaxis, :] * grads[self._h_idx] - bslope0
+            theta_front = self._pp_theta(Q[self._h_idx, :self._nc], sh0)
+            front = theta_front < self._front_tol
+            o1_mask = front if o1_mask is None else (o1_mask[:self._nc] | front)
+
         # A-priori Xing-Zhang-Shu cell-mean positivity (optional): cap the
         # CONSERVATIVE depth deviation so the reconstructed h stays ≥ 0 at every
         # face — while keeping the BED reconstruction FAITHFUL (b is fixed
@@ -955,6 +987,13 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
             phi = phi.at[self._h_idx, :].set(jnp.ones_like(phi[self._h_idx]))
             for mi in self._mom_idx:
                 phi = phi.at[mi, :].multiply(theta)
+
+        # Force flagged cells to genuine 1st order (constant reconstruction):
+        # zero EVERY row's limiter, including the h-row whose slope the
+        # zhang_shu block folded into ``grads`` with φ_h=1 — φ_h:=0 kills that
+        # contribution too, so the back-transform gives h_f = h̄ on all faces.
+        if o1_mask is not None:
+            phi = jnp.where(o1_mask[jnp.newaxis, :self._nc], 0.0, phi)
 
         W_L, W_R = self._reconstruct(W, grads, phi, bf_W)
 
@@ -977,11 +1016,11 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
                 jnp.where(dry_R, 0.0, Q_R[mi, :]))
         return Q_L, Q_R, grads, phi
 
-    def __call__(self, Q, bf_face_values):
-        Q_L, Q_R, _grads, _phi = self._eta_core(Q, bf_face_values)
+    def __call__(self, Q, bf_face_values, force_o1=None):
+        Q_L, Q_R, _grads, _phi = self._eta_core(Q, bf_face_values, force_o1)
         return Q_L, Q_R
 
-    def reconstruct_with_grad(self, Q, bf_face_values):
+    def reconstruct_with_grad(self, Q, bf_face_values, force_o1=None):
         """η-consistent limited cell gradient for the order≥2 cell-interior
         NCP integral ``B(Q_c)·s_c`` (well-balanced + positivity-safe on
         wet/dry beds).
@@ -1001,7 +1040,7 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         ``−∂b`` and the interior NCP exactly cancels the η hydrostatic face
         flux.  ``b`` and the momentum rows already carry their tied limited
         slopes ``φ·grad``."""
-        Q_L, Q_R, grads, phi = self._eta_core(Q, bf_face_values)
+        Q_L, Q_R, grads, phi = self._eta_core(Q, bf_face_values, force_o1)
         lim_grad = phi[:, jnp.newaxis, :] * grads     # slopes on (b, η, hu, hv)
         # η row → conservative h slope ∂η − ∂b (tied limiter on both rows).
         lim_grad = lim_grad.at[self._h_idx].set(

@@ -205,6 +205,22 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             "the cell mean under CFL ≤ 1/(2k+1), with NO a-posteriori step and "
             "NO dt-halving.  Currently wired for ``reconstruction_variables="
             "'eta'`` (the well-balanced wet/dry recipe).")
+    front_theta_tol = param.Number(default=None, allow_None=True, bounds=(0, 1),
+        doc="A-priori wet/dry-front PRE-DETECTOR (order≥2, eta path).  None = "
+            "off.  A value ∈ (0, 1] demotes to genuine 1st order (φ:=0) every "
+            "cell whose positivity indicator θ_front < tol — i.e. the wet/dry "
+            "shoreline + steep h extrema (Gallardo-Parés-Castro).  Reuses the "
+            "_pp_theta indicator.  Lets the run use the linear-stability CFL "
+            "instead of the a-priori-positivity 1/(2k+1); pair with ``mood``.")
+    mood = param.Boolean(default=False,
+        doc="A-posteriori MOOD corrector (order≥2, eta path).  False = off.  "
+            "When True: after the SSP-RK2 candidate, detect troubled cells "
+            "(PAD h<0 + CAD non-finite — NO relaxed-DMP, invalid with a source) "
+            "and, if any, re-run the step forcing those cells to 1st order "
+            "(constant reconstruction → positivity-preserving by the XZS "
+            "1st-order lemma, conservative via the shared face flux).  The "
+            "guaranteed net behind ``front_theta_tol``; needs the eta "
+            "reconstruction.  Replaces positivity_method='zhang_shu'+CFL=1/6.")
 
     def __init__(self, **kwargs):
         # Riemann numerics are now owned by the NSM (nsm.riemann is the
@@ -427,6 +443,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                     momentum_indices=self.free_surface_momentum_indices,
                     eps_wet=float(self.free_surface_eps_wet),
                     positivity=(self.positivity_method or None),
+                    front_tol=self.front_theta_tol,
                     limiter=limiter,
                 )
             if mode == "xz":
@@ -470,6 +487,15 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         rt_num_flux = runtime.numerical_flux
         rt_num_fluct = runtime.numerical_fluctuations
         rt_bc = runtime.boundary_conditions
+
+        # Whether the reconstruction honours a per-cell ``force_o1`` demotion
+        # mask (the eta path does) — required by the a-posteriori MOOD corrector.
+        support_o1 = bool(getattr(reconstruct, "supports_force_o1", False))
+        if self.mood and not support_o1:
+            raise NotImplementedError(
+                f"mood=True needs a reconstruction that supports per-cell "
+                f"1st-order demotion (reconstruction_variables='eta'); "
+                f"{type(reconstruct).__name__} does not.")
 
         # Cell-interior non-conservative integral (path-conservative,
         # order ≥ 2) — mirrors NumPy ``solver_numpy.get_flux_operator``:
@@ -533,7 +559,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         @jax.jit
         @partial(jax.named_call, name="Flux")
-        def flux_operator(dt, time, Q, Qaux, parameters, dQ):
+        def flux_operator(dt, time, Q, Qaux, parameters, dQ, force_o1=None):
             dQ = jnp.zeros_like(dQ)
 
             # 1. Boundary face values via BC kernel (vmap over boundary faces).
@@ -559,9 +585,10 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
             # 2. Reconstruct with bf_values (LSQ-MUSCL sees boundary
             # face values for limiter bounds + Q_R override).
+            o1kw = {"force_o1": force_o1} if support_o1 else {}
             if use_interior_ncp:
                 Q_L, Q_R, lim_grad = reconstruct.reconstruct_with_grad(
-                    Q, bf_values)
+                    Q, bf_values, **o1kw)
                 # 2b. Cell-interior NCP integral: dQ_c −= Σ_d B(Q_c)[:,:,d]
                 # · s_c[:,d].  No |cell| division — the volume factor
                 # cancels against the per-unit-volume residual (NumPy
@@ -570,7 +597,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 interior_ncp = jnp.einsum("ijdc,jdc->ic", B_all, lim_grad)
                 dQ = dQ.at[:, :interior_ncp.shape[1]].subtract(interior_ncp)
             else:
-                Q_L, Q_R = reconstruct(Q, bf_values)
+                Q_L, Q_R = reconstruct(Q, bf_values, **o1kw)
             normals = face_normals_j
             face_volumes = face_volumes_j
 
@@ -721,13 +748,40 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # ghost cells.  Mirrors the NumPy solver — one BC kernel
         # invocation per face per stage, no stale-ghost reads.
         if self.nsm.reconstruction.order >= 2:
-            # SSP-RK2 (Heun).
-            Q0 = Q
-            dQ = flux(dt, time, Q0, Qaux, parameters, jnp.zeros_like(Q))
-            Q1 = Q0 + dt * dQ
-            dQ = flux(dt, time + dt, Q1, Qaux, parameters, jnp.zeros_like(Q))
-            Q2 = Q1 + dt * dQ
-            Q = 0.5 * (Q0 + Q2)
+            # SSP-RK2 (Heun).  ``force_o1`` (or None) is threaded through both
+            # stages so the a-posteriori MOOD re-run demotes the SAME troubled
+            # cells in both — the a-priori front pre-detector lives inside the
+            # reconstruction and applies on every call regardless.
+            def _rk2(force_o1):
+                Q0 = Q
+                dQ = flux(dt, time, Q0, Qaux, parameters,
+                          jnp.zeros_like(Q), force_o1)
+                Q1 = Q0 + dt * dQ
+                dQ = flux(dt, time + dt, Q1, Qaux, parameters,
+                          jnp.zeros_like(Q), force_o1)
+                Q2 = Q1 + dt * dQ
+                return 0.5 * (Q0 + Q2)
+
+            if self.mood:
+                # A-posteriori MOOD: take the order-2 candidate, detect troubled
+                # cells (PAD h<0 + CAD non-finite), and — only if any cell is
+                # troubled — re-run the step forcing those cells to 1st order.
+                # The re-run is conservative (shared face flux) and the demoted
+                # cells are positivity-preserving (XZS 1st-order lemma + Audusse
+                # face clip).  With the front pre-detector on, troubled cells
+                # rarely form, so the lax.cond branch is rarely taken.
+                Q_cand = _rk2(None)
+                h_idx = int(self.free_surface_h_index)
+                nc = int(self._rt_mesh.n_inner_cells)
+                troubled = ((Q_cand[h_idx, :nc] < 0.0)
+                            | (~jnp.isfinite(Q_cand[:, :nc]).all(axis=0)))
+                Q = jax.lax.cond(
+                    jnp.any(troubled),
+                    lambda: _rk2(troubled),
+                    lambda: Q_cand,
+                )
+            else:
+                Q = _rk2(None)
         else:
             dQ = flux(dt, time, Q, Qaux, parameters, jnp.zeros_like(Q))
             Q = Q + dt * dQ
