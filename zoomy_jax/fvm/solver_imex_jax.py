@@ -136,8 +136,11 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         choked on bare ``Derivative(b, x)`` / ``tau(t, x, σ)`` atoms.
         """
         mesh = ensure_lsq_mesh(mesh, model)
-        if hasattr(mesh, "resolve_periodic_bcs"):
-            mesh.resolve_periodic_bcs(model.boundary_conditions)
+        # Periodic BCs are resolved in ``solve`` via the canonical _bc_source
+        # container BEFORE create_runtime is called.  The old reach here,
+        # ``model.boundary_conditions``, is the lambdified BC-kernel Function on
+        # the SystemModel/NSM path (not a BoundaryConditions container) and
+        # crashed resolve_periodic_bcs — so it is intentionally not repeated.
         jax_mesh = convert_mesh_to_jax(mesh)
         Q = jnp.asarray(Q)
         Qaux = jnp.asarray(Qaux)
@@ -343,19 +346,27 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         """Full IMEX solve: setup + JIT-compiled time loop."""
         t0_wall = _time.time()
 
-        # Keep reference to NumPy mesh for diffusion operator assembly
+        # Keep reference to NumPy mesh for diffusion operator assembly.
+        # Coerce to the NSM and resolve periodic BCs the canonical way (mirrors
+        # solver_numpy.py:1016-1023 / solver_jax.py:682): the periodic topology
+        # remap walks the BoundaryConditions CONTAINER, which lives at
+        # ``sm._bc_source`` on the declarative path (or
+        # ``source_model.boundary_conditions`` for a raw Model) — NOT
+        # ``sm.boundary_conditions``, which is the lambdified BC-kernel Function
+        # (a sympy ``Function`` with no ``boundary_conditions_list``; reaching it
+        # was the old IMEX bug that predated the NSM→_bc_source→runtime path).
         mesh_numpy = ensure_lsq_mesh(mesh, model)
-        # Accept a NumericalSystemModel (it wraps its SystemModel in the ``.sm``
-        # field) — the base ``setup_simulation`` accepts NSM, so ``solve`` must
-        # too (else passing an order-2 NSM here raises AttributeError on
-        # ``.boundary_conditions``).
-        bc_model = model.sm if hasattr(model, "sm") else model
-        if hasattr(mesh_numpy, "resolve_periodic_bcs"):
-            mesh_numpy.resolve_periodic_bcs(bc_model.boundary_conditions)
+        nsm, source_model = self._coerce_to_nsm(model)
+        self.nsm = nsm
+        bcs_obj = (source_model.boundary_conditions if source_model is not None
+                   else getattr(nsm.sm, "_bc_source", None))
+        if bcs_obj is not None and hasattr(mesh_numpy, "resolve_periodic_bcs"):
+            mesh_numpy.resolve_periodic_bcs(bcs_obj)
 
-        Q, Qaux = self.initialize(mesh_numpy, model)
+        Q, Qaux = self.initialize(
+            mesh_numpy, source_model if source_model is not None else nsm.sm)
         Q, Qaux, parameters, jmesh, rmodel = self.create_runtime(
-            Q, Qaux, mesh_numpy, model)
+            Q, Qaux, mesh_numpy, nsm)
 
         source_mode = self._resolve_source_mode(rmodel)
         jv_backend = self._resolve_jv_backend()
