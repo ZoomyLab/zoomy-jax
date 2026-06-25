@@ -296,12 +296,30 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         through this one method, so they pick the aux update up uniformly.
         """
         out = Qaux
-        # (1) LOCAL aux formula leg (e.g. KP hinv) — written as a PREFIX slice
-        # so the non-local derivative-aux tail (rows >= n_local) survives.
+        # (1) LOCAL aux formula leg (e.g. KP hinv).  The runtime lambdifies the
+        # SystemModel's ``update_aux_variables`` as a FULL-LENGTH ``(n_aux, ·)``
+        # vector — each row is either an algebraic formula (``hinv = KP(h)``) or
+        # a passthrough of its own aux symbol (the SystemModel sizes it to
+        # ``len(aux_state)`` via ``_to_matrix``).  Writing it as a PREFIX slice
+        # silently mis-places the algebraic rows onto the leading
+        # (derivative/LSQ-gradient) rows whenever the model APPENDS an aux (e.g.
+        # ``hinv`` registered last): that row is then clobbered by the
+        # derivative walk (2) below, ``hinv`` stays 0, and every ``hinv``-scaled
+        # moment source/friction vanishes → ``SME(level≥1)`` degenerates to SWE
+        # (task 0017 — was worked around case-side by emitting a full-length
+        # passthrough vector).  So enforce the full-length contract and replace
+        # by row, never by prefix.
         fn = getattr(model, "update_aux_variables", None)
         if fn is not None:
             local = fn(Q, Qaux, parameters)
-            out = out.at[:local.shape[0]].set(local)
+            if local.shape[0] != out.shape[0]:
+                raise ValueError(
+                    f"update_aux_variables must be full-length "
+                    f"({out.shape[0]} aux rows) so each algebraic aux lands on "
+                    f"its own row — got {local.shape[0]} rows.  A partial vector "
+                    f"is prefix-written and silently degenerates SME(≥1)→SWE "
+                    f"(task 0017); emit a passthrough on every non-formula row.")
+            out = local
         # (2) DERIVATIVE aux leg — the non-local LSQ-gradient rows the
         # SystemModel gathered in aux_registry, via the shared walk (the SINGLE
         # source the Chorin per-pool refresh also calls).
