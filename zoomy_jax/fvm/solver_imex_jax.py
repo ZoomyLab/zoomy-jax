@@ -240,11 +240,43 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
 
     @staticmethod
     def _build_implicit_local(runtime_model, parameters, n_vars, maxiter):
-        """Cell-wise Newton via fori_loop."""
+        """Cell-wise (diagonal) Newton via fori_loop.
+
+        When the model carries an algebraic aux formula (e.g. the
+        KP-desingularized ``hinv = KP(h)``), the implicit source is solved with
+        that aux RECOMPUTED from the current iterate, and the per-cell Jacobian
+        is taken by AD *through* that recompute — so the chain term
+        ``∂S/∂aux·∂aux/∂Q`` (e.g. ``∂hinv/∂h ~ -1/h²``) is included.  The old
+        path froze ``Qaux`` and used ``∂S/∂Q`` only, so the SME(1) friction
+        solve was inconsistent (solved the wrong equation with a stale Jacobian)
+        — task A.  jax AD chain-rules the already-lowered ``source``∘
+        ``update_aux_variables`` exactly; the symbolic ∂aux/∂Q the C backend
+        uses isn't needed here.  Models with no algebraic aux fall back to the
+        frozen ``∂S/∂Q`` form (identical to before)."""
+        uav = getattr(runtime_model, "update_aux_variables", None)
+
         def _impl(Qexp, Qaux, dt):
+            if uav is not None:
+                # Per-cell residual source with the aux re-derived from the
+                # iterate (one column at a time so it stays cell-local; the
+                # frozen ``Qaux`` column supplies the non-local passthrough
+                # rows, which don't depend on Q so AD zeros them).
+                def _g(qv, qav):
+                    Qa = uav(qv[:, None], qav[:, None], parameters)
+                    return runtime_model.source(
+                        qv[:, None], Qa, parameters)[:, 0]
+                S_of = lambda Q: jax.vmap(
+                    _g, in_axes=(1, 1), out_axes=1)(Q, Qaux)
+                J_of = lambda Q: jax.vmap(
+                    jax.jacfwd(_g, argnums=0), in_axes=(1, 1), out_axes=2)(Q, Qaux)
+            else:
+                S_of = lambda Q: runtime_model.source(Q, Qaux, parameters)
+                J_of = lambda Q: runtime_model.source_jacobian_wrt_variables(
+                    Q, Qaux, parameters)
+
             def body(i, Q):
-                S = runtime_model.source(Q, Qaux, parameters)
-                Jq = runtime_model.source_jacobian_wrt_variables(Q, Qaux, parameters)
+                S = S_of(Q)
+                Jq = J_of(Q)
                 A = jnp.eye(n_vars, dtype=Q.dtype)[:, :, None] - dt * Jq
                 R = Q - Qexp - dt * S
                 d = jax.vmap(lambda Ac, rc: jnp.linalg.solve(Ac, -rc),
