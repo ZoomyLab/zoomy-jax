@@ -185,8 +185,11 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
     free_surface_b_index = param.Integer(default=0, allow_None=True,
         doc="State-vector index of bathymetry b.  Used only when "
             "``reconstruction_variables='eta'`` to form η = h + b.")
-    free_surface_eps_wet = param.Number(default=1e-3, bounds=(0, None),
-        doc="Wet/dry threshold (m) for the MUSCL fallback.")
+    # REQ-48: the wet/dry threshold is NOT a solver parameter — it is the
+    # NSM-owned canonical parameter ``wet_dry_eps`` (populated from the model,
+    # also read by the FVM riemann solver).  The eta reconstruction reads it
+    # from ``nsm.parameter_values.wet_dry_eps``; models that declare none let
+    # the reconstruction use its own default.
     free_surface_momentum_indices = param.List(default=None, allow_None=True,
         doc="Indices of momentum components.  Defaults to "
             "``h_index+1 … h_index+1+dim``.")
@@ -447,13 +450,12 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             EtaWellBalancedLSQMUSCLJAX,
         )
         dim = symbolic_model.dimension
-        # REQ-48: single source of truth for the wet/dry threshold.  Prefer the
-        # NSM-owned parameter ``wet_dry_eps`` (populated from the model) when the
-        # NSM carries it; otherwise fall back to the solver-local
-        # ``free_surface_eps_wet``.  This read switches over automatically once
-        # core promotes the model eps to ``nsm.parameters.wet_dry_eps`` — no
-        # further solver edit, no manual re-definition of the value here.
-        eps_wet = float(self.free_surface_eps_wet)
+        # REQ-48: the wet/dry threshold is the NSM-owned canonical parameter
+        # ``wet_dry_eps`` (populated from the model, also read by the riemann
+        # solver) — the single source of truth.  Read it from the NSM when
+        # present; if the model declares none, leave ``eps_wet`` unset so the
+        # eta reconstruction uses its own default.
+        eps_wet = None
         for _z in (getattr(self.nsm, "parameter_values", None),
                    getattr(self.nsm, "parameters", None)):
             if _z is not None and getattr(_z, "contains", None) \
@@ -475,7 +477,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                     b_index=int(self.free_surface_b_index),
                     h_index=int(self.free_surface_h_index),
                     momentum_indices=self.free_surface_momentum_indices,
-                    eps_wet=eps_wet,
+                    **({"eps_wet": eps_wet} if eps_wet is not None else {}),
                     positivity=(self.positivity_method or None),
                     front_tol=self.front_theta_tol,
                     limiter=limiter,
