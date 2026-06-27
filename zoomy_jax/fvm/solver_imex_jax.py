@@ -8,6 +8,7 @@ Extends ``HyperbolicSolver`` (JAX) with:
 All operations are JIT-compatible inside ``jax.lax.while_loop``.
 """
 
+import os
 import time as _time
 from dataclasses import dataclass
 
@@ -17,6 +18,9 @@ from jax.scipy.sparse.linalg import gmres as jax_gmres
 
 import zoomy_jax.fvm.ode as ode
 from zoomy_jax.fvm.solver_jax import HyperbolicSolver
+import zoomy_core.misc.io as io
+import zoomy_jax.misc.io as jax_io
+from zoomy_core.misc import misc as _misc
 from zoomy_core.model.derivative_workflow import DerivativeAwareSolverMixin
 from zoomy_core.misc.logger_config import logger
 
@@ -481,18 +485,42 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         # Select ODE stepper: RK2 for 2nd-order, RK1 for 1st-order
         ode_step = ode.RK2 if self.nsm.reconstruction.order >= 2 else ode.RK1
 
+        # ── HDF5 snapshot output (AD-safe, mirrors HyperbolicSolver) ──────
+        # IMEX previously wrote NO field snapshots (only a checkpoint sidecar),
+        # so runs were not post-processable. Re-enable the canonical writer:
+        # jax_io.get_save_fields uses pure_callback wrapped in custom_jvp (JVP
+        # returns 0), transparent under autodiff — same path solver_jax uses.
+        if write_output:
+            output_hdf5_path = os.path.join(
+                self.settings.output.directory,
+                f"{self.settings.output.filename}.h5")
+            io.init_output_directory(
+                self.settings.output.directory,
+                self.settings.output.clean_directory)
+            mesh_numpy.write_to_hdf5(
+                os.path.join(_misc.get_main_directory(), output_hdf5_path))
+            io.save_settings(self.settings)
+            save_fields = jax_io.get_save_fields(output_hdf5_path, write_all=False)
+        else:
+            def save_fields(time, time_stamp, i_snapshot, Q, Qaux):
+                return i_snapshot
+        dt_snapshot = self.time_end / max(self.settings.output.snapshots - 1, 1)
+        # initial snapshot (writes iteration_0 + the mesh group) → start counter
+        i_snapshot0 = save_fields(0.0, 0.0, 0.0, Qnew, Qauxnew)
+
         # ── build the full loop ──────────────────────────────────────────
 
-        def run_loop(Q0, Qa0, max_steps):
+        def run_loop(Q0, Qa0, isnap0, max_steps):
             init = (jnp.asarray(0.0, dtype=Q0.dtype),
                     Q0, Qa0,
-                    jnp.asarray(0, dtype=jnp.int32))
+                    jnp.asarray(0, dtype=jnp.int32),
+                    isnap0)
 
             def cond(s):
                 return jnp.logical_and(s[0] < time_end, s[3] < max_steps)
 
             def step(s):
-                t, Qn, Qan, ns = s
+                t, Qn, Qan, ns, isnap = s
                 dt = compute_dt_fn(
                     Qn, Qan, parameters, h_face, ev_op)
                 dt = jnp.minimum(dt, time_end - t)
@@ -524,7 +552,20 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
                 if uv is not None:               # update_q THEN update_qaux
                     Qn2 = uv(Qn2, Qan, parameters)
                 Qan2 = uq(Qn2, Qan, Qn, dt)
-                return (t + dt, Qn2, Qan2, ns + 1)
+
+                t_new = t + dt
+                ns_new = ns + 1
+                # AD-safe HDF5 snapshot at the next evenly-spaced time stamp.
+                isnap_new = save_fields(
+                    t_new, isnap * dt_snapshot, isnap, Qn2, Qan2)
+                # jax.debug.print is transparent under autodiff (unlike io_callback).
+                jax.lax.cond(
+                    (ns_new % 10) == 0,
+                    lambda: jax.debug.print(
+                        "iteration: {i}, time: {t:.6f}, dt: {d:.6f}",
+                        i=ns_new, t=t_new, d=dt),
+                    lambda: None)
+                return (t_new, Qn2, Qan2, ns_new, isnap_new)
 
             return jax.lax.while_loop(cond, step, init)
 
@@ -538,15 +579,15 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
             f"diffusion={'CN' if has_diff else 'none'}) ...")
         t_c0 = _time.time()
         lowered = jax.jit(run_loop).lower(
-            Qnew, Qauxnew, jnp.int32(0))
+            Qnew, Qauxnew, i_snapshot0, jnp.int32(0))
         compiled = lowered.compile()
         t_compile = _time.time() - t_c0
         logger.info(f"Compilation done in {t_compile:.2f}s")
 
         # Execute
         t_r0 = _time.time()
-        state = compiled(Qnew, Qauxnew, jnp.int32(2**30))
-        _, Qnew, Qauxnew, n_steps = state
+        state = compiled(Qnew, Qauxnew, i_snapshot0, jnp.int32(2**30))
+        _, Qnew, Qauxnew, n_steps, _isnap = state
         Qnew.block_until_ready()
         t_run = _time.time() - t_r0
 
