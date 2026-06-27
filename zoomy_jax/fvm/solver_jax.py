@@ -447,6 +447,22 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             EtaWellBalancedLSQMUSCLJAX,
         )
         dim = symbolic_model.dimension
+        # REQ-48: single source of truth for the wet/dry threshold.  Prefer the
+        # NSM-owned parameter ``wet_dry_eps`` (populated from the model) when the
+        # NSM carries it; otherwise fall back to the solver-local
+        # ``free_surface_eps_wet``.  This read switches over automatically once
+        # core promotes the model eps to ``nsm.parameters.wet_dry_eps`` — no
+        # further solver edit, no manual re-definition of the value here.
+        eps_wet = float(self.free_surface_eps_wet)
+        for _z in (getattr(self.nsm, "parameter_values", None),
+                   getattr(self.nsm, "parameters", None)):
+            if _z is not None and getattr(_z, "contains", None) \
+                    and _z.contains("wet_dry_eps"):
+                try:
+                    eps_wet = float(getattr(_z, "wet_dry_eps"))
+                    break
+                except (TypeError, ValueError):
+                    pass
         if self.nsm.reconstruction.order >= 2:
             mode = self.reconstruction_variables
             limiter = self.nsm.reconstruction.limiter
@@ -459,7 +475,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                     b_index=int(self.free_surface_b_index),
                     h_index=int(self.free_surface_h_index),
                     momentum_indices=self.free_surface_momentum_indices,
-                    eps_wet=float(self.free_surface_eps_wet),
+                    eps_wet=eps_wet,
                     positivity=(self.positivity_method or None),
                     front_tol=self.front_theta_tol,
                     limiter=limiter,
