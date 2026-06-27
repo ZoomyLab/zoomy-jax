@@ -250,17 +250,46 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         path froze ``Qaux`` and used ``∂S/∂Q`` only, so the SME(1) friction
         solve was inconsistent (solved the wrong equation with a stale Jacobian)
         — task A.  jax AD chain-rules the already-lowered ``source``∘
-        ``update_aux_variables`` exactly; the symbolic ∂aux/∂Q the C backend
-        uses isn't needed here.  Models with no algebraic aux fall back to the
-        frozen ``∂S/∂Q`` form (identical to before)."""
+        ``update_aux_variables`` exactly.
+
+        Preferred (symbolic) route — used when the model carries an algebraic
+        aux AND both symbolic source jacobians are lowered: assemble the
+        consistent implicit Jacobian as ``∂S/∂Q + ∂S/∂aux·∂aux/∂Q`` from the two
+        symbolic ``source_jacobian_wrt_{variables,aux_variables}`` blocks, with
+        only ``∂aux/∂Q`` taken by AD of the cheap ``update_aux_variables`` map.
+        This avoids AD through ``source`` entirely and is the exact building
+        block an additive-RK (ARK) implicit stage needs.  If a symbolic block is
+        missing (e.g. a model that never channeled ∂S/∂aux), it falls back to
+        AD through ``source``∘``update_aux_variables``; models with no algebraic
+        aux fall back to the frozen ``∂S/∂Q`` form."""
         uav = getattr(runtime_model, "update_aux_variables", None)
+        sjq = getattr(runtime_model, "source_jacobian_wrt_variables", None)
+        sja = getattr(runtime_model, "source_jacobian_wrt_aux_variables", None)
 
         def _impl(Qexp, Qaux, dt):
-            if uav is not None:
-                # Per-cell residual source with the aux re-derived from the
-                # iterate (one column at a time so it stays cell-local; the
-                # frozen ``Qaux`` column supplies the non-local passthrough
-                # rows, which don't depend on Q so AD zeros them).
+            if uav is not None and sjq is not None and sja is not None:
+                # Cell-local aux re-derived from the iterate (frozen ``Qaux``
+                # column supplies the non-local passthrough rows; only the
+                # algebraic rows — e.g. KP ``hinv`` — depend on Q).
+                def _aux_of(qv, qav):
+                    return uav(qv[:, None], qav[:, None], parameters)[:, 0]
+                def _S(qv, qav):
+                    Qa = _aux_of(qv, qav)[:, None]
+                    return runtime_model.source(qv[:, None], Qa, parameters)[:, 0]
+                S_of = lambda Q: jax.vmap(
+                    _S, in_axes=(1, 1), out_axes=1)(Q, Qaux)
+
+                def _Jcell(qv, qav):
+                    Qac = _aux_of(qv, qav)[:, None]          # (n_aux,1)
+                    Jsq = sjq(qv[:, None], Qac, parameters)[:, :, 0]   # (n_eq,n_state)
+                    Jsa = sja(qv[:, None], Qac, parameters)[:, :, 0]   # (n_eq,n_aux)
+                    Jaq = jax.jacfwd(_aux_of, argnums=0)(qv, qav)      # (n_aux,n_state)
+                    return Jsq + Jsa @ Jaq                            # (n_eq,n_state)
+                J_of = lambda Q: jax.vmap(
+                    _Jcell, in_axes=(1, 1), out_axes=2)(Q, Qaux)
+            elif uav is not None:
+                # AD through source∘update_aux (one column at a time; AD zeros
+                # the passthrough rows that don't depend on Q).
                 def _g(qv, qav):
                     Qa = uav(qv[:, None], qav[:, None], parameters)
                     return runtime_model.source(

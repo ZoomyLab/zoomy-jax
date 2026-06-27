@@ -324,11 +324,15 @@ class JaxRuntime:
                             std, self.module),
             n_extra=0,
         )
-        # ── source_jacobian_wrt_variables: (n_eq, n_state) — ∂S/∂Q.
-        # The SystemModel auto-derives `source_jacobian` in __post_init__;
-        # we lambdify it here so IMEX (and any other solver that needs a
-        # cell-local Newton on the source) can call it directly.
-        sj = getattr(sm, "source_jacobian", None)
+        # ── source_jacobian_wrt_variables: (n_eq, n_state) — ∂S/∂Q (frozen aux).
+        # ── source_jacobian_wrt_aux_variables: (n_eq, n_aux) — ∂S/∂aux.
+        # Both are real fields on the SystemModel (channeled from the Model,
+        # else auto-derived in __post_init__).  We lambdify them here so IMEX
+        # (and any other solver that needs a cell-local Newton on the source)
+        # can assemble the implicit Jacobian symbolically: the consistent
+        # ∂S/∂Q_total = ∂S/∂Q + ∂S/∂aux·∂aux/∂Q, with ∂aux/∂Q taken by AD of
+        # the (cheap) update_aux_variables map — no AD through ``source``.
+        sj = getattr(sm, "source_jacobian_wrt_variables", None)
         if sj is not None:
             self.source_jacobian_wrt_variables = self._vmap_cell(
                 _lambdify_array(_to_array_of_exprs(sj), std, self.module),
@@ -336,6 +340,14 @@ class JaxRuntime:
             )
         else:
             self.source_jacobian_wrt_variables = None
+        sja = getattr(sm, "source_jacobian_wrt_aux_variables", None)
+        if sja is not None and _shape(_to_array_of_exprs(sja)):
+            self.source_jacobian_wrt_aux_variables = self._vmap_cell(
+                _lambdify_array(_to_array_of_exprs(sja), std, self.module),
+                n_extra=0,
+            )
+        else:
+            self.source_jacobian_wrt_aux_variables = None
         # ── update_variables: (n_eq, 1) per-cell state hygiene
         # transform — squeeze the trailing 1 so callers get
         # ``(n_eq, n_cells)``.  Optional; ``None`` means identity, in
