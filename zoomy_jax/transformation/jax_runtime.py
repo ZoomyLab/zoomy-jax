@@ -55,8 +55,6 @@ _JAX_MODULE_BASE: dict = {
     "array": jnp.array,
     "squeeze": jnp.squeeze,
     "conditional": lambda c, t, f: jnp.where(c, t, f),
-    "clamp_positive": lambda x: jnp.maximum(x, 0.0),
-    "clamp_momentum": lambda hu, h, u_max: jnp.clip(hu, -h * u_max, h * u_max),
     # ``max_wavespeed`` is an opaque sympy Function that Rusanov-style
     # numerics emit; the runtime fills it with the local-Roe / max-eig
     # callable built from the SystemModel's ``eigenvalues``.  Set by

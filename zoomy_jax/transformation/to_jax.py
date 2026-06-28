@@ -22,8 +22,6 @@ class JaxRuntimeModel(NumpyRuntimeModel):
         "array": jnp.array,
         "squeeze": jnp.squeeze,
         "conditional": lambda c, t, f: jnp.where(c, t, f),
-        "clamp_positive": lambda x: jnp.maximum(x, 0.0),
-        "clamp_momentum": lambda hu, h, u_max: jnp.clip(hu, -h * u_max, h * u_max),
         "max_wavespeed": None,
     }
     printer = "jax"
@@ -38,8 +36,6 @@ class JaxRuntimeSymbolic(NumpyRuntimeSymbolic):
         "array": jnp.array,
         "squeeze": jnp.squeeze,
         "conditional": lambda c, t, f: jnp.where(c, t, f),
-        "clamp_positive": lambda x: jnp.maximum(x, 0.0),
-        "clamp_momentum": lambda hu, h, u_max: jnp.clip(hu, -h * u_max, h * u_max),
         "max_wavespeed": None,
     }
     printer = "jax"
