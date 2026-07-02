@@ -2,6 +2,7 @@
 
 import os
 import jax
+import jax.experimental
 import jax.numpy as jnp
 import h5py
 
@@ -46,16 +47,27 @@ def get_save_fields(_filepath, write_all=False, overwrite=True):
         def do_save(_):
             @jax.custom_jvp
             def _save(i_snapshot, time, Q, Qaux):
-                """Internal helper `_save`."""
-                return jax.pure_callback(
+                """Internal helper `_save`.
+
+                Uses ``io_callback`` (an ORDERED side effect), NOT
+                ``pure_callback``: XLA treats ``pure_callback`` as
+                side-effect-free and ELIDES the HDF5 write inside the
+                solver's ``lax.while_loop``, so every in-loop snapshot was
+                dropped and only the eager pre-loop ``iteration_0`` survived
+                (REQ-92).  ``io_callback`` is not elided.  The
+                ``custom_jvp`` zero-tangent rule below intercepts
+                differentiation, so AD never reaches the (JVP-less)
+                ``io_callback`` — forward AD through the solver still works.
+                """
+                return jax.experimental.io_callback(
                     _save_hdf5,
                     jax.ShapeDtypeStruct((), jnp.float64),
                     i_snapshot,
                     time,
                     Q,
                     Qaux,
+                    ordered=True,
                 )
-                # return i_snapshot + 1.
 
             @_save.defjvp
             def _save_jvp(primals, tangents):
