@@ -82,8 +82,31 @@ def _build_diffusion_operators_jax(mesh_numpy, symbolic_model, dim, n_vars):
     Returns
     -------
     dict or None
-        {var_index: DiffusionOperatorJAX} or None if no diffusion.
+        {var_index: DiffusionOperatorJAX} (scalar path), {"__dense__": op}
+        (dense/state-dependent path, REQ-109), or None if no diffusion.
     """
+    # ── Dense / state-dependent path (REQ-109) ───────────────────────────
+    # If the model carries a general rank-4 ``diffusion_matrix`` with any
+    # off-diagonal (i≠j) / cross-derivative (d≠e) entry OR any state/aux
+    # dependence, build the single DenseDiffusionOperatorJAX and let it
+    # consume the runtime ``diffusion_matrix`` implicitly (Newton+GMRES for the
+    # state-dependent case).  Classification is SHARED with numpy
+    # (HyperbolicSolver._classify_diffusion) so both backends route identically
+    # — mirror of core reconstruction.py::DenseDiffusionOperator (57f5e8f).
+    import sympy as sp
+    sym_A = getattr(symbolic_model, "diffusion_matrix", None)
+    if sym_A is not None and not all(
+            sp.simplify(e) == 0 for e in sp.flatten(sym_A)):
+        from zoomy_core.fvm.solver_numpy import HyperbolicSolver
+        needs_dense, state_dependent, _diag = \
+            HyperbolicSolver._classify_diffusion(sym_A, symbolic_model)
+        if needs_dense or state_dependent:
+            from zoomy_jax.fvm.reconstruction_jax import DenseDiffusionOperatorJAX
+            op = DenseDiffusionOperatorJAX(
+                mesh_numpy, dim, n_vars, state_dependent=state_dependent)
+            return {"__dense__": op}
+
+    # ── Scalar path (constant diagonal): existing per-variable ν·L ───────
     if not hasattr(symbolic_model, 'diffusive_flux'):
         return None
     sym_dflux = symbolic_model.diffusive_flux()
@@ -373,17 +396,27 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         return _impl
 
     @staticmethod
-    def _build_implicit_diffusion(diffusion_ops_jax, bc_op, parameters):
+    def _build_implicit_diffusion(diffusion_ops_jax, bc_op, parameters,
+                                  runtime_model=None, gmres_tol=1e-7,
+                                  gmres_maxiter=30, newton_maxiter=8,
+                                  newton_tol=1e-8):
         """Build a JIT-compatible implicit diffusion closure.
 
         Parameters
         ----------
         diffusion_ops_jax : dict or None
-            {var_index: DiffusionOperatorJAX} mapping.
+            ``{var_index: DiffusionOperatorJAX}`` (scalar path) or
+            ``{"__dense__": DenseDiffusionOperatorJAX}`` (dense path, REQ-109).
         bc_op : callable
             Boundary condition operator.
         parameters : jnp.ndarray
             Model parameters.
+        runtime_model : JaxRuntime, optional
+            Needed for the dense path — supplies the lowered
+            ``diffusion_matrix(Q, Qaux, p)`` as the operator's ``A_fn``.
+        gmres_tol, gmres_maxiter, newton_maxiter, newton_tol :
+            Implicit-solve knobs threaded to the dense operator (the scalar
+            path uses its own dense-matrix solve).
 
         Returns
         -------
@@ -393,6 +426,40 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         if diffusion_ops_jax is None:
             return None
 
+        # ── Dense / state-dependent path (REQ-109) ───────────────────────
+        if "__dense__" in diffusion_ops_jax:
+            op = diffusion_ops_jax["__dense__"]
+            dmat = getattr(runtime_model, "diffusion_matrix", None)
+            if dmat is None:
+                raise ValueError(
+                    "dense implicit diffusion needs runtime.diffusion_matrix, "
+                    "but the runtime did not lower it (REQ-109).")
+            nc = op.nc
+
+            def _apply_diffusion(Q, Qaux, dt, time):
+                # Operate on inner cells only; the runtime diffusion_matrix
+                # vmaps over the cell axis, so slice Q/Qaux to [:nc].  Qaux/p
+                # are frozen across the Newton iterates (only Q varies), per
+                # the numpy reference (solver_imex_numpy).
+                Q_in = Q[:, :nc]
+                Qaux_in = Qaux[:, :nc] if Qaux.shape[0] > 0 else Qaux
+
+                def _A(Qs):
+                    return dmat(Qs, Qaux_in, parameters)
+
+                Q_new = op.implicit_solve(
+                    Q_in, dt, _A, bf_grads=None,
+                    tol=gmres_tol, maxiter=gmres_maxiter,
+                    newton_maxiter=newton_maxiter, newton_tol=newton_tol)
+                Q = Q.at[:, :nc].set(Q_new)
+                # Boundaries: refill ghosts via the BC op (periodic / Neumann),
+                # exactly as the scalar jax path does after its solve.
+                Q = bc_op(time, Q, Qaux, parameters)
+                return Q
+
+            return _apply_diffusion
+
+        # ── Scalar path (constant diagonal ν·L, per variable) ────────────
         var_indices = sorted(diffusion_ops_jax.keys())
         ops = [diffusion_ops_jax[v] for v in var_indices]
 
@@ -468,9 +535,12 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
             mesh_numpy, symbolic_model,
             symbolic_model.dimension, n_vars)
 
-        # Build implicit diffusion closure
+        # Build implicit diffusion closure (dense path also needs the runtime
+        # diffusion_matrix + implicit-solve knobs; REQ-109)
         impl_diffusion = self._build_implicit_diffusion(
-            diff_ops, bc_op, parameters)
+            diff_ops, bc_op, parameters, rmodel,
+            self.gmres_tol, self.gmres_maxiter,
+            self.implicit_maxiter, self.implicit_tol)
 
         if source_mode == "local":
             impl = self._build_implicit_local(

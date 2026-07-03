@@ -1223,3 +1223,214 @@ class DiffusionOperatorJAX:
         result = u_star.at[:nc].set(sol)
         result = result.at[self._boundary_ghosts].set(result[self._boundary_cells])
         return result
+
+
+class DenseDiffusionOperatorJAX:
+    r"""JAX mirror of core ``DenseDiffusionOperator`` (REQ-109): dense,
+    state-dependent implicit diffusion ``div(A : grad Q)``.
+
+    Assembles the two-point (TPFA) FVM divergence of the model's GENERAL
+    diffusive flux ``F_diff[i,d] = Σ_{j,e} A[i,j,d,e] ∂_e Q[j]`` from the
+    rank-4 ``diffusion_matrix`` ``A(Q, Qaux, p)``.  Unlike the scalar
+    :class:`DiffusionOperatorJAX` (``ν`` × constant Laplacian, per-variable
+    diagonal) this couples DIFFERENT variables (dense ``A[i,j]``, ``i≠j``) and
+    lets ``A`` depend on the state, so a state-dependent cross-modal viscosity
+    (e.g. the μ(I) in-plane ν-moments) is treated FULLY IMPLICITLY — no
+    parabolic CFL.
+
+    Discretisation mirrors core ``DenseDiffusionOperator`` bit-for-bit: the
+    same ν-free geometry factors, the same face-normal contraction
+    ``T[i,j] = Σ_{d,e} A[i,j,d,e]·n_d·n_e`` (``Ā = ½(A_a+A_b)``), and
+    Crank–Nicolson (θ=½).  A constant diagonal ``A = ν·I·δ_de`` reduces to
+    ``ν·L`` (unit normals ⇒ ``T = ν·δ_ij``), so the jax dense path matches both
+    the jax scalar path and the numpy reference on that regression.
+
+    Boundaries: like the scalar jax path, the implicit half is interior-only
+    (``bf_grads=None``) and ghosts are refilled by the solver's ``bc_op`` after
+    the solve — exact for the periodic / Neumann cases the jax IMEX targets.
+
+    Improvement over the numpy reference: the state-dependent Newton inner
+    Jacobian action is EXACT automatic differentiation (``jax.jvp``), not a
+    finite-difference JVP — no ``fd_eps`` to tune.
+    """
+
+    def __init__(self, mesh, dim, n_vars, state_dependent=False):
+        import numpy as np
+        self.dim = int(dim)
+        self.n_vars = int(n_vars)
+        self.state_dependent = bool(state_dependent)
+        nc = mesh.n_inner_cells
+        self.nc = nc
+        iA = mesh.face_cells[0]
+        iB = mesh.face_cells[1]
+        centers = mesh.cell_centers[:dim, :]
+        normals = mesh.face_normals[:dim, :]
+        face_vol = mesh.face_volumes
+        cell_vol = mesh.cell_volumes
+
+        # Interior-face geometry (ν-free) + unit normal — the SAME per-face
+        # factors DiffusionOperatorJAX bakes into ``L``.
+        ia, ib, gA, gB, n_int = [], [], [], [], []
+        for f in range(mesh.n_faces):
+            a, b = int(iA[f]), int(iB[f])
+            if not (a < nc and b < nc):
+                continue
+            dx = centers[:, b] - centers[:, a]
+            dist = float(np.linalg.norm(dx))
+            if dist < 1e-30:
+                continue
+            n = normals[:, f]
+            n_dot_e = float(np.dot(n, dx / dist))
+            n_dot_e = max(abs(n_dot_e), 0.1) * np.sign(n_dot_e + 1e-30)
+            g = float(face_vol[f]) / dist / abs(n_dot_e)
+            ia.append(a); ib.append(b)
+            gA.append(g / float(cell_vol[a])); gB.append(g / float(cell_vol[b]))
+            n_int.append(np.asarray(n, dtype=float).copy())
+        self._ia = jnp.asarray(ia, dtype=int)
+        self._ib = jnp.asarray(ib, dtype=int)
+        self._gA = jnp.asarray(gA, dtype=float)
+        self._gB = jnp.asarray(gB, dtype=float)
+        self._n_int = (jnp.asarray(np.asarray(n_int, dtype=float).T)
+                       if n_int else jnp.zeros((dim, 0)))
+        self._has_int = len(ia) > 0
+
+        # Boundary-face geometry + unit normal (inner-cell tensor).
+        bf_inner, bf_g, n_bf = [], [], []
+        for i_bf in range(mesh.n_boundary_faces):
+            fidx = int(mesh.boundary_face_face_indices[i_bf])
+            inner = int(mesh.boundary_face_cells[i_bf])
+            a, b = int(iA[fidx]), int(iB[fidx])
+            dx = centers[:, b] - centers[:, a]
+            dist = float(np.linalg.norm(dx))
+            n = normals[:, fidx]
+            if dist < 1e-30:
+                bf_inner.append(inner); bf_g.append(0.0)
+                n_bf.append(np.asarray(n, dtype=float).copy())
+                continue
+            n_dot_e = float(np.dot(n, dx / dist))
+            n_dot_e = max(abs(n_dot_e), 0.1) * np.sign(n_dot_e + 1e-30)
+            g = float(face_vol[fidx]) / abs(n_dot_e) / float(cell_vol[inner])
+            bf_inner.append(inner); bf_g.append(g)
+            n_bf.append(np.asarray(n, dtype=float).copy())
+        self._bf_inner = jnp.asarray(bf_inner, dtype=int)
+        self._bf_g = jnp.asarray(bf_g, dtype=float)
+        self._n_bf = (jnp.asarray(np.asarray(n_bf, dtype=float).T)
+                      if n_bf else jnp.zeros((dim, 0)))
+        self._has_bf = len(bf_inner) > 0
+
+    def _as_cell_tensor(self, A):
+        """Reshape the runtime ``diffusion_matrix`` return to core's per-cell
+        layout ``(n_eq, n_st, nc, d, d)``.
+
+        The jax runtime vmaps over cells with ``out_axes=-1`` ⇒ a full-grid
+        call yields ``(n_eq, n_st, d, d, nc)``; transpose the trailing cell
+        axis into the middle so the divergence einsum mirrors the numpy
+        reference 1:1.  A purely-constant tensor (no cell axis) is broadcast."""
+        A = jnp.asarray(A)
+        d = self.dim
+        if A.ndim == 5:                      # (n_eq, n_st, d, d, nc)
+            return jnp.transpose(A, (0, 1, 4, 2, 3))
+        if A.ndim == 4:                      # (n_eq, n_st, d, d) — constant
+            return jnp.broadcast_to(
+                A[:, :, None, :, :],
+                (A.shape[0], A.shape[1], self.nc, d, d))
+        raise ValueError(
+            f"diffusion_matrix returned ndim={A.ndim}; expected 4 or 5.")
+
+    def _divergence(self, Q, A_cells, bf_grads=None):
+        """Discrete ``∇·F_diff`` — mirror of core ``_divergence`` (TPFA
+        face-normal contraction + scatter-add).  ``Q`` and the output are
+        inner-cell only (``(n_vars, nc)`` / ``(n_eq, nc)``)."""
+        n_eq = A_cells.shape[0]
+        D = jnp.zeros((n_eq, self.nc), dtype=Q.dtype)
+        if self._has_int:
+            A_a = A_cells[:, :, self._ia]           # (n_eq,n_st,nf,d,d)
+            A_b = A_cells[:, :, self._ib]
+            Aface = 0.5 * (A_a + A_b)
+            T = jnp.einsum('ijfde,df,ef->ijf', Aface, self._n_int, self._n_int)
+            dQ = Q[:, self._ib] - Q[:, self._ia]    # (n_st,nf)
+            flux = jnp.einsum('ijf,jf->if', T, dQ)  # (n_eq,nf)
+            D = D.at[:, self._ia].add(flux * self._gA)
+            D = D.at[:, self._ib].add(-flux * self._gB)
+        if bf_grads is not None and self._has_bf:
+            A_in = A_cells[:, :, self._bf_inner]    # (n_eq,n_st,nbf,d,d)
+            T_bf = jnp.einsum('ijbde,db,eb->ijb', A_in, self._n_bf, self._n_bf)
+            fluxb = jnp.einsum('ijb,jb->ib', T_bf, jnp.asarray(bf_grads))
+            D = D.at[:, self._bf_inner].add(fluxb * self._bf_g)
+        return D
+
+    def implicit_solve(self, Q_star, dt, A_fn, bf_grads=None,
+                       tol=1e-8, maxiter=100, newton_maxiter=8,
+                       newton_tol=1e-8):
+        r"""One Crank–Nicolson implicit-diffusion sub-step (mirror of core).
+
+        Solves ``(Q^{n+1}−Q*)/dt = ½[𝒟_impl(Q^{n+1}) + 𝒟_expl]`` with
+        ``𝒟_expl = interior(Q*) [+ boundary(Q*)]`` frozen.  ``A_fn(Q) ->
+        diffusion_matrix`` closes over ``Qaux``/``p`` (inner cells).  Constant
+        ``A`` ⇒ one linear ``jax_gmres`` solve; state-dependent ⇒ a Newton
+        loop (``lax.while_loop``) with an EXACT ``jax.jvp`` Jacobian action and
+        a ``jax_gmres`` inner solve.  ``Q_star`` is inner-cell ``(n_vars, nc)``.
+        """
+        from jax.scipy.sparse.linalg import gmres as jax_gmres
+        from jax import lax
+
+        Q_star = jnp.asarray(Q_star)
+        shape = Q_star.shape
+
+        A_star = self._as_cell_tensor(A_fn(Q_star))
+        D_expl = self._divergence(Q_star, A_star, bf_grads=bf_grads)
+
+        if not self.state_dependent:
+            rhs = (Q_star + 0.5 * dt * D_expl).reshape(-1)
+
+            def matvec(x_flat):
+                X = x_flat.reshape(shape)
+                DX = self._divergence(X, A_star, bf_grads=None)
+                return (X - 0.5 * dt * DX).reshape(-1)
+
+            sol, _ = jax_gmres(matvec, rhs, x0=Q_star.reshape(-1),
+                               tol=tol, atol=0.0, maxiter=maxiter)
+            return sol.reshape(shape)
+
+        # State-dependent: Newton on R(Q) = Q − Q* − dt/2 (𝒟_impl(Q) + 𝒟_expl),
+        # A re-evaluated at each iterate (i.e. at Q^{n+1}).  Exact FD-free
+        # Jacobian action via jax.jvp; jax_gmres for the inner linear solve.
+        def residual(Q):
+            D_impl = self._divergence(Q, self._as_cell_tensor(A_fn(Q)),
+                                      bf_grads=None)
+            return Q - Q_star - 0.5 * dt * (D_impl + D_expl)
+
+        def cond(carry):
+            Q, it = carry
+            return jnp.logical_and(
+                it < newton_maxiter,
+                jnp.linalg.norm(residual(Q)) > newton_tol)
+
+        def body(carry):
+            Q, it = carry
+            R = residual(Q)
+
+            def jvp(v_flat):
+                V = v_flat.reshape(shape)
+                return jax.jvp(residual, (Q,), (V,))[1].reshape(-1)
+
+            delta, _ = jax_gmres(jvp, (-R).reshape(-1),
+                                 tol=tol, atol=0.0, maxiter=maxiter)
+            return (Q + delta.reshape(shape), it + 1)
+
+        Qf, _ = lax.while_loop(cond, body, (Q_star, jnp.array(0)))
+        return Qf
+
+    def residual_norm(self, Q_np1, Q_star, dt, A_fn, bf_grads=None):
+        r"""Norm of the Crank–Nicolson residual the Newton solve drives to
+        zero (mirror of core ``residual_norm``)::
+
+            R = Q^{n+1} − Q* − dt/2 ( 𝒟_int(Q^{n+1}) + 𝒟_int(Q*) + bf ).
+
+        ``→0`` ⇔ the implicit-diffusion update is satisfied."""
+        D_expl = self._divergence(
+            Q_star, self._as_cell_tensor(A_fn(Q_star)), bf_grads=bf_grads)
+        D_impl = self._divergence(
+            Q_np1, self._as_cell_tensor(A_fn(Q_np1)), bf_grads=None)
+        R = Q_np1 - Q_star - 0.5 * dt * (D_impl + D_expl)
+        return float(jnp.linalg.norm(R))
