@@ -527,7 +527,13 @@ class IMEXSourceSolverJax(DerivativeAwareSolverMixin, HyperbolicSolver):
         ).min()
         time_end = jnp.asarray(self.time_end, dtype=Q.dtype)
         compute_dt_fn = self.compute_dt
-        sym_model = rmodel.model if hasattr(rmodel, "model") else None
+        # REQ-109: the symbolic handle carrying the sympy ``diffusion_matrix``
+        # (a ZArray) is ``rmodel.sm`` on a ``JaxRuntime`` — ``rmodel`` itself
+        # exposes the jax-LOWERED ``diffusion_matrix`` (a PjitFunction), which
+        # ``_build_diffusion_operators_jax`` cannot flatten.  Resolve to the
+        # SystemModel so the dense classifier reads the symbolic tensor.
+        sym_model = (rmodel.model if hasattr(rmodel, "model")
+                     else getattr(rmodel, "sm", None))
 
         # Build diffusion operators from the NumPy mesh
         symbolic_model = sym_model if sym_model is not None else rmodel
