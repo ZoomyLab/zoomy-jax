@@ -558,6 +558,29 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 "for the cell-interior NCP integral; "
                 f"{type(reconstruct).__name__} does not.")
 
+        # ── Explicit diffusion (REQ-50) ──────────────────────────────────
+        # dQ += ∇·(A:∇Q) from the model's rank-4 ``diffusion_matrix_explicit``
+        # (the explicit twin; else ``diffusion_matrix`` evaluated at Qⁿ),
+        # applied via the SAME dense TPFA divergence the IMEX dense path uses
+        # (REQ-109's DenseDiffusionOperatorJAX).  This carries cross-variable /
+        # state-dependent tensors — e.g. the malpasset chain-rule cross term
+        # ``A[2,1]=-D·u`` — unlike the numpy reference's DIAGONAL-only explicit
+        # path (``solver_numpy._diffusion_in_flux`` per-variable
+        # ``explicit_with_bc``).  ``JaxRuntime`` already lambdifies both tensors
+        # (``None`` when the model carries neither), so this is a no-op for
+        # models without diffusion.  Interior only (``bf_grads=None``); the
+        # diffusive wall flux is left to a follow-up (the convective BC handles
+        # boundaries, and A∝u ⇒ 0 at a no-slip wall / lake-at-rest anyway).
+        rt_diff_expl = getattr(runtime, "diffusion_matrix_explicit", None)
+        rt_diff = getattr(runtime, "diffusion_matrix", None)
+        rt_diff_fn = rt_diff_expl if rt_diff_expl is not None else rt_diff
+        dense_diff_op = None
+        if rt_diff_fn is not None:
+            from zoomy_jax.fvm.reconstruction_jax import DenseDiffusionOperatorJAX
+            dense_diff_op = DenseDiffusionOperatorJAX(
+                mesh, mesh.dimension, getattr(runtime, "n_state", 0),
+                state_dependent=False)
+
         # Precompute face index arrays.
         fc0 = np.asarray(mesh.face_cells[0])
         fc1 = np.asarray(mesh.face_cells[1])
@@ -688,6 +711,16 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 Dm_bnd = fluct_bnd[1]
                 dQ = dQ.at[:, iInner_bnd].subtract(
                     (F_num_bnd + Dm_bnd) * fv_bnd / cv_bnd)
+
+            # 5. Explicit diffusion (REQ-50): dQ += ∇·(A:∇Q).  A evaluated at
+            # the current state (explicit); the per-volume divergence matches
+            # the flux residual's ``/cv`` convention and the contract's
+            # ``+∂_x(A·∂_x Q)`` sign.  Interior faces only (bf_grads=None).
+            if dense_diff_op is not None:
+                A_cells = dense_diff_op._as_cell_tensor(
+                    rt_diff_fn(Q, Qaux, parameters))
+                dQ = dQ.at[:, :dense_diff_op.nc].add(
+                    dense_diff_op._divergence(Q, A_cells, bf_grads=None))
 
             return dQ
 
