@@ -607,6 +607,18 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         boundary_face_cells_j = jnp.asarray(
             mesh.boundary_face_cells, dtype=jnp.int32)
 
+        # Periodic-seam faces (REQ-116): after ``resolve_periodic_bcs``, a
+        # periodic boundary face has ``boundary_face_cells`` remapped to the
+        # PARTNER cell (≠ ``face_cells[0]``, the this-side cell).  The Periodic
+        # BC kernel is a pass-through, so at these faces the ghost state Q_R is
+        # the partner cell's state — NOT ``BC(Q_L)`` (which would silently
+        # degrade the wrap to extrapolation).  Static mask ⇒ zero per-step cost
+        # (and the whole branch is dropped at trace time when no periodic BC).
+        periodic_bf_np = (np.asarray(mesh.boundary_face_cells) != fc0[bf_face_idx]
+                          if n_bf > 0 else np.zeros(0, dtype=bool))
+        has_periodic = bool(periodic_bf_np.any())
+        periodic_mask_j = jnp.asarray(periodic_bf_np)
+
         # Distance from boundary face to inner cell (precomputed).
         d_face = np.asarray([
             np.linalg.norm(
@@ -704,6 +716,17 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 Q_R_bnd_list = [_per_bf_R(i) for i in range(n_bf)]
                 Q_R_bnd = jnp.stack(Q_R_bnd_list, axis=-1)
 
+                # Periodic seam (REQ-116): Q_R is the opposite-side (partner)
+                # cell state, already remapped into ``boundary_face_cells``;
+                # the BC-kernel override above (fed Q_L) would turn the wrap
+                # back into extrapolation.  Mirrors numpy's periodic_bf branch.
+                # ``has_periodic`` is a static python bool → this whole block is
+                # dropped at trace time for non-periodic meshes.
+                if has_periodic:
+                    Q_partner = Q[:, boundary_face_cells_j]
+                    Q_R_bnd = jnp.where(
+                        periodic_mask_j[None, :], Q_partner, Q_R_bnd)
+
                 F_num_bnd = rt_num_flux(
                     Q_L_bnd, Q_R_bnd, qauxBnd, qauxBnd, parameters, normals_bnd)
                 fluct_bnd = rt_num_fluct(
@@ -751,6 +774,17 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         nsm, source_model = self._coerce_to_nsm(model)
         self.nsm = nsm
         mesh = ensure_lsq_mesh(mesh, nsm)
+        # Periodic BCs (REQ-116): remap ``boundary_face_cells`` at the periodic
+        # seam to the partner cell across the wrap, exactly as numpy does
+        # (solver_numpy.py `setup_simulation`).  Must run on the NumPy mesh
+        # BEFORE ``create_runtime``/``convert_mesh_to_jax`` (which copies the
+        # patched array) — resolving on the already-converted jax mesh is too
+        # late.  Without it the jax FVM applied an extrapolation/wall flux at
+        # the seam (periodic roll waves decayed instead of growing).
+        bcs_obj = (source_model.boundary_conditions if source_model is not None
+                   else getattr(nsm.sm, "_bc_source", None))
+        if hasattr(mesh, "resolve_periodic_bcs") and bcs_obj is not None:
+            mesh.resolve_periodic_bcs(bcs_obj)
         # `initialize` only needs the SystemModel's shape info + the
         # initial_conditions if the SM carries them.  Source Model is
         # no longer required — JaxRuntime is the runtime.
