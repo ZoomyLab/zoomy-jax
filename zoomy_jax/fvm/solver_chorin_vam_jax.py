@@ -255,11 +255,24 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         """LSQ-recompute every state-derivative aux entry for ``sm`` via the
         shared :meth:`HyperbolicSolver._walk_derivative_aux` (state-only, both
         derivative kinds — Chorin's historical scope).  Pure function — returns
-        a new Qaux array.  Safe inside ``jax.jit`` / ``jax.lax.scan``."""
+        a new Qaux array.  Safe inside ``jax.jit`` / ``jax.lax.scan``.
+
+        Walks BOTH registries: since the splitter's ``_partition_pressure_aux``
+        (zoomy_core@44bdfca, REQ-94) the pressure sub-model keeps only the
+        LIVE pressure-derivative entries in ``aux_registry`` and moves the
+        frozen predictor-state derivatives (``h_x``, ``q_k_x``, ``b_x`` …) to
+        ``aux_input_registry`` — the documented contract is that a runtime
+        with a private pressure pool fills it from both, once per stage.
+        Walking only ``aux_registry`` left every input derivative at 0, so the
+        elliptic RHS was IDENTICALLY zero and P (hence r) never activated on
+        flat beds (task 0039: confluence VAM inert → blow-up)."""
+        reg = (list(getattr(sm, "aux_registry", None) or [])
+               + list(getattr(sm, "aux_input_registry", None) or []))
         return self._walk_derivative_aux(
             sm, Qaux, Q, self._rt_mesh,
             kinds=("derivative", "limited_derivative"),
-            target_kinds=("state",))
+            target_kinds=("state",),
+            registry=reg or None)
 
     def update_aux_variables(self):
         """Host-side wrapper that mutates ``self`` — convenience for
@@ -388,12 +401,25 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         return Q_new, Qaux_press_new
 
     def _step_corrector_pure(self, Q, Qaux_corr, dt):
-        """Pure-functional corrector: ``Q[corr_e2s] ← state_update(Q,
-        Qaux_corr, p, dt)``."""
+        """Pure-functional corrector: ``Q[corr_e2s] ← update(Q, Qaux_corr,
+        p, dt)``.
+
+        The splitter's "self-contained sub-models" refactor
+        (zoomy_core@44bdfca) moved the corrector's projection formula from
+        the ``state_update`` slot onto ``update_variables`` — accept either
+        (older splits carry ``state_update``, current ones
+        ``update_variables``).  Neither present is a HARD error: silently
+        skipping the corrector leaves the momenta/r unprojected (the solved
+        pressure is never applied — task 0039's second half)."""
         rt = self.rt_corr
         e2s = self._corr_state_idx
-        if rt.state_update is None:
-            return Q
+        fn = rt.state_update if rt.state_update is not None \
+            else rt.update_variables
+        if fn is None:
+            raise RuntimeError(
+                "Chorin corrector sub-model carries neither state_update nor "
+                "update_variables — the pressure projection would silently "
+                "never be applied.")
         p_full = self._params_with_dt(rt, dt)
-        new_vals = rt.state_update(Q, Qaux_corr, p_full)
+        new_vals = fn(Q, Qaux_corr, p_full)
         return Q.at[e2s, :].set(jnp.asarray(new_vals))

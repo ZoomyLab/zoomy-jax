@@ -331,16 +331,21 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
     @staticmethod
     def _walk_derivative_aux(sm, Qaux, Q, mesh, *, kinds=("derivative",),
-                             target_kinds=("state", "function")):
+                             target_kinds=("state", "function"),
+                             registry=None):
         """Fill ``aux_registry`` derivative rows of ONE SystemModel via the
         shared BC-aware LSQ kernel — the single source the canonical
         :meth:`update_qaux` AND ``ChorinSplitVAMSolverJax._refresh_aux_for_sm``
         both call.  ``kinds`` / ``target_kinds`` keep each caller's exact scope
         (canonical: spatial ``derivative``, state+function; Chorin: also
-        ``limited_derivative``, state only).  jit-traceable — the registry is
-        static so the loop unrolls at trace time."""
+        ``limited_derivative``, state only).  ``registry`` overrides the entry
+        list (the Chorin caller passes ``aux_registry + aux_input_registry`` —
+        see the splitter's ``_partition_pressure_aux``).  jit-traceable — the
+        registry is static so the loop unrolls at trace time."""
         out = Qaux
-        registry = getattr(sm, "aux_registry", None) if sm is not None else None
+        if registry is None:
+            registry = (getattr(sm, "aux_registry", None)
+                        if sm is not None else None)
         if not registry:
             return out
         for e in registry:
