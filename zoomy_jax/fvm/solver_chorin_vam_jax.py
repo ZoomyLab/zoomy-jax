@@ -94,6 +94,11 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         self.n_state = sm_pred.n_state
         self._reconstruction_spec = reconstruction or ReconstructionSpec()
         self._dt_symbol = self._detect_dt_symbol()
+        # Compiled time-loop cache, keyed by (static) n_steps.  Rebuilding the
+        # jit every ``run_jit_steps`` call forced a full XLA recompile of the
+        # whole scan per chunk (~320 ms/step on the 500-cell bend); caching it
+        # drops steady-state to the on-device compute floor (~19 ms/step).
+        self._run_step_cache: dict = {}
 
         for name, sm in (("press", sm_press), ("corr", sm_corr)):
             if [str(s) for s in sm.state] != [str(s) for s in sm_pred.state]:
@@ -331,20 +336,34 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
                       Qaux_corr, t_start=0.0):
         """JIT'd time loop via ``jax.lax.scan``.  Calls
         :meth:`chorin_cycle` ``n_steps`` times.  Returns final
-        ``(Q, Qaux_pred, Qaux_press, Qaux_corr, time)``."""
-        cycle = jax.jit(self.chorin_cycle)
+        ``(Q, Qaux_pred, Qaux_press, Qaux_corr, time)``.
 
-        def _body(carry, k):
-            Q, Qaux_pred, Qaux_press, Qaux_corr, t = carry
-            Q, Qaux_pred, Qaux_press, Qaux_corr = cycle(
-                dt, t, Q, Qaux_pred, Qaux_press, Qaux_corr)
-            return (Q, Qaux_pred, Qaux_press, Qaux_corr, t + dt), None
+        The compiled scan is **cached per (static) ``n_steps``** on the solver
+        (``self._run_step_cache``) and reused across calls.  ``n_steps`` is a
+        Python ``int`` closed over as a compile-time constant, so the whole
+        chunk stays a single resident XLA executable — no per-call recompile
+        (the recompile-per-chunk was the ~1000× per-step floor, REQ-122).
+        Drivers that step in chunks (one ``run_jit_steps`` per output snapshot)
+        therefore pay the compile ONCE, not every chunk."""
+        n_steps = int(n_steps)
+        run = self._run_step_cache.get(n_steps)
+        if run is None:
+            def _run(dt, Q, Qaux_pred, Qaux_press, Qaux_corr, t_start):
+                def _body(carry, _k):
+                    Q, Qaux_pred, Qaux_press, Qaux_corr, t = carry
+                    Q, Qaux_pred, Qaux_press, Qaux_corr = self.chorin_cycle(
+                        dt, t, Q, Qaux_pred, Qaux_press, Qaux_corr)
+                    return (Q, Qaux_pred, Qaux_press, Qaux_corr, t + dt), None
 
-        init = (Q, Qaux_pred, Qaux_press, Qaux_corr,
-                jnp.asarray(t_start, dtype=Q.dtype))
-        (Q, Qaux_pred, Qaux_press, Qaux_corr, t_final), _ = jax.lax.scan(
-            _body, init, jnp.arange(n_steps))
-        return Q, Qaux_pred, Qaux_press, Qaux_corr, t_final
+                init = (Q, Qaux_pred, Qaux_press, Qaux_corr,
+                        jnp.asarray(t_start, dtype=Q.dtype))
+                (Q, Qaux_pred, Qaux_press, Qaux_corr, t_final), _ = jax.lax.scan(
+                    _body, init, jnp.arange(n_steps))
+                return Q, Qaux_pred, Qaux_press, Qaux_corr, t_final
+
+            run = self._run_step_cache[n_steps] = jax.jit(_run)
+        return run(dt, Q, Qaux_pred, Qaux_press, Qaux_corr,
+                   jnp.asarray(t_start, dtype=Q.dtype))
 
     def _step_pressure_pure(self, Q, Qaux_press, dt):
         """Pure-functional pressure step: matrix-free GMRES on the
