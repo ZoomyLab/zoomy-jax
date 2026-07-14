@@ -49,7 +49,58 @@ __all__ = [
     "build_sharded_flux_run",
     "halo_exchange_periodic",
     "run_solver_sharded",
+    "collective_inner",
+    "distributed_gmres",
 ]
+
+
+def collective_inner(axis_name="cells"):
+    """Return an inner-product ``inner(a, b)`` that sums over the FULL domain.
+    Inside a ``shard_map`` over ``axis_name`` it is ``lax.psum`` across devices
+    (so a Krylov solve converges the *global* system, not each device's local
+    slab); outside shard_map the ``psum`` over a trivial axis is a no-op, so the
+    same callable works single-device."""
+    def inner(a, b):
+        return lax.psum(jnp.vdot(a, b), axis_name)
+    return inner
+
+
+def distributed_gmres(matvec, b, *, inner=None, maxiter=30, tol=1e-8, x0=None):
+    """Matrix-free GMRES whose inner products go through ``inner`` — pass
+    :func:`collective_inner` and a halo-exchanging ``matvec`` and the SAME code
+    solves the GLOBAL system under ``shard_map``.  Non-restarted Arnoldi (Krylov
+    dim = ``maxiter``) with modified Gram-Schmidt; the small least-squares is
+    solved on the (replicated, tiny) Hessenberg.  Only the Arnoldi inner
+    products and the residual norms are collective — the basis combination is
+    local — so cross-device traffic is O(maxiter) scalars per iteration.
+
+    ``matvec(v) -> A v`` MUST include the halo exchange when sharded (so ``A`` is
+    the global operator).  Returns ``x`` solving ``A x = b``."""
+    inner = inner or (lambda a, c: jnp.vdot(a, c))
+    x = jnp.zeros_like(b) if x0 is None else x0
+    r = b - matvec(x)
+    beta = jnp.sqrt(jnp.real(inner(r, r)))
+    m = int(maxiter)
+    eps = jnp.asarray(1e-300, dtype=beta.dtype)
+
+    V = [r / jnp.where(beta > 0, beta, 1.0)]
+    H = jnp.zeros((m + 1, m), dtype=b.dtype)
+    for j in range(m):
+        w = matvec(V[j])
+        for i in range(j + 1):
+            hij = inner(V[i], w)
+            H = H.at[i, j].set(hij)
+            w = w - hij * V[i]
+        hjp = jnp.sqrt(jnp.real(inner(w, w)))
+        H = H.at[j + 1, j].set(hjp)
+        V.append(w / jnp.where(hjp > 0, hjp, 1.0))
+
+    # least squares min || beta e1 - H y ||  (H is (m+1, m), tiny + replicated)
+    e1 = jnp.zeros((m + 1,), dtype=b.dtype).at[0].set(beta)
+    y, *_ = jnp.linalg.lstsq(H, e1, rcond=None)
+    for j in range(m):
+        x = x + y[j] * V[j]
+    return x
 
 
 def halo_exchange_periodic(Q_pad, halo, axis_name, n_devices):
