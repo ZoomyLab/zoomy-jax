@@ -167,17 +167,20 @@ def run_demo(mesh_file: Path, output_h5: Path, vtk_name: str) -> None:
         Qaux,
     )
 
-    core_io.generate_vtk(
+    from zoomy_prepost import hdf5_to_vtk
+
+    hdf5_to_vtk(
         str(output_h5),
+        str(output_h5.parent),
+        basename=vtk_name,
+        include_aux=True,
         field_names=["gnn_scalar"],
         aux_field_names=["aux_dummy"],
-        skip_aux=False,
-        filename=vtk_name,
     )
 
     print(f"Loaded mesh: {mesh_file}")
     print(f"Wrote HDF5: {output_h5}")
-    print(f"Wrote VTK series prefix: {output_h5.parent / vtk_name}")
+    print(f"Wrote VTK series: {output_h5.parent / (vtk_name + '.pvd')}")
 
 
 def _str2bool(v: str) -> bool:

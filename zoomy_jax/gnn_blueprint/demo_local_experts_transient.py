@@ -160,18 +160,21 @@ def run_demo(mesh_file: Path, output_h5: Path, vtk_name: str, n_steps: int):
         t = jnp.float64(step)
         _ = save_fields(t, t, jnp.float64(step), Q, Qaux)
 
-    core_io.generate_vtk(
+    from zoomy_prepost import hdf5_to_vtk
+
+    hdf5_to_vtk(
         str(output_h5),
+        str(output_h5.parent),
+        basename=vtk_name,
+        include_aux=True,
         field_names=["q_local_expert"],
         aux_field_names=["class_id", "dt_global"],
-        skip_aux=False,
-        filename=vtk_name,
     )
 
     print(f"Loaded mesh: {mesh_file}")
     print(f"Boundary classes used: {n_classes} (0=interior, >0 from boundary_function_number+1)")
     print(f"Saved {n_steps} snapshots to: {output_h5}")
-    print(f"VTK series: {output_h5.parent / (vtk_name + '.vtk.series')}")
+    print(f"VTK series: {output_h5.parent / (vtk_name + '.pvd')}")
 
 
 def main():
