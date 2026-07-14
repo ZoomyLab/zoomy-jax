@@ -381,8 +381,11 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         """JIT-compiled BC operator that fills ghost cells via the
         indexed kernel on JaxRuntime.boundary_conditions."""
         rt_bc = runtime.boundary_conditions
-        if rt_bc is None:
-            # Model has no BC kernel — return identity.
+        if rt_bc is None or int(getattr(mesh, "n_boundary_faces", 0)) == 0:
+            # No BC kernel, or a mesh with no boundary faces (e.g. an interior
+            # SPMD partition — all faces connect to halo cells, refreshed by
+            # halo exchange).  The BC operator is identity; tracing the fori_loop
+            # over a size-0 boundary_face array would otherwise gather OOB.
             return lambda time, Q, Qaux, parameters: Q
 
         @jax.jit
@@ -842,7 +845,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         operator; ``nc`` = #inner cells (for the troubled-cell mask).  order≥2 =
         SSP-RK2 (Heun); order 1 = explicit Euler.  The caller applies the source
         afterwards (explicit RK1 in ``step``, implicit in the IMEX loop).
+
+        SPMD: the flux is halo-wrapped here (once), so EVERY solver that reuses
+        this sub-step — the base explicit ``step`` AND the IMEX explicit stage —
+        gets across-partition halo exchange before each flux evaluation with no
+        extra wiring.  Identity when not sharded (``_halo_exchange`` unset).
         """
+        flux = self._halo_wrap(flux)
         if self.nsm.reconstruction.order >= 2:
             # SSP-RK2 (Heun).  ``force_o1`` (or None) is threaded through both
             # stages so the a-posteriori MOOD re-run demotes the SAME troubled
@@ -878,6 +887,25 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             return _rk2(None)
         dQ = flux(dt, time, Q, Qaux, parameters, jnp.zeros_like(Q))
         return Q + dt * dQ
+
+    def _halo_wrap(self, flux):
+        """SPMD hook.  When ``self._halo_exchange`` is set (the solver is being
+        run inside a ``jax.shard_map`` over a partitioned mesh), refresh the
+        halo slabs of ``Q`` **and** ``Qaux`` before *every* flux evaluation —
+        so the reconstruction + Riemann across the partition boundary see the
+        neighbor cells (``ppermute``).  Because the wrap sits on the flux op
+        itself, every stage (order-1 Euler, both SSP-RK2 stages, a MOOD re-run)
+        gets fresh halos with no change to the RK logic.  ``None`` (single
+        device) ⇒ returns ``flux`` unchanged: identity, zero cost, no behaviour
+        change on the non-sharded path."""
+        he = getattr(self, "_halo_exchange", None)
+        if he is None:
+            return flux
+
+        def wrapped(dt, time, Q, Qaux, parameters, dQ, *rest):
+            return flux(dt, time, he(Q), he(Qaux), parameters, dQ, *rest)
+
+        return wrapped
 
     def step(self, dt, time, Q, Qaux, parameters=None):
         """Perform a single explicit time step.

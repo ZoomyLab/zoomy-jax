@@ -47,7 +47,64 @@ __all__ = [
     "shard_global_state",
     "gather_owned",
     "build_sharded_flux_run",
+    "halo_exchange_periodic",
+    "run_solver_sharded",
 ]
+
+
+def halo_exchange_periodic(Q_pad, halo, axis_name, n_devices):
+    """Periodic ring halo: rank ``i`` sends its edge slabs to ``(i±1) mod n``.
+    Unlike :func:`~zoomy_jax.fvm.halo_exchange_jax.halo_exchange_inplace` (which
+    zeros the outer halo at the two global ends for the inline BC to overwrite),
+    this wraps around — so a periodic domain sharded across ``n`` devices equals
+    the same periodic domain on 1 device.  Layout ``[halo | owned | halo]``."""
+    left_owned = Q_pad[:, halo:2 * halo]
+    right_owned = Q_pad[:, -2 * halo:-halo]
+    perm_r = [(i, (i + 1) % n_devices) for i in range(n_devices)]
+    perm_l = [(i, (i - 1) % n_devices) for i in range(n_devices)]
+    fill_left = lax.ppermute(right_owned, perm=perm_r, axis_name=axis_name)
+    fill_right = lax.ppermute(left_owned, perm=perm_l, axis_name=axis_name)
+    Q_pad = Q_pad.at[:, :halo].set(fill_left)
+    Q_pad = Q_pad.at[:, -halo:].set(fill_right)
+    return Q_pad
+
+
+def run_solver_sharded(solver, n_devices, halo, n_steps, dt, *,
+                       t=0.0, axis_name="cells",
+                       halo_exchange=halo_exchange_periodic):
+    """Run the **real** solver (its own ``step`` + ``post_step`` — full physics:
+    flux, order-1/2 reconstruction, explicit/local-implicit source) across
+    ``n_devices`` via ``jax.shard_map``.
+
+    ``solver`` must already be set up (``setup_simulation``) on the **per-
+    partition padded mesh** (e.g. ``partition_1d_contiguous(global_mesh, ...)[1]``
+    or ``partition_xaxis_structured(...)``).  This sets ``solver._halo_exchange``
+    so the flux operator refreshes ``Q``/``Qaux`` halos every stage (see
+    :meth:`HyperbolicSolver._halo_wrap`); the same solver code then runs on every
+    device.  With the periodic halo (default) the result is transparent to the
+    device count (sharded-1 == sharded-N).  ``dt`` is fixed (a global adaptive dt
+    would need a ``lax.pmin`` collective — a small refinement).  Returns a
+    callable ``run(Q_pad, Qaux_pad) -> (Q_pad, Qaux_pad)``."""
+    solver._halo_exchange = lambda x: halo_exchange(x, halo, axis_name, n_devices)
+    dmesh = spmd_device_mesh(n_devices, axis_name)
+    dt_j = jnp.asarray(dt)
+    t0 = jnp.asarray(t)
+
+    @partial(shard_map, mesh=dmesh,
+             in_specs=(P(None, axis_name), P(None, axis_name)),
+             out_specs=(P(None, axis_name), P(None, axis_name)), check_rep=False)
+    def run(Q_pad, Qaux_pad):
+        def body(carry, _):
+            Q, Qaux, tc = carry
+            Qn = solver.step(dt_j, tc, Q, Qaux)
+            Qn, Qauxn = solver.post_step(tc + dt_j, dt_j, Qn, Q, Qaux)
+            return (Qn, Qauxn, tc + dt_j), None
+
+        (Q, Qaux, _), _ = lax.scan(body, (Q_pad, Qaux_pad, t0), None,
+                                   length=n_steps)
+        return Q, Qaux
+
+    return run
 
 
 def spmd_device_mesh(n_devices=None, axis_name="cells"):

@@ -13,6 +13,8 @@ from zoomy_jax.fvm.spmd_jax import (
     shard_global_state,
     gather_owned,
     build_sharded_flux_run,
+    halo_exchange_periodic,
+    run_solver_sharded,
 )
 
 __all__ = [
@@ -23,4 +25,6 @@ __all__ = [
     "shard_global_state",
     "gather_owned",
     "build_sharded_flux_run",
+    "halo_exchange_periodic",
+    "run_solver_sharded",
 ]
