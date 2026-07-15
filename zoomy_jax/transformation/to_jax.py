@@ -13,29 +13,32 @@ _enable_x64 = os.environ.get("ZOOMY_JAX_ENABLE_X64", "1").strip().lower() not in
 jax.config.update("jax_enable_x64", _enable_x64)
 
 
-class JaxRuntimeModel(NumpyRuntimeModel):
-    """JAX-backed runtime model compiled from symbolic functions."""
+def _legacy_module() -> dict:
+    """The jax UserFunctions table (REQ-168) — ONE source; this dict used to be
+    duplicated verbatim across both classes below.
 
-    module = {
-        "ones_like": jnp.ones_like,
-        "zeros_like": jnp.zeros_like,
-        "array": jnp.array,
-        "squeeze": jnp.squeeze,
-        "conditional": lambda c, t, f: jnp.where(c, t, f),
-        "max_wavespeed": None,
-    }
+    Lazy import: ``zoomy_jax.fvm`` imports this module, so a module-level import
+    of ``zoomy_jax.fvm.userfunctions`` would be circular."""
+    from zoomy_jax.fvm.userfunctions import jax_userfunctions
+    m = jax_userfunctions()
+    m["max_wavespeed"] = None      # orphaned; see jax_runtime._jax_module_base
+    return m
+
+
+class JaxRuntimeModel(NumpyRuntimeModel):
+    """JAX-backed runtime model compiled from symbolic functions.
+
+    LEGACY — superseded by :class:`zoomy_jax.transformation.jax_runtime.JaxRuntime`,
+    the live runtime every solver builds via ``JaxRuntime.from_nsm``."""
+
+    module = _legacy_module()
     printer = "jax"
 
 
 class JaxRuntimeSymbolic(NumpyRuntimeSymbolic):
-    """JAX-backed runtime wrapper for symbolic registrars (e.g. Numerics, Kernel)."""
+    """JAX-backed runtime wrapper for symbolic registrars (e.g. Numerics, Kernel).
 
-    module = {
-        "ones_like": jnp.ones_like,
-        "zeros_like": jnp.zeros_like,
-        "array": jnp.array,
-        "squeeze": jnp.squeeze,
-        "conditional": lambda c, t, f: jnp.where(c, t, f),
-        "max_wavespeed": None,
-    }
+    LEGACY — see :class:`JaxRuntimeModel`."""
+
+    module = _legacy_module()
     printer = "jax"

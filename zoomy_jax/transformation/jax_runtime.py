@@ -49,23 +49,24 @@ from zoomy_core.numerics import NumericalSystemModel
 # ── JAX module dict for sp.lambdify ──────────────────────────────────
 
 
-_JAX_MODULE_BASE: dict = {
-    "ones_like": jnp.ones_like,
-    "zeros_like": jnp.zeros_like,
-    "array": jnp.array,
-    "squeeze": jnp.squeeze,
-    "conditional": lambda c, t, f: jnp.where(c, t, f),
-    # ``max_wavespeed`` is an opaque sympy Function that Rusanov-style
-    # numerics emit; the runtime fills it with the local-Roe / max-eig
-    # callable built from the SystemModel's ``eigenvalues``.  Set by
-    # ``JaxRuntime`` in __init__.
-    "max_wavespeed": None,
-    # NON-LOCAL spatial derivative aux — the solver injects the mesh-bound
-    # impl (lsq_gradient_per_field) before the update_aux_variables slot is
-    # lambdified, mirroring max_wavespeed.  Requires that slot to be lowered
-    # WHOLE-GRID (field arrives as the full row, not a per-cell scalar).
-    "compute_derivative": None,
-}
+# The UserFunctions table lives in ONE place (REQ-168):
+# ``zoomy_jax.fvm.userfunctions`` — arithmetic + the opaque kernels
+# (``eigensystem``, ``solve``) + the solver-injected ``compute_derivative``.
+# Built fresh per runtime because ``JaxRuntime`` injects per-instance entries.
+def _jax_module_base() -> dict:
+    # Lazy import: ``zoomy_jax.fvm`` imports ``transformation.to_jax``, so a
+    # module-level import here would be circular.
+    from zoomy_jax.fvm.userfunctions import jax_userfunctions
+    m = jax_userfunctions()
+    # ``max_wavespeed`` is an opaque sympy Function that Rusanov-style numerics
+    # USED to emit; ``JaxRuntime.__init__`` still fills it with the local-Roe /
+    # max-eig callable built from the SystemModel's ``eigenvalues``.
+    # ⚠ REQ-168: core no longer emits this symbol anywhere (grep zoomy_core =
+    # zero hits), so the plug below is orphaned — kept for now (harmless: an
+    # unemitted symbol is simply never resolved) pending the REQ-168 GAP-1
+    # decision, which should give the wave speed a real λ-only kernel instead.
+    m["max_wavespeed"] = None
+    return m
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -226,7 +227,7 @@ class JaxRuntime:
 
         # JAX module dict — local copy so per-instance ``max_wavespeed``
         # injection doesn't leak across runtimes.
-        self.module = dict(_JAX_MODULE_BASE)
+        self.module = _jax_module_base()
 
         # Per-cell operators on the SystemModel.
         self._build_cell_operators()
