@@ -78,8 +78,32 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
     pressure_maxit = param.Integer(default=100, bounds=(1, None))
     time_order = param.Integer(default=1, bounds=(1, 2))
 
-    def __init__(self, sm_pred, sm_press, sm_corr, *,
-                 reconstruction=None, **kwargs):
+    #: The stage kinds this solver realises (REQ-173).  Mirrors
+    #: ``ChorinSplitVAMSolver._STAGE_KINDS``; the Chorin march is exactly
+    #: hyperbolic → elliptic → pointwise, one stage each.
+    _STAGE_KINDS = ("hyperbolic", "elliptic", "pointwise")
+
+    def __init__(self, sm_pred=None, sm_press=None, sm_corr=None, *,
+                 stages=None, reconstruction=None, **kwargs):
+        # REQ-173: accept EITHER the legacy positional triple OR a canonical
+        # stage list.  The binding is delegated to core's `_bind_stages` rather
+        # than reimplemented here — it binds BY KIND (never by position) and
+        # validates one-stage-per-kind, and a second copy of that logic is a
+        # second thing to drift.
+        if stages is not None:
+            if not (sm_pred is None and sm_press is None and sm_corr is None):
+                raise TypeError(
+                    "ChorinSplitVAMSolverJax: pass EITHER the positional "
+                    "(sm_pred, sm_press, sm_corr) triple OR stages=[...], "
+                    "not both.")
+            from zoomy_core.fvm.solver_chorin_vam_numpy import (
+                ChorinSplitVAMSolver as _CoreChorin,
+            )
+            sm_pred, sm_press, sm_corr = _CoreChorin._bind_stages(stages)
+        elif sm_pred is None or sm_press is None or sm_corr is None:
+            raise TypeError(
+                "ChorinSplitVAMSolverJax: need the (sm_pred, sm_press, "
+                "sm_corr) triple or stages=[...].")
         if not isinstance(sm_pred, SystemModel):
             raise TypeError("sm_pred must be a SystemModel")
         if not isinstance(sm_press, SystemModel):
@@ -460,6 +484,16 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
             atol=0.0, tol=self.pressure_tol,
             maxiter=self.pressure_maxit,
         )
+        # REQ-173's `elliptic` stage contract: the executor must surface
+        # ‖b − A x‖/‖b‖.  ⚠ BACKEND DIVERGENCE, deliberate: numpy stores it on
+        # `self.last_elliptic_rel_resid`; this method is PURE and runs inside
+        # jit/scan, so assigning to self here would capture a TRACER, not a
+        # value -- a trap, not a diagnostic.  jax therefore surfaces the same
+        # number through `jax.debug.print`, which fires from inside the fused
+        # loop.  Same contract, different delivery; if REQ-173 later demands
+        # the attribute specifically, it has to be threaded out through the
+        # scan carry rather than assigned.
+        #
         # One extra matvec (<1% of the ~10^2 the solve just spent) buys the
         # warning PETSc backends get for free.  Measured on VAM(1,3) 2-D the
         # shipped defaults converge to 2304 cells (rel resid <= 3.6e-7 vs the
