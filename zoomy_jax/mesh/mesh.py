@@ -16,23 +16,46 @@ import jax.numpy as jnp
 from zoomy_core.mesh.lsq_reconstruction import find_derivative_indices
 
 
-def compute_derivatives(u, mesh, derivatives_multi_index=None):
-    """Compute cell-wise LSQ derivatives using JAX vmap."""
+def compute_derivatives(u, mesh, derivatives_multi_index=None, u_bf=None):
+    """Compute cell-wise LSQ derivatives using JAX vmap.
+
+    ``lsq_gradQ`` is built over the stencil ``neighbours + boundary faces``, so
+    the right-hand side MUST carry a boundary block too: on a 1-D 80-cell mesh
+    ``lsq_gradQ`` is ``(82, 5, 2)`` while ``lsq_neighbors`` is only ``(82, 4)``
+    and ``lsq_boundary_face_neighbors`` supplies the 5th (4 + 1 = 5).  Feeding
+    just the neighbours made the matmul contract 5 against 4 and raise
+    ``dot_general requires contracting dimensions to have the same shape``.
+
+    ``u_bf=None`` ⇒ extrapolation/Neumann-zero (the boundary block contributes
+    a zero delta), matching :func:`lsq_gradient_per_field`, which already did
+    this correctly — that divergence is why the per-field kernel worked while
+    this one raised.
+    """
     A_glob = mesh.lsq_gradQ
     neighbors = mesh.lsq_neighbors
     mon_indices = mesh.lsq_monomial_multi_index
     scale_factors = mesh.lsq_scale_factors
+    bdy_nbr = mesh.lsq_boundary_face_neighbors
+    has_bdy = bdy_nbr is not None
 
     if derivatives_multi_index is None:
         derivatives_multi_index = mon_indices
     indices = find_derivative_indices(mon_indices, derivatives_multi_index)
 
-    def reconstruct_cell(A_loc, neighbor_idx, u_i):
-        u_neighbors = u[neighbor_idx]
-        delta_u = u_neighbors - u_i
+    def reconstruct_cell(A_loc, neighbor_idx, u_i, bf):
+        delta_u = u[neighbor_idx] - u_i
+        if has_bdy:
+            if u_bf is not None:
+                u_bf_i = jnp.where(bf >= 0, u_bf[jnp.maximum(bf, 0)], u_i)
+            else:
+                u_bf_i = jnp.full_like(bf, u_i, dtype=u_i.dtype)
+            delta_u = jnp.concatenate(
+                [delta_u, jnp.where(bf >= 0, u_bf_i - u_i, 0.0)])
         return (scale_factors * (A_loc.T @ delta_u)).T
 
-    return jax.vmap(reconstruct_cell)(A_glob, neighbors, u)[:, indices]
+    bf_arg = bdy_nbr if has_bdy else jnp.zeros((jnp.shape(A_glob)[0], 0),
+                                               dtype=jnp.int32)
+    return jax.vmap(reconstruct_cell)(A_glob, neighbors, u, bf_arg)[:, indices]
 
 
 def lsq_gradient_per_field(mesh, u_inner, u_bf=None, multi_index=(1,)):
