@@ -79,3 +79,31 @@ def test_solve_matches_numpy_batched():
            [jnp.asarray(b[:, i]) for i in range(n)]
     x = np.stack([np.asarray(solve(i, *args)) for i in range(n)], axis=-1)
     assert np.allclose(x, np.linalg.solve(A, b[..., None])[..., 0], atol=1e-10)
+
+
+@pytest.mark.jax
+def test_eigenvalues_lambda_only_matches_numpy():
+    """REQ-168 GAP 1: the λ-only kernel — idx-th eigenvalue (real part).
+
+    Must agree with numpy's spectrum, scalar and batched.  Unlike `eigensystem`
+    this lowers to `jnp.linalg.eigvals` directly (no pure_callback), so it stays
+    inside the jit — the wave speed is evaluated every step inside the fused
+    while_loop and a host round-trip there would collapse the fusion.
+    """
+    from zoomy_jax.fvm.userfunctions import eigenvalues
+    rng = np.random.default_rng(3)
+
+    A = rng.standard_normal((3, 3))
+    lam = np.array([float(eigenvalues(i, *[float(x) for x in A.reshape(-1)]))
+                    for i in range(3)])
+    assert np.allclose(np.sort(lam), np.sort(np.real(np.linalg.eigvals(A))), atol=1e-10)
+
+    Ab = rng.standard_normal((5, 2, 2))                    # batched over faces
+    flat = [jnp.asarray(Ab[:, i, j]) for i in range(2) for j in range(2)]
+    lam_b = np.stack([np.asarray(eigenvalues(i, *flat)) for i in range(2)], axis=-1)
+    ref = np.sort(np.real(np.linalg.eigvals(Ab)), axis=-1)
+    assert np.allclose(np.sort(lam_b, axis=-1), ref, atol=1e-10)
+
+    # the CFL bound the wave speed actually wants
+    assert np.allclose(np.abs(lam).max(), np.abs(np.real(np.linalg.eigvals(A))).max(),
+                       atol=1e-10)

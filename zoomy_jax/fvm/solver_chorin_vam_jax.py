@@ -256,11 +256,34 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         p = rt.parameters
         return p.at[-1].set(jnp.asarray(dt, dtype=p.dtype))
 
+    def _runtime_for_sm(self, sm):
+        """The :class:`JaxRuntime` that lambdified ``sm`` (REQ-151 DEFECT D).
+
+        The pressure/corrector sub-systems get their own runtimes in
+        ``setup_simulation``; the predictor rides the parent ``HyperbolicSolver``
+        runtime (``_rt_model``, built on ``SM_pred``)."""
+        if sm is getattr(self, "sm_press", None):
+            return getattr(self, "rt_press", None)
+        if sm is getattr(self, "sm_corr", None):
+            return getattr(self, "rt_corr", None)
+        return getattr(self, "_rt_model", None)
+
     def _refresh_aux_for_sm(self, Qaux, sm, Q):
-        """LSQ-recompute every state-derivative aux entry for ``sm`` via the
-        shared :meth:`HyperbolicSolver._walk_derivative_aux` (state-only, both
-        derivative kinds — Chorin's historical scope).  Pure function — returns
-        a new Qaux array.  Safe inside ``jax.jit`` / ``jax.lax.scan``.
+        """Refresh ``sm``'s aux pool: the ALGEBRAIC ``update_aux_variables``
+        rule first, then every state-derivative entry — mirroring the base
+        :meth:`HyperbolicSolver.update_qaux` order.  Pure function — returns a
+        new Qaux array.  Safe inside ``jax.jit`` / ``jax.lax.scan``.
+
+        REQ-151 DEFECT D: this used to walk ONLY the derivative kinds, so a
+        plain-Symbol aux (``hinv = KP(h)``, which every velocity scales by:
+        ``u = hu·hinv``) was NEVER evaluated — it sat at its init value 0 and
+        silently zeroed every velocity.  That is a wrong-answer bug, not a
+        crash.  ``zoomy_core@676ed2d`` fixed the SYMBOLIC half (``hinv`` now
+        survives into ``SM_pred``/``SM_press`` WITH its update rule); this is
+        the solver-side half.  The rule is a FULL-LENGTH ``(n_aux, ·)`` vector
+        whose non-algebraic rows pass their own aux symbol through, so applying
+        it before the derivative walk is safe (the walk then refreshes the
+        derivative rows).
 
         Walks BOTH registries: since the splitter's ``_partition_pressure_aux``
         (zoomy_core@44bdfca, REQ-94) the pressure sub-model keeps only the
@@ -271,6 +294,18 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         Walking only ``aux_registry`` left every input derivative at 0, so the
         elliptic RHS was IDENTICALLY zero and P (hence r) never activated on
         flat beds (task 0039: confluence VAM inert → blow-up)."""
+        # (1) ALGEBRAIC aux leg (REQ-151 DEFECT D) — e.g. the KP-desingularized
+        #     ``hinv``.  Guarded on full length, mirroring the base solver:
+        #     a short/prefix vector would mis-place the algebraic rows onto the
+        #     leading derivative rows and then be clobbered by (2).
+        rt = self._runtime_for_sm(sm)
+        fn = getattr(rt, "update_aux_variables", None)
+        if fn is not None:
+            local = fn(Q, Qaux, getattr(rt, "parameters", None))
+            if local is not None and jnp.shape(local)[0] == jnp.shape(Qaux)[0]:
+                Qaux = local
+
+        # (2) state-derivative entries (Chorin's historical scope).
         reg = (list(getattr(sm, "aux_registry", None) or [])
                + list(getattr(sm, "aux_input_registry", None) or []))
         return self._walk_derivative_aux(
