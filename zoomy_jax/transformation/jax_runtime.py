@@ -482,7 +482,13 @@ class JaxRuntime:
                 def per_cell(q, qaux, n):
                     ql = jnp.asarray(ql_fn(q, qaux, parameters))
                     ql = ql.reshape(n_state, n_state, n_dim)
-                    A_n = jnp.einsum("ijk,k->ij", ql, n)
+                    # REQ-170: the mesh stores face normals with 3 components
+                    # (vertex coords are 3-D; z ≡ 0 on a 2-D mesh) while the
+                    # quasilinear matrix carries only ``n_dim`` directions —
+                    # einsum then fails on label 'k'.  Truncating the normal is
+                    # exact (the dropped components are identically zero) and a
+                    # no-op when the ranks already agree (1-D / 3-D).
+                    A_n = jnp.einsum("ijk,k->ij", ql, n[:n_dim])
                     return jnp.real(jnp.linalg.eigvals(A_n))
                 return jax.vmap(per_cell, in_axes=(1, 1, 1),
                                 out_axes=-1)(Q, Qaux, normal)
