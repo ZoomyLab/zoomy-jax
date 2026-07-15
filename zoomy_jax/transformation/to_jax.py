@@ -25,13 +25,41 @@ def _legacy_module() -> dict:
     return m
 
 
+class _LazyUserFunctions:
+    """Descriptor: build the table on FIRST ACCESS, not at import.
+
+    ``_legacy_module``'s *import* is lazy — but a class body that CALLS it runs
+    it at **import** time regardless, which recreated the exact cycle the lazy
+    import exists to avoid:
+
+        to_jax -> fvm/__init__ -> solver_imex_jax
+               -> `from zoomy_jax.transformation.to_jax import JaxRuntimeModel`
+               -> to_jax is still half-initialised -> ImportError
+
+    A lazy import inside a function the class body calls buys nothing; the CALL
+    has to be deferred too.  First access caches the dict onto the class and
+    drops this descriptor, so both `JaxRuntimeModel.module` (class access — what
+    the REQ-168 contract test uses) and `self.module` behave exactly like the
+    plain dict they were before.
+    """
+
+    def __set_name__(self, owner, name):
+        self._name = name
+
+    def __get__(self, obj, owner=None):
+        owner = owner if owner is not None else type(obj)
+        m = _legacy_module()
+        setattr(owner, self._name, m)          # cache; replaces the descriptor
+        return m
+
+
 class JaxRuntimeModel(NumpyRuntimeModel):
     """JAX-backed runtime model compiled from symbolic functions.
 
     LEGACY — superseded by :class:`zoomy_jax.transformation.jax_runtime.JaxRuntime`,
     the live runtime every solver builds via ``JaxRuntime.from_nsm``."""
 
-    module = _legacy_module()
+    module = _LazyUserFunctions()
     printer = "jax"
 
 
@@ -40,5 +68,5 @@ class JaxRuntimeSymbolic(NumpyRuntimeSymbolic):
 
     LEGACY — see :class:`JaxRuntimeModel`."""
 
-    module = _legacy_module()
+    module = _LazyUserFunctions()
     printer = "jax"
