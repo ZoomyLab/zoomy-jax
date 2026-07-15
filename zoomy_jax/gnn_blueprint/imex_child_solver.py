@@ -241,25 +241,43 @@ class IMEXSourceSolverJaxGNNGuess(IMEXSourceSolverJax):
                 b = (-R).reshape(-1)
                 x0 = gmres_x0(Q, R)
 
-                def _gmres_with(init_x0):
-                    return jax_gmres(lambda v: matvec(Q, R, v), b, x0=init_x0, atol=0.0, tol=gmres_tol, maxiter=gmres_maxiter)
+                # jax's gmres `info` is a hard-coded 0 placeholder (its own
+                # docstring: "Placeholder for convergence information"), NOT a
+                # convergence flag -- measured identical for a converged solve
+                # and one starved to maxiter=1.  This block used to branch on
+                # `info != 0`, so the retry was UNREACHABLE, the `where(info ==
+                # 0, ...)` fallback never fired, and `total_gmres_failures` /
+                # `total_gmres_fallbacks` were structurally pinned at 0 -- the
+                # log line reported "gmres_fail=0" even if every solve diverged.
+                # Branch on the measured residual instead (one extra matvec).
+                def _solve(init_x0):
+                    d, _info = jax_gmres(lambda v: matvec(Q, R, v), b, x0=init_x0,
+                                         atol=0.0, tol=gmres_tol, maxiter=gmres_maxiter)
+                    bn = jnp.linalg.norm(b)
+                    rel = jnp.linalg.norm(matvec(Q, R, d) - b) / jnp.where(bn > 0, bn, 1.0)
+                    return d, rel
 
-                delta, info = _gmres_with(x0)
+                delta, rel = _solve(x0)
 
                 def retry(_):
-                    d2, i2 = _gmres_with(jnp.zeros_like(x0))
-                    return d2, i2, jnp.int32(1)
+                    d2, r2 = _solve(jnp.zeros_like(x0))
+                    return d2, r2, jnp.int32(1)
 
                 def keep(_):
-                    return delta, info, jnp.int32(0)
+                    return delta, rel, jnp.int32(0)
 
-                do_retry = jnp.logical_and(info != 0, guess_mode != "zero")
-                delta, info, did_retry = jax.lax.cond(do_retry, retry, keep, operand=None)
+                # a bad initial guess is the one thing a retry can fix, so only
+                # retry when we did not already start from zero.
+                do_retry = jnp.logical_and(rel > gmres_tol, guess_mode != "zero")
+                delta, rel, did_retry = jax.lax.cond(do_retry, retry, keep, operand=None)
 
-                delta = jnp.where(info == 0, delta, b)
+                # still unconverged after the retry -> fall back to the steepest
+                # -descent-ish step `b` rather than a garbage Krylov direction.
+                converged = rel <= gmres_tol
+                delta = jnp.where(converged, delta, b)
                 Qn = boundary_op(time_now, Q + delta.reshape(q_shape), Qauxold, parameters)
                 Rn = residual(Qn)
-                fails_new = fails + jnp.where(info == 0, jnp.int32(0), jnp.int32(1))
+                fails_new = fails + jnp.where(converged, jnp.int32(0), jnp.int32(1))
                 fb_new = fallbacks + did_retry
                 return (Qn, Rn, jnp.linalg.norm(Rn.reshape(-1)), i + 1, fails_new, fb_new)
 

@@ -65,7 +65,7 @@ def collective_inner(axis_name="cells"):
     return inner
 
 
-def distributed_gmres(matvec, b, *, inner=None, maxiter=30, tol=1e-8, x0=None):
+def distributed_gmres(matvec, b, *, inner=None, maxiter=30, x0=None):
     """Matrix-free GMRES whose inner products go through ``inner`` — pass
     :func:`collective_inner` and a halo-exchanging ``matvec`` and the SAME code
     solves the GLOBAL system under ``shard_map``.  Non-restarted Arnoldi (Krylov
@@ -75,7 +75,21 @@ def distributed_gmres(matvec, b, *, inner=None, maxiter=30, tol=1e-8, x0=None):
     local — so cross-device traffic is O(maxiter) scalars per iteration.
 
     ``matvec(v) -> A v`` MUST include the halo exchange when sharded (so ``A`` is
-    the global operator).  Returns ``x`` solving ``A x = b``."""
+    the global operator).
+
+    Returns ``(x, rel_resid)`` where ``rel_resid = ||b - A x|| / ||b||`` comes
+    free from the Arnoldi least-squares.  **The caller MUST inspect it.**  The
+    Krylov dimension is the static ``maxiter``, so a solve that has not
+    converged returns the best-in-subspace ``x`` and is otherwise
+    indistinguishable from a converged one.
+
+    This used to take a ``tol`` argument and return only ``x``.  ``tol`` was
+    never read — the loop always ran ``maxiter`` steps — so callers passing
+    ``tol=1e-12`` got bit-identical results to ``tol=1e-1`` while the docstring
+    promised ``x`` "solving A x = b".  jax's own ``gmres`` has the same shape of
+    hole from the other side: its ``info`` is a hard-coded 0 placeholder (its
+    docstring says so), so ``_, info = jax_gmres(...)`` can never report
+    non-convergence.  Reporting the residual is the only honest option here."""
     inner = inner or (lambda a, c: jnp.vdot(a, c))
     x = jnp.zeros_like(b) if x0 is None else x0
     r = b - matvec(x)
@@ -100,7 +114,14 @@ def distributed_gmres(matvec, b, *, inner=None, maxiter=30, tol=1e-8, x0=None):
     y, *_ = jnp.linalg.lstsq(H, e1, rcond=None)
     for j in range(m):
         x = x + y[j] * V[j]
-    return x
+    # ||beta e1 - H y|| IS the true residual norm of the Arnoldi solution, so
+    # this costs no extra matvec (H, e1, y are replicated -> no collective).
+    # Normalise by ||b||, NOT by beta: they coincide only when x0 = 0, and a
+    # residual quietly measured against ||b - A x0|| is the kind of almost-right
+    # number this function exists to stop shipping.  One scalar collective.
+    bnorm = jnp.sqrt(jnp.real(inner(b, b)))
+    rel_resid = jnp.linalg.norm(e1 - H @ y) / jnp.where(bnorm > 0, bnorm, 1.0)
+    return x, rel_resid
 
 
 def halo_exchange_periodic(Q_pad, halo, axis_name, n_devices):

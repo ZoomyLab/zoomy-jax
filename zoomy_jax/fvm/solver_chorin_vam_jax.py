@@ -444,10 +444,39 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
             _, jvp_val = jax.jvp(_residual, (zero_p,), (p_vec,))
             return jvp_val
 
+        # NOTE ON `info`: jax's gmres CANNOT report non-convergence.  Its own
+        # docstring calls `info` a "Placeholder for convergence information",
+        # and it is a hard-coded 0 -- measured identical for a converged solve
+        # and for one deliberately starved to maxiter=1.  So there is nothing
+        # to check: the ONLY way to know whether this solve converged is to
+        # measure the residual, which is what we do below.  (PETSc backends get
+        # DIVERGED_ITS for free and print a warning; jax gets silence.)
+        #
+        # `maxiter` here is the number of RESTARTS of a size-`restart` (default
+        # 20) Krylov space, NOT an iteration count -- the budget is ~20*maxiter
+        # matvecs.
         p_new, _info = jax_gmres(
             matvec, -b,
             atol=0.0, tol=self.pressure_tol,
             maxiter=self.pressure_maxit,
+        )
+        # One extra matvec (<1% of the ~10^2 the solve just spent) buys the
+        # warning PETSc backends get for free.  Measured on VAM(1,3) 2-D the
+        # shipped defaults converge to 2304 cells (rel resid <= 3.6e-7 vs the
+        # 1e-6 tol), so this is a latent guard, not a live failure -- but an
+        # unconverged pressure is otherwise indistinguishable from a good one.
+        b_norm = jnp.linalg.norm(b)
+        rel_resid = jnp.linalg.norm(matvec(p_new) + b) / jnp.where(
+            b_norm > 0, b_norm, 1.0)
+        jax.lax.cond(
+            rel_resid > self.pressure_tol,
+            lambda r: jax.debug.print(
+                "[chorin] pressure NOT converged: rel residual {r:.3e} > tol "
+                "{t:.1e} (restart=20 x maxiter={m}); the step continues on an "
+                "UNCONVERGED pressure", r=r, t=self.pressure_tol,
+                m=self.pressure_maxit),
+            lambda r: None,
+            rel_resid,
         )
         Q_new = Q.at[e2s, :].set(p_new.reshape(nP, nc))
         Qaux_press_new = _refresh_pressure_aux(
