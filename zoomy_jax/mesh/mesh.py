@@ -26,10 +26,23 @@ def compute_derivatives(u, mesh, derivatives_multi_index=None, u_bf=None):
     just the neighbours made the matmul contract 5 against 4 and raise
     ``dot_general requires contracting dimensions to have the same shape``.
 
-    ``u_bf=None`` ⇒ extrapolation/Neumann-zero (the boundary block contributes
-    a zero delta), matching :func:`lsq_gradient_per_field`, which already did
-    this correctly — that divergence is why the per-field kernel worked while
-    this one raised.
+    ⚠ ``u_bf`` carries the value at the **GHOST-CELL** position (the symmetric
+    image of the inner cell through the boundary face), NOT at the face:
+
+    * ``u_bf=None`` ⇒ ghost = inner cell value = core's documented
+      ``'extrapolation'`` / Neumann-zero BC.  This is a **BC CHOICE**, not a
+      neutral default — core's ``_resolve_u_boundary_face`` RAISES on ``None``
+      precisely to force callers to state it.
+    * a prescribed face value must be passed as ``2*u_face - u_cell``.  Handing
+      in the bare face value puts a face-valued sample at a ghost-positioned
+      point and caps the boundary gradient at 1st order: measured 4.16 max err
+      vs 0.024 for the correct form on ``x**2+2x+1``.  (I made exactly this
+      mistake and briefly concluded the stencil was broken — it isn't.)
+
+    See ``zoomy_core.mesh.lsq_reconstruction._resolve_u_boundary_face`` for the
+    authoritative statement.  Exactness follows that convention: a LINEAR field
+    is exact everywhere including boundary cells; a quadratic is exact in the
+    interior, with the boundary set by the linear ghost extrapolation.
     """
     A_glob = mesh.lsq_gradQ
     neighbors = mesh.lsq_neighbors
