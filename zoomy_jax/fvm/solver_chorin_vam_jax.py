@@ -41,6 +41,7 @@ from zoomy_core.misc.misc import Zstruct
 from zoomy_core.systemmodel.system_model import SystemModel
 from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
 from zoomy_core.fvm.solver_chorin_vam_numpy import (
+    ChorinSplitVAMSolver as _CoreChorin,
     _pad_to_square, _substitute_dt,
 )
 
@@ -96,9 +97,6 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
                     "ChorinSplitVAMSolverJax: pass EITHER the positional "
                     "(sm_pred, sm_press, sm_corr) triple OR stages=[...], "
                     "not both.")
-            from zoomy_core.fvm.solver_chorin_vam_numpy import (
-                ChorinSplitVAMSolver as _CoreChorin,
-            )
             sm_pred, sm_press, sm_corr = _CoreChorin._bind_stages(stages)
         elif sm_pred is None or sm_press is None or sm_corr is None:
             raise TypeError(
@@ -258,6 +256,39 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
                 "state_index": int(entry["state_index"]),
                 "multi_index": tuple(entry["multi_index"]),
             })
+
+        # Elliptic-stage boundary conditions (REQ-174).  The BC *vocabulary* —
+        # what counts as a declared Dirichlet, how a PerFieldBoundary delegates
+        # per slot — is core's, so call core's parser instead of re-deriving it:
+        # one source of truth, and it follows core if the vocabulary moves.
+        # (Same reuse pattern as `_bind_stages`.)  It reads only `sm_press`,
+        # `_press_state_idx` and `nc` off self, plus four boundary attributes
+        # off the mesh, all of which MeshJAX carries.
+        # ``None`` ⇒ no pressure mode declares a Dirichlet ⇒ homogeneous
+        # Neumann, bit-identical to the pre-REQ-174 path.
+        self._press_dir = _CoreChorin._build_pressure_dirichlet(
+            self, self._rt_mesh)
+        if self._press_dir is None:
+            self._press_dir_j = None
+        else:
+            d = self._press_dir
+            self._press_dir_j = {
+                "face_mask": jnp.asarray(d["face_mask"]),
+                "face_value": jnp.asarray(d["face_value"]),
+                "bf_cells": jnp.asarray(np.asarray(d["bf_cells"]), dtype=int),
+                "cell_mask": jnp.asarray(d["cell_mask"]),
+                "cell_value": jnp.asarray(d["cell_value"]),
+                # Which modes carry ANY Dirichlet.  Static (host-side), so a
+                # mode with none keeps the literal `u_bf=None` fast path rather
+                # than a ghost array that merely reduces to it.
+                "modes": tuple(bool(m) for m in
+                               np.asarray(d["face_mask"]).any(axis=1)),
+            }
+            logger.info(
+                "REQ-174: elliptic stage carries declared P Dirichlet on modes "
+                "%s (%d pinned boundary faces)",
+                [k for k, m in enumerate(self._press_dir_j["modes"]) if m],
+                int(np.asarray(d["face_mask"]).sum()))
 
         logger.info(
             "ChorinSplitVAMSolverJax setup: pred → %s, press → %s, corr → %s "
@@ -444,12 +475,37 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         local_of_state = {int(s): k for k, s in enumerate(e2s)}
         press_aux_specs = self._press_aux_recompute
         mesh = self._rt_mesh
+        pdir = self._press_dir_j          # declared P Dirichlet BCs, or None
+
+        def _u_bf_ghost(k, p_mat):
+            """Boundary samples for mode ``k``'s LSQ derivative stencil (REQ-174).
+
+            ⚠ jax's ``u_bf`` is NOT numpy's ``u_boundary_face``.  core's
+            ``compute_derivatives`` takes FACE values and converts internally
+            (``_resolve_u_boundary_face``: ``ghost = 2·u_face − u_cell``);
+            ``lsq_gradient_per_field`` takes the **ghost/boundary-neighbour**
+            value DIRECTLY (``u_bf_delta = u_bf_i − u_i``, no conversion).  So
+            the ``2·u_face − u_cell`` lift is ours to apply.  Passing the bare
+            face value here puts a face-valued sample at the ghost position and
+            silently caps the boundary gradient at 1st order — measured 4.16 vs
+            0.024 in ``test_mesh_derivatives_recent.py``.
+
+            ``None`` ⇒ Neumann-zero (∂ₙP = 0), the standard Chorin pressure BC.
+            Non-Dirichlet faces take the inner-cell value, for which
+            ``2·u_cell − u_cell = u_cell`` reproduces that path exactly."""
+            if pdir is None or not pdir["modes"][k]:
+                return None
+            bf_cells = pdir["bf_cells"]
+            u_cell = p_mat[k, bf_cells]
+            face_vals = jnp.where(pdir["face_mask"][k],
+                                  pdir["face_value"][k], u_cell)
+            return 2.0 * face_vals - u_cell
 
         def _refresh_pressure_aux(p_mat, Qaux_work):
             for spec in press_aux_specs:
                 k = local_of_state[spec["state_index"]]
                 grad = lsq_gradient_per_field(
-                    mesh, p_mat[k, :], u_bf=None,
+                    mesh, p_mat[k, :], u_bf=_u_bf_ghost(k, p_mat),
                     multi_index=spec["multi_index"])
                 Qaux_work = Qaux_work.at[spec["row"], :].set(grad)
             return Qaux_work
@@ -458,7 +514,17 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
             p_mat = p_vec.reshape(nP, nc)
             Q_try = Q.at[e2s, :].set(p_mat)
             Qaux_work = _refresh_pressure_aux(p_mat, Qaux_press)
-            R = rt.source(Q_try, Qaux_work, p_full)
+            R = rt.source(Q_try, Qaux_work, p_full).reshape(nP, nc)
+            if pdir is not None:
+                # REAL Dirichlet rows (REQ-174): replace the elliptic PDE row at
+                # each pinned boundary cell with ``P_k[cell] − value = 0``.
+                # Carried inside the residual so BOTH the matrix-free matvec
+                # (``A·p = _residual(p) − b``) and the surfaced rel_resid see the
+                # system actually being solved.  No shift/penalty/rank fix — the
+                # operator is full-rank without any pin (v3); this is a
+                # wrong-problem fix, not a singularity fix.
+                R = jnp.where(pdir["cell_mask"],
+                              p_mat - pdir["cell_value"], R)
             return R.reshape(-1)
 
         b = _residual(jnp.zeros(N))

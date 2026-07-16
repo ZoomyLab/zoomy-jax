@@ -50,8 +50,14 @@ def _build():
     sm.attach_boundary_conditions(BoundaryConditions([
         Wall("left", on="momentum"), Wall("right", on="momentum"),
         Wall("bottom", on="momentum"), Wall("top", on="momentum"),
-        Dirichlet("top", on="P_0", value=0.0),     # pin P: the elliptic solve
-        Dirichlet("top", on="P_1", value=0.0),     # is singular otherwise
+        # ⚠ These pins are NOT a rank fix — that comment was my misconception.
+        # REQ-172 v3 measured the elliptic operator FULL-RANK with no pin at
+        # all (sigma_min ~3e-5 and RISING under refinement; LU solves to 1e-14).
+        # They're here only to fix P's otherwise-arbitrary additive constant.
+        # Pre-REQ-174 they were silently ignored anyway (hardcoded Neumann);
+        # they are now genuinely consumed — see test_elliptic_bc_jax_req174.py.
+        Dirichlet("top", on="P_0", value=0.0),
+        Dirichlet("top", on="P_1", value=0.0),
     ]))
 
     def ic(xv):
