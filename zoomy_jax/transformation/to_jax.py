@@ -7,10 +7,11 @@ import jax.numpy as jnp  # type: ignore[reportMissingImports]
 
 from zoomy_core.transformation.to_numpy import NumpyRuntimeModel, NumpyRuntimeSymbolic
 
-# Controlled by env so backend/precision benchmarks can compare float32 vs float64.
-# Default remains x64 for stability/parity.
-_enable_x64 = os.environ.get("ZOOMY_JAX_ENABLE_X64", "1").strip().lower() not in {"0", "false", "no"}
-jax.config.update("jax_enable_x64", _enable_x64)
+# x64 is configured in `zoomy_jax/__init__.py`, which Python runs on EVERY
+# `zoomy_jax.*` import.  Setting it here meant x64 was enabled only as a side
+# effect of importing a solver, so the mesh kernels silently ran float32 when
+# imported directly — see that module's note.  Re-exported for back-compat.
+from zoomy_jax import ZOOMY_JAX_ENABLE_X64 as _enable_x64
 
 
 def _legacy_module() -> dict:
