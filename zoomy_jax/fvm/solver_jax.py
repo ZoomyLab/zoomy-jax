@@ -808,6 +808,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         """
         nsm, source_model = self._coerce_to_nsm(model)
         self.nsm = nsm
+        # REQ-190: fill the adaptive strategy's ``dt_max`` cap from the NSM's
+        # standard ``dt_max`` unless the caller passed an explicit cap (explicit
+        # wins).  jax shares core's ``timestepping.adaptive``, so a wave-free
+        # (fully-dry) domain — every gated ``|λ| = 0`` → local CFL limits ``+inf``
+        # — then steps at ``dt_max`` instead of leaking ``inf``, identically to
+        # the numpy solver.  No-op for strategies without the hook (constant dt).
+        timestepping.apply_default_dt_max(self.compute_dt, nsm.dt_max)
         mesh = ensure_lsq_mesh(mesh, nsm)
         # Periodic BCs (REQ-116): remap ``boundary_face_cells`` at the periodic
         # seam to the partner cell across the wrap, exactly as numpy does
