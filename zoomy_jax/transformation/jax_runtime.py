@@ -156,10 +156,12 @@ def _lambdify_array(arr: sp.Array, arg_lists: Sequence[Sequence[sp.Symbol]],
                 flat.append(g)
         out = fn_flat(*flat)
         if shape:
-            # REQ-84: this asarray/reshape coercion of the flat lambdify output
-            # is the residual mixed-rank workaround; with ``uniform_rank`` above
-            # emitting uniform-rank rows it is now always stackable and can be
-            # retired once REQ-84 verification lands (jax steward owns removal).
+            # REQ-84: STRUCTURAL flat→shape reconstruction, NOT a retireable
+            # workaround — ``flat_expr = list(arr)`` flattens row-major, so this
+            # reshape restores the operator shape (e.g. SWE flux (4,2) from 8
+            # scalars); removing it returns a flat vector and downstream
+            # ``[i,j]`` reads silently go wrong.  (jax verified 2026-07-17; the
+            # mixed-rank stacking fix is ``uniform_rank`` above.)
             return jnp.asarray(out).reshape(shape)
         return jnp.asarray(out)
 
