@@ -314,7 +314,14 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # by row, never by prefix.
         fn = getattr(model, "update_aux_variables", None)
         if fn is not None:
-            local = fn(Q, Qaux, parameters)
+            # REQ-185: update_aux_variables is declared
+            # ``(Q, Qaux, p, time, position)`` — thread the current ``time``
+            # (a rain-rate aux ``r_o = Piecewise((rate, t<T_rain),(0,True))``
+            # binds it) and the per-cell centres (a manufactured spatial aux
+            # binds position).  ``mesh.cell_centers`` is 3-padded and sliced to
+            # this Q's column count; state-only aux (KP ``hinv``) ignores both.
+            local = fn(Q, Qaux, parameters, time=time,
+                       position=mesh.cell_centers[:, :Q.shape[-1]])
             if local.shape[0] != out.shape[0]:
                 raise ValueError(
                     f"update_aux_variables must be full-length "
@@ -365,14 +372,26 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
     def get_compute_source(self, mesh, runtime):
         """JIT-compiled source operator using JaxRuntime.source (which
-        is itself jit-vmap'd over the cell axis)."""
+        is itself jit-vmap'd over the cell axis).
+
+        REQ-185: the timestepping calls this as
+        ``(dt, time, Q, Qaux, parameters, dQ)`` and threads the current
+        simulation ``time``, the step ``dt`` and the inner-cell centre
+        positions into ``JaxRuntime.source`` (declared
+        ``source(Q, Qaux, p, time, dt, position)``), so a time/space-dependent
+        source binds them.  An autonomous source ignores the extra args
+        (the runtime defaults are the coordinate origin — bit-identical)."""
         nc = mesh.n_inner_cells
         rt_source = runtime.source
+        # Inner-cell centre positions (3, nc) — the length-3 position VECTOR X
+        # of the REQ-185 source signature; ``mesh.cell_centers`` is 3-padded.
+        cell_centers = mesh.cell_centers[:, :nc]
 
         @jax.jit
         @partial(jax.named_call, name="source")
-        def compute_source(dt, Q, Qaux, parameters, dQ):
-            S = rt_source(Q[:, :nc], Qaux[:, :nc], parameters)
+        def compute_source(dt, time, Q, Qaux, parameters, dQ):
+            S = rt_source(Q[:, :nc], Qaux[:, :nc], parameters,
+                          time=time, dt=dt, position=cell_centers)
             return dQ.at[:, :nc].set(S)
 
         return compute_source
@@ -950,7 +969,10 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             int(self._rt_mesh.n_inner_cells))
 
         # Source step (explicit Euler is fine — source is treated as O1).
-        Q = ode.RK1(self._rt_source_op, Q, Qaux, parameters, dt)
+        # REQ-185: thread the current ``time`` into the timestepping so a
+        # time-dependent source binds ``t`` (dt + cell positions are added by
+        # ``get_compute_source``).
+        Q = ode.RK1(self._rt_source_op, Q, Qaux, parameters, dt, time)
 
         return Q
 
