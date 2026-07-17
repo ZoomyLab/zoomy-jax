@@ -101,6 +101,17 @@ def _flat_symbols(zstruct_like) -> List[sp.Symbol]:
     return list(zstruct_like)
 
 
+def _group_symbols(group) -> List[sp.Symbol]:
+    """Flatten ONE declared signature group from
+    ``sm.operator_signature(name)`` to an ordered symbol list.  Vector
+    groups (variables / aux_variables / parameters / normal / position)
+    are Zstructs; the scalar groups (``time`` / ``dt``) are bare
+    Symbols."""
+    if isinstance(group, sp.Symbol):
+        return [group]
+    return _flat_symbols(group)
+
+
 def _lambdify_array(arr: sp.Array, arg_lists: Sequence[Sequence[sp.Symbol]],
                     module: dict) -> Callable:
     """Lambdify a (possibly empty) sympy Array against grouped
@@ -190,11 +201,17 @@ class JaxRuntime:
 
     * ``flux(Q, Qaux, parameters)``  →  ``(n_eq, n_dim, n_cells)``
     * ``hydrostatic_pressure(Q, Qaux, parameters)`` →  ``(n_eq, n_dim, n_cells)``
-    * ``source(Q, Qaux, parameters)`` →  ``(n_eq, n_cells)``
+    * ``source(Q, Qaux, parameters[, time, dt, position])`` →  ``(n_eq, n_cells)``
     * ``mass_matrix(Q, Qaux, parameters)`` → ``(n_eq, n_state, n_cells)``
     * ``nonconservative_matrix(Q, Qaux, parameters)`` → ``(n_eq, n_state, n_dim, n_cells)``
     * ``quasilinear_matrix(Q, Qaux, parameters)`` → same shape as NCP
     * ``eigenvalues(Q, Qaux, parameters, normal)`` →  ``(n_eq, n_cells)``
+
+    All registry-slot signatures are DERIVED from the SystemModel's
+    declared ``operator_signature`` (REQ-185); trailing groups beyond
+    ``(Q, Qaux, parameters)`` bind positionally in declared order or by
+    keyword, with ``time`` / ``dt`` defaulting to 0 and ``position`` to
+    the origin (exact for operators that don't reference them).
 
     Per-face (vmap over the face axis):
 
@@ -305,30 +322,36 @@ class JaxRuntime:
 
     def _build_cell_operators(self):
         sm = self.sm
-        # Standard signature: (Q_vec, Qaux_vec, p_vec) per cell.
+        # REQ-185: every registry-slot operator derives its lambdify arg
+        # lists from the DECLARED signature on the SystemModel
+        # (``sm.operator_signature`` via ``_build_slot_operator`` /
+        # ``_slot_arg_lists``) — this runtime translates syntax only and
+        # never re-declares arg lists.  ``std`` survives ONLY for the
+        # NON-slot model map ``state_update`` (a splitter product outside
+        # ``OPERATOR_ARG_SLOTS``), mirroring the generic-C / foam decision
+        # to leave non-slot lowerings hand-built.
         std = (self._q_syms, self._qaux_syms, self._p_syms)
-        # Signature with normal: (Q, Qaux, p, n).
-        eig = (self._q_syms, self._qaux_syms, self._p_syms, self._n_syms)
 
         # ── flux: (n_eq, n_dim)
-        self.flux = self._vmap_cell(
-            _lambdify_array(_to_array_of_exprs(sm.flux), std, self.module),
-            n_extra=0,
-        )
+        self.flux = self._build_slot_operator("flux", sm.flux)
         # ── hydrostatic_pressure: (n_eq, n_dim)
-        self.hydrostatic_pressure = self._vmap_cell(
-            _lambdify_array(_to_array_of_exprs(sm.hydrostatic_pressure),
-                            std, self.module),
-            n_extra=0,
-        )
-        # ── source: (n_eq, 1) → collapse trailing axis below
-        self.source = self._vmap_cell(
-            _lambdify_array(_to_array_of_exprs(sm.source), std, self.module),
-            n_extra=0, squeeze_trailing=True,
-        )
+        self.hydrostatic_pressure = self._build_slot_operator(
+            "hydrostatic_pressure", sm.hydrostatic_pressure)
+        # ── source: (n_eq, 1) → collapse trailing axis below.
+        # REQ-185: the source signature is DECLARED on the SystemModel
+        # (``operator_signature`` — the single source) and carries time + dt +
+        # the length-3 position vector; ``_build_slot_operator`` reads it and
+        # returns a backward-compatible callable ``source(Q, Qaux, p, time=0,
+        # dt=0, position=None)`` (defaults are the coordinate origin, EXACT for
+        # autonomous sources — same trailing-arg padding the numpy runtime uses).
+        self.source = self._build_slot_operator(
+            "source", sm.source, squeeze_trailing=True)
         # ── state_update: split-system corrector update (n_eq, 1) →
         # collapse trailing 1.  Optional — some sub-systems carry no
         # state_update slot, in which case the attribute is None.
+        # NON-slot model map (not in ``OPERATOR_ARG_SLOTS``): keeps the
+        # hand-built ``std`` arg list, like reconstruction_variables /
+        # interpolate_to_3d in the C-family printers.
         su = getattr(sm, "state_update", None)
         if su is not None:
             self.state_update = self._vmap_cell(
@@ -338,11 +361,8 @@ class JaxRuntime:
         else:
             self.state_update = None
         # ── mass_matrix: (n_eq, n_state)
-        self.mass_matrix = self._vmap_cell(
-            _lambdify_array(_to_array_of_exprs(sm.mass_matrix),
-                            std, self.module),
-            n_extra=0,
-        )
+        self.mass_matrix = self._build_slot_operator(
+            "mass_matrix", sm.mass_matrix)
         # ── source_jacobian_wrt_variables: (n_eq, n_state) — ∂S/∂Q (frozen aux).
         # ── source_jacobian_wrt_aux_variables: (n_eq, n_aux) — ∂S/∂aux.
         # Both are real fields on the SystemModel (channeled from the Model,
@@ -353,18 +373,14 @@ class JaxRuntime:
         # the (cheap) update_aux_variables map — no AD through ``source``.
         sj = getattr(sm, "source_jacobian_wrt_variables", None)
         if sj is not None:
-            self.source_jacobian_wrt_variables = self._vmap_cell(
-                _lambdify_array(_to_array_of_exprs(sj), std, self.module),
-                n_extra=0,
-            )
+            self.source_jacobian_wrt_variables = self._build_slot_operator(
+                "source_jacobian_wrt_variables", sj)
         else:
             self.source_jacobian_wrt_variables = None
         sja = getattr(sm, "source_jacobian_wrt_aux_variables", None)
         if sja is not None and _shape(_to_array_of_exprs(sja)):
-            self.source_jacobian_wrt_aux_variables = self._vmap_cell(
-                _lambdify_array(_to_array_of_exprs(sja), std, self.module),
-                n_extra=0,
-            )
+            self.source_jacobian_wrt_aux_variables = self._build_slot_operator(
+                "source_jacobian_wrt_aux_variables", sja)
         else:
             self.source_jacobian_wrt_aux_variables = None
         # ── update_variables: (n_eq, 1) per-cell state hygiene
@@ -374,11 +390,13 @@ class JaxRuntime:
         # ``update_q`` short-circuits to a no-op via ``getattr``.
         uv = getattr(sm, "update_variables", None)
         if uv is not None and _shape(_to_array_of_exprs(uv)):
-            self.update_variables = self._vmap_cell(
-                _lambdify_array(_to_array_of_exprs(uv),
-                                std, self.module),
-                n_extra=0, squeeze_trailing=True,
-            )
+            # REQ-185: declared ``update_variables(Q, Qaux, p, dt)`` — dt is
+            # load-bearing in the Chorin corrector, where it is baked in as a
+            # model PARAMETER and the declared dt group is dropped again
+            # (duplicate lambdify argument, see ``_slot_arg_lists``).  Callers
+            # keep the 3-arg form; ``dt=...`` reaches a non-Chorin remap.
+            self.update_variables = self._build_slot_operator(
+                "update_variables", uv, squeeze_trailing=True)
         else:
             self.update_variables = None
         # ── update_aux_variables: (n_aux, 1) per-cell aux formula (e.g. the
@@ -388,11 +406,12 @@ class JaxRuntime:
         # model declares no per-cell aux formula), and the slot short-circuits.
         uav = getattr(sm, "update_aux_variables", None)
         if uav is not None and _shape(_to_array_of_exprs(uav)):
-            self.update_aux_variables = self._vmap_cell(
-                _lambdify_array(_to_array_of_exprs(uav),
-                                std, self.module),
-                n_extra=0, squeeze_trailing=True,
-            )
+            # REQ-185: declared signature carries time + position (no dt);
+            # backward-compatible ``update_aux_variables(Q, Qaux, p, time=0,
+            # position=None)`` — a rain-rate aux binds ``t``, a manufactured
+            # ``S(x)`` binds position; state-only aux ignores them.
+            self.update_aux_variables = self._build_slot_operator(
+                "update_aux_variables", uav, squeeze_trailing=True)
         else:
             self.update_aux_variables = None
         # ── diffusion_matrix / diffusion_matrix_explicit:
@@ -402,24 +421,21 @@ class JaxRuntime:
         # that fold diffusion into the convective flux can ignore them.
         dm = getattr(sm, "diffusion_matrix", None)
         if dm is not None and _shape(_to_array_of_exprs(dm)):
-            self.diffusion_matrix = self._vmap_cell(
-                _lambdify_array(_to_array_of_exprs(dm),
-                                std, self.module),
-                n_extra=0,
-            )
+            self.diffusion_matrix = self._build_slot_operator(
+                "diffusion_matrix", dm)
         else:
             self.diffusion_matrix = None
         dme = getattr(sm, "diffusion_matrix_explicit", None)
         if dme is not None and _shape(_to_array_of_exprs(dme)):
-            self.diffusion_matrix_explicit = self._vmap_cell(
-                _lambdify_array(_to_array_of_exprs(dme),
-                                std, self.module),
-                n_extra=0,
-            )
+            self.diffusion_matrix_explicit = self._build_slot_operator(
+                "diffusion_matrix_explicit", dme)
         else:
             self.diffusion_matrix_explicit = None
         # ── interpolate_to_3d: (n_3d_components,)  signature
         # ``(Q, Qaux, p, position)`` where ``position = [X0, X1, X2]``.
+        # NON-slot model map (not in ``OPERATOR_ARG_SLOTS``): hand-built
+        # arg list, matching the generic-C / foam printers which also keep
+        # their interpolate_to_3d lowerings backend-local.
         # Vmapped over the cell axis with ``position`` broadcast per
         # cell so callers can hand in a per-cell ``(3, n_cells)``
         # position array (typically constant ``(x_cell, y_cell, z*)``
@@ -462,38 +478,29 @@ class JaxRuntime:
         else:
             self.interpolate_to_3d = None
         # ── nonconservative_matrix: (n_eq, n_state, n_dim)
-        self.nonconservative_matrix = self._vmap_cell(
-            _lambdify_array(_to_array_of_exprs(sm.nonconservative_matrix),
-                            std, self.module),
-            n_extra=0,
-        )
+        self.nonconservative_matrix = self._build_slot_operator(
+            "nonconservative_matrix", sm.nonconservative_matrix)
         # ── quasilinear_matrix: (n_eq, n_state, n_dim)
-        self.quasilinear_matrix = self._vmap_cell(
-            _lambdify_array(_to_array_of_exprs(sm.quasilinear_matrix),
-                            std, self.module),
-            n_extra=0,
-        )
-        # ── eigenvalues: takes normal — signature (Q, Qaux, p, n).
-        # Two paths:
-        #   * symbolic eigenvalues present → lambdify directly.
+        self.quasilinear_matrix = self._build_slot_operator(
+            "quasilinear_matrix", sm.quasilinear_matrix)
+        # ── eigenvalues: declared ``(Q, Qaux, p, n)`` — the normal group is
+        # a deliberate deviation from the ruling's condensed list, pinned by
+        # the committed REQ-185 C ABI.  Two paths:
+        #   * symbolic eigenvalues present → lambdify against the declared
+        #     signature (normal is per-cell, vmap axis 1).
         #   * eigenvalues is None (chain Chorin convention) → fall
         #     back to numerical eigvals(quasilinear · n) per cell.
         eig_def = sm.eigenvalues
         eig_arr = _to_array_of_exprs(eig_def)
         eig_shape_cell = _shape(eig_arr)
         if eig_shape_cell and all(s > 0 for s in eig_shape_cell):
-            eig_fn = _lambdify_array(eig_arr, eig, self.module)
-
-            @jax.jit
-            def _eig_full(Q, Qaux, parameters, normal):
-                def per_cell(q, qaux, n):
-                    return eig_fn(q, qaux, parameters, n)
-                return jax.vmap(per_cell, in_axes=(1, 1, 1),
-                                out_axes=-1)(Q, Qaux, normal)
-            self.eigenvalues = _eig_full
+            self.eigenvalues = self._build_slot_operator(
+                "eigenvalues", eig_def)
         else:
             ql_arr = _to_array_of_exprs(sm.quasilinear_matrix)
-            ql_fn = _lambdify_array(ql_arr, std, self.module)
+            ql_fn = _lambdify_array(
+                ql_arr, self._slot_arg_lists("quasilinear_matrix")[1],
+                self.module)
             n_state = self.n_state
             n_dim = self.n_dim
 
@@ -538,6 +545,104 @@ class JaxRuntime:
             return out
         return full_grid
 
+    # Signature groups whose runtime arrays vary PER CELL (vmap axis 1);
+    # the rest (parameters, time, dt) broadcast unbatched.
+    _PER_CELL_GROUPS = ("variables", "aux_variables", "normal", "position")
+
+    def _slot_arg_lists(self, name):
+        """``(keys, arg_lists)`` for registry-slot operator ``name``, read off
+        the DECLARED signature ``sm.operator_signature(name)`` — the REQ-185
+        boundary API, the same ``Function.args`` the C-family and numpy
+        printers consume.  The symbols come from the signature groups
+        themselves, so this runtime translates SYNTAX only and never
+        re-declares arg lists.
+
+        One jax lowering-SYNTAX constraint, mirroring numpy's
+        ``NumpyRuntimeModel._op_sig``: when a split sub-system baked ``dt``
+        in as a model PARAMETER (Chorin/VAM), the declared ``dt`` group is
+        the SAME symbol as the parameter and must be dropped from the
+        lambdify args (duplicate argument) — a lowering constraint, not a
+        signature difference."""
+        sig = self.sm.operator_signature(name)
+        dt_in_params = bool(self.sm.parameters.contains("dt"))
+        keys = [k for k in sig.keys() if not (k == "dt" and dt_in_params)]
+        return keys, tuple(_group_symbols(sig[k]) for k in keys)
+
+    def _build_slot_operator(self, name, definition, *, squeeze_trailing=False):
+        """Build a registry-slot operator whose lambdify signature carries
+        the DECLARED groups (variables, aux_variables, parameters, [normal],
+        [time], [dt], [position]) from ``_slot_arg_lists(name)`` — no local
+        arg-list re-declaration (REQ-185).  Generalizes the coord-operator
+        builder to EVERY slot: ``(Q, Qaux, p)``-only slots reduce exactly to
+        the classic per-cell vmap.
+
+        The returned callable is backward-compatible:
+        ``fn(Q, Qaux, parameters, *extras, **extras)``.  Trailing declared
+        groups bind positionally in FULL declared-signature order (so
+        ``eigenvalues(Q, Qaux, p, n)`` and ``source(Q, Qaux, p, t, dt, x)``
+        read naturally, and a positionally-passed ``dt`` still lands on the
+        dt slot even when the Chorin drop removed it) or by keyword.
+        ``time`` / ``dt`` default to 0 and ``position`` to the coordinate
+        origin ``zeros((3, n_cells))`` — EXACT for operators that don't
+        reference them, so existing 3-arg solver call sites are unchanged;
+        ``position`` follows the mesh's 3-padded convention.  Extras passed
+        to a slot that doesn't declare them are accepted and IGNORED
+        (mirrors the numpy flattener's trailing-``dt`` tolerance).
+        ``uniform_rank`` anchoring stays on the ``variables`` group — always
+        first in every declared slot."""
+        keys, arg_lists = self._slot_arg_lists(name)
+        per_cell_fn = _lambdify_array(
+            _to_array_of_exprs(definition), arg_lists, self.module)
+        cell_keys = tuple(k for k in keys if k in self._PER_CELL_GROUPS)
+        # Positional binding of trailing groups uses the FULL declared key
+        # order (pre dt-drop) so positional call sites are drop-invariant.
+        declared = list(self.sm.operator_signature(name).keys())
+        trailing_keys = tuple(k for k in declared
+                              if k not in ("variables", "aux_variables",
+                                           "parameters"))
+
+        @jax.jit
+        def _jitted(*groups):
+            bound = dict(zip(keys, groups))
+
+            def per_cell(*cell_vals):
+                local = {**bound, **dict(zip(cell_keys, cell_vals))}
+                return per_cell_fn(*(local[k] for k in keys))
+
+            out = jax.vmap(per_cell, in_axes=(1,) * len(cell_keys),
+                           out_axes=-1)(*(bound[k] for k in cell_keys))
+            if squeeze_trailing and out.ndim >= 3 and out.shape[-2] == 1:
+                out = jnp.squeeze(out, axis=-2)
+            return out
+
+        def full_grid(Q, Qaux, parameters, *args, **kwargs):
+            extras = dict(zip(trailing_keys, args))
+            extras.update(kwargs)
+            groups = []
+            for k in keys:
+                if k == "variables":
+                    groups.append(Q)
+                elif k == "aux_variables":
+                    groups.append(Qaux)
+                elif k == "parameters":
+                    groups.append(parameters)
+                elif extras.get(k) is not None:
+                    v = extras[k]
+                    groups.append(jnp.asarray(v, float)
+                                  if k in ("time", "dt") else v)
+                elif k in ("time", "dt"):
+                    groups.append(jnp.asarray(0.0))
+                elif k == "position":
+                    groups.append(jnp.zeros((3, Q.shape[-1])))
+                else:
+                    raise TypeError(
+                        f"{name}: declared arg group '{k}' not supplied — "
+                        f"pass it positionally after parameters or as "
+                        f"{k}=...")
+            return _jitted(*groups)
+
+        return full_grid
+
     # ── Per-face Riemann numerics ────────────────────────────────
 
     def _build_face_operators(self):
@@ -573,7 +678,7 @@ class JaxRuntime:
         if has_symbolic_eig:
             _eig_scalar = _lambdify_array(
                 eig_arr,
-                (self._q_syms, self._qaux_syms, self._p_syms, self._n_syms),
+                self._slot_arg_lists("eigenvalues")[1],
                 self.module,
             )
 
@@ -592,7 +697,7 @@ class JaxRuntime:
             ql_arr = _to_array_of_exprs(self.sm.quasilinear_matrix)
             _ql_scalar = _lambdify_array(
                 ql_arr,
-                (self._q_syms, self._qaux_syms, self._p_syms),
+                self._slot_arg_lists("quasilinear_matrix")[1],
                 self.module,
             )
             n_dim = self.n_dim
@@ -616,6 +721,9 @@ class JaxRuntime:
 
         # Per-face signature: (Q_minus, Q_plus, Qaux_minus, Qaux_plus,
         #                      parameters, normal) — all vectors.
+        # NOT a registry slot: the minus/plus trace symbols are OWNED by the
+        # Numerics object (per-face Riemann composite), so this signature is
+        # read off ``numerics``, not ``OPERATOR_ARG_SLOTS``.
         face_sig = (
             list(numerics.variables_minus),
             list(numerics.variables_plus),
