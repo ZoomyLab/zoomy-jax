@@ -413,8 +413,11 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return apply_boundary_conditions
 
     def get_compute_max_abs_eigenvalue(self, mesh, runtime):
-        """Max |eigenvalue| over the faces, using JaxRuntime.eigenvalues
-        (which is jit-vmap'd per cell)."""
+        """PER-FACE max |eigenvalue|, using JaxRuntime.eigenvalues
+        (jit-vmap'd per cell).  Returns an ``(n_faces,)`` array (NOT a global
+        scalar) so the CFL couples each face's wave speed to its LOCAL cell
+        size; ``compute_dt`` takes the min over faces -> ``min_f(h/λ)``, instead
+        of the over-conservative ``global_min(h)/global_max(λ)``."""
         rt_eig = runtime.eigenvalues
 
         @jax.jit
@@ -423,9 +426,14 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             iA = mesh.face_cells[0]
             iB = mesh.face_cells[1]
             normal = mesh.face_normals
-            evA = rt_eig(Q[:, iA], Qaux[:, iA], parameters, normal)
-            evB = rt_eig(Q[:, iB], Qaux[:, iB], parameters, normal)
-            return jnp.maximum(jnp.abs(evA).max(), jnp.abs(evB).max())
+            evA = jnp.abs(rt_eig(Q[:, iA], Qaux[:, iA], parameters, normal))
+            evB = jnp.abs(rt_eig(Q[:, iB], Qaux[:, iB], parameters, normal))
+            # Reduce the eigenvalue axis, KEEP the face axis (last).
+            if evA.ndim > 1:
+                red = tuple(range(evA.ndim - 1))
+                evA = jnp.max(evA, axis=red)
+                evB = jnp.max(evB, axis=red)
+            return jnp.maximum(evA, evB)
 
         return compute_max_abs_eigenvalue
 
@@ -818,8 +826,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             jax_mesh, runtime_model
         )
 
-        # Precompute scalar used for CFL
-        self._rt_min_inradius = jnp.min(jax_mesh.cell_inradius)
+        # Precompute PER-FACE cell size for the LOCAL CFL: couple each face's
+        # wave speed (per-face) to the smaller of its two adjacent cells'
+        # inradii; compute_dt takes min over faces -> min_f(h/λ), NOT the
+        # over-conservative global_min(inradius)/global_max(λ).
+        _ir = jax_mesh.cell_inradius
+        self._rt_inradius_face = jnp.minimum(
+            _ir[jax_mesh.face_cells[0]], _ir[jax_mesh.face_cells[1]])
 
         # Initial aux update
         Qaux = self.update_qaux(
@@ -1043,7 +1056,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return self.compute_dt(
             Q, Qaux,
             (self._rt_parameters if parameters is None else parameters),
-            self._rt_min_inradius, self._rt_eigenvalue_op,
+            self._rt_inradius_face, self._rt_eigenvalue_op,
         )
 
     def run_simulation(self, Q, Qaux, write_output=True, parameters=None):
