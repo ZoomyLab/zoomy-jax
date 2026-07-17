@@ -44,6 +44,7 @@ import sympy as sp
 
 from zoomy_core.fvm.riemann_solvers import Numerics
 from zoomy_core.numerics import NumericalSystemModel
+from zoomy_core.transformation.vectorize import uniform_rank
 
 
 # ── JAX module dict for sp.lambdify ──────────────────────────────────
@@ -115,6 +116,19 @@ def _lambdify_array(arr: sp.Array, arg_lists: Sequence[Sequence[sp.Symbol]],
     ``n0``, but ``mesh.face_normals`` is shape ``(3, n_faces)``).
     """
     shape = _shape(arr)
+    # REQ-84: shared constant-entry rank-normalization seam
+    # (``zoomy_core.transformation.vectorize.uniform_rank``, the same helper
+    # the numpy printer uses).  The FIRST arg group is the state group — mirror
+    # to_numpy's convention (vector_symbols = state, anchor = first state
+    # symbol).  Wrapping each state-free constant entry with
+    # ``zeros_like(anchor)`` / ``c*ones_like(anchor)`` lifts short rows (e.g.
+    # MalpassetSWE's identically-zero bathymetry flux row) to the batch rank of
+    # their siblings so the generated ``jnp.array`` stacks them; ``ones_like`` /
+    # ``zeros_like`` bind to ``jnp.*`` via the module dict (userfunctions.py).
+    if arg_lists and shape and all(int(s) > 0 for s in shape):
+        state_syms = tuple(arg_lists[0])
+        if state_syms:
+            arr = uniform_rank(arr, state_syms, state_syms[0])
     counts = [len(group) for group in arg_lists]
     flat_args = [sym for group in arg_lists for sym in group]
     flat_expr = list(arr) if shape else []
@@ -142,6 +156,10 @@ def _lambdify_array(arr: sp.Array, arg_lists: Sequence[Sequence[sp.Symbol]],
                 flat.append(g)
         out = fn_flat(*flat)
         if shape:
+            # REQ-84: this asarray/reshape coercion of the flat lambdify output
+            # is the residual mixed-rank workaround; with ``uniform_rank`` above
+            # emitting uniform-rank rows it is now always stackable and can be
+            # retired once REQ-84 verification lands (jax steward owns removal).
             return jnp.asarray(out).reshape(shape)
         return jnp.asarray(out)
 
