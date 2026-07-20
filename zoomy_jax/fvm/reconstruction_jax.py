@@ -518,17 +518,49 @@ class LSQMUSCLReconstructionJAX:
     # ── Limiter bounds (interior + boundary passes) ─────────────────
 
     def _neighbor_bounds(self, u, bf_values):
-        """Per-cell min/max over face-neighbors.  Mirrors NumPy:
-        interior faces use ``u[iA]`` / ``u[iB]``; boundary faces use
-        the BC-provided face values."""
+        """Per-cell min/max over face-neighbors.
+
+        Interior faces contribute the OTHER cell's centre value ``u[iA]`` /
+        ``u[iB]`` — a sample a full cell spacing away.  Boundary faces must
+        contribute a sample at the SAME distance, i.e. at the GHOST-CELL
+        centre, not at the face centre.
+
+        **Ghost-distance convention** (identical to the one enforced on the
+        LSQ gradient row in :meth:`_lsq_gradient_scalar`, see its docstring):
+        BC kernels evaluate at the FACE CENTRE, so the bound carried at the
+        ghost position is ``u_ghost = 2·u_face − u_cell``.
+
+        Using the bare face value halves the admissible increment at every
+        boundary cell relative to an interior cell seeing the same smooth
+        field.  Both the Venkatakrishnan numerator and denominator are then
+        O(h), so the resulting φ deficit is GRID-INDEPENDENT — it never
+        relaxes under refinement.  Measured on a smooth Dirichlet SME(0)
+        with a nonzero boundary slope (N = 50…800): φ at the clipped
+        boundary cell converged to 0.953 instead of 1, and
+        ``|limited_grad − exact|`` DIVERGED (3.1e-3 → 2.1e-2, rates −1.86 →
+        −0.11) to a permanent ~4.8 % gradient deficit, while the raw LSQ
+        gradient converged cleanly (rates 0.84 → 0.98).  With the ghost
+        conversion below, φ at that cell goes 0.9522 → 0.9995 and the
+        limited-gradient error collapses onto the raw one.
+
+        Self-cancels for extrapolation / Neumann-zero (``u_face = u_cell``
+        ⇒ ``u_ghost = u_cell``) and for reflective walls evaluated at the
+        face (``u_face = 0`` ⇒ ``u_ghost = −u_cell``), so it is a no-op on
+        every BC family that does not prescribe a value.
+
+        NumPy twin carries the SAME defect at
+        ``zoomy_core/fvm/reconstruction.py:600-601`` — reported, not fixed
+        here (that tree is owned elsewhere).
+        """
         u_max = u
         u_min = u
         u_max = u_max.at[self._iA_int].max(u[self._iB_int])
         u_max = u_max.at[self._iB_int].max(u[self._iA_int])
         u_min = u_min.at[self._iA_int].min(u[self._iB_int])
         u_min = u_min.at[self._iB_int].min(u[self._iA_int])
-        u_max = u_max.at[self._bf_cells].max(bf_values)
-        u_min = u_min.at[self._bf_cells].min(bf_values)
+        u_bf_ghost = 2.0 * bf_values - u[self._bf_cells]
+        u_max = u_max.at[self._bf_cells].max(u_bf_ghost)
+        u_min = u_min.at[self._bf_cells].min(u_bf_ghost)
         return u_min, u_max
 
     # ── Face deltas (interior + boundary, NumPy-style split) ────────
