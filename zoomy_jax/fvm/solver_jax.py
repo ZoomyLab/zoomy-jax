@@ -576,10 +576,29 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # part).  Active only when the reconstruction exposes its limited
         # gradient (plain LSQ-MUSCL); order 1 has slope ≡ 0.
         rt_ncm = getattr(runtime, "nonconservative_matrix", None)
+        # ``hasattr`` is NOT a valid test here and was the bug: it succeeds on
+        # an INHERITED base-class ``reconstruct_with_grad``, so a subclass that
+        # puts its positivity / wet-dry / WB treatment only in ``__call__``
+        # (as PositivityPreservingLSQMUSCLJAX and FreeSurfaceLSQMUSCLJAX both
+        # did) silently routed the order≥2 NCP path through the UNTREATED base
+        # implementation.  Measured on a 1-D draining bed: the two paths
+        # returned face states differing by 3.125e-03, with min h_face = 0 via
+        # ``__call__`` but −3.125e-03 (NEGATIVE DEPTH) via the inherited
+        # ``reconstruct_with_grad``.  The guard below was written to catch
+        # exactly this and was defeated by attribute inheritance.
+        #
+        # A class opts in by providing its OWN ``reconstruct_with_grad``, or —
+        # if it deliberately reuses a parent's implementation unchanged — by
+        # declaring ``supports_grad_recon = True`` in its own class body.
+        # Inheriting either one is not opting in.
+        _cls = type(reconstruct)
+        _grad_recon_ok = (
+            "reconstruct_with_grad" in _cls.__dict__
+            or bool(_cls.__dict__.get("supports_grad_recon", False)))
         use_interior_ncp = bool(
             self.nsm.reconstruction.order >= 2
             and rt_ncm is not None
-            and hasattr(reconstruct, "reconstruct_with_grad"))
+            and _grad_recon_ok)
         if (self.nsm.reconstruction.order >= 2 and rt_ncm is not None
                 and not use_interior_ncp):
             # Silently dropping the interior NCP at order >= 2 loses
@@ -589,9 +608,15 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             raise NotImplementedError(
                 f"order-{self.nsm.reconstruction.order} with a nonzero "
                 "nonconservative_matrix requires the reconstruction to "
-                "provide reconstruct_with_grad (limited cell gradient) "
-                "for the cell-interior NCP integral; "
-                f"{type(reconstruct).__name__} does not.")
+                "provide its OWN reconstruct_with_grad (limited cell "
+                "gradient) for the cell-interior NCP integral; "
+                f"{_cls.__name__} does not define one. Inheriting it from a "
+                "base class does NOT count: a subclass that only overrides "
+                "__call__ would run the base reconstruction with its "
+                "positivity / wet-dry / well-balancing treatment skipped. "
+                "Either implement reconstruct_with_grad on "
+                f"{_cls.__name__}, or — if reusing the parent's is genuinely "
+                "correct — declare supports_grad_recon = True on it.")
 
         # ── Explicit diffusion (REQ-50) ──────────────────────────────────
         # dQ += ∇·(A:∇Q) from the model's rank-4 ``diffusion_matrix_explicit``
