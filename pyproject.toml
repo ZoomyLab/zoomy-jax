@@ -41,3 +41,21 @@ Issues = "https://github.com/mbd-rwth/Zoomy/issues"
 
 [tool.setuptools.packages.find]
 include = ["zoomy_jax*"]
+
+# Standalone runs (rootdir = zoomy_jax, where the superrepo pytest.ini and
+# root conftest are invisible).  Marker names follow the SUPERREPO
+# conventions (small/medium/large/regression + the jax stack tag) — never
+# zoomy_core's pyproject-local gate/rederive/area names, which superrepo-root
+# runs cannot see.  Under the superrepo, its pytest.ini owns configuration
+# and auto-marks these tests jax + small; the explicit in-file markers keep
+# standalone runs warning-free and addressable.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+markers = [
+  "small: fast default-tier test (superrepo convention)",
+  "medium: mid-cost test (superrepo convention)",
+  "large: real time-march / simulation test; deselected by default, enable with --run-large (>5 min individually is large)",
+  "regression: end-state march asserted against blessed baselines in tests/goldens",
+  "jax: requires the jax stack (auto-applied by the superrepo conftest)",
+]
