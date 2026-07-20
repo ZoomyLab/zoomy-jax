@@ -23,11 +23,10 @@ def test_vam_chorin_short(overwrite):
     triple = chorin_split_for(model, sm)
     print(describe(triple[0]))                     # SM_pred
     set_state_width(triple[0])
-    sm.initial_conditions = IC.UserFunction(function=bump_ic)
 
     mesh = LSQMesh.create_1d(domain=ESC_DOMAIN, n_inner_cells=ESC_NCELLS)
     t0 = time.perf_counter()
-    Q, Qaux = chorin_march(triple, mesh, cfl=CFL_1D, t_end=0.5,
+    Q, Qaux = chorin_march(triple, mesh, cfl=CFL_1D, ic=bump_ic, t_end=0.5,
                            h_scale=ESC_H_RES)
     elapsed = time.perf_counter() - t0
 
@@ -47,12 +46,11 @@ def test_vam_smooth_small(overwrite):
     triple = chorin_split_for(model, sm)
     print(describe(triple[0]))
     set_state_width(triple[0])
-    sm.initial_conditions = IC.UserFunction(function=smooth_vam_ic)
 
     mesh = LSQMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=20)
     t0 = time.perf_counter()
-    Q, Qaux = chorin_march(triple, mesh, cfl=CFL_1D, n_steps=2,
-                           pressure_tol=1e-13)
+    Q, Qaux = chorin_march(triple, mesh, cfl=CFL_1D, ic=smooth_vam_ic,
+                           n_steps=2, pressure_tol=VAM_PRESSURE_TOL)
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all()

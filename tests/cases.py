@@ -38,6 +38,27 @@ AHS26_DOMAIN, AHS26_T_END = (0.0, 1.0), 0.5
 ESC_DOMAIN, ESC_NCELLS = (-1.5, 1.5), 60
 ESC_H_RES, ESC_H_DRY = 0.34, 0.015
 
+# Pressure tolerance for the SMOOTH periodic VAM runs (the Richardson order
+# study and its small twin).  The spec's 1e-13 is KEPT DELIBERATELY, as a
+# TRUTHFUL request that the solver currently cannot meet — do not loosen it to
+# silence the warning, because the warning is the finding.
+#
+# MEASURED: the matrix-free GMRES reaches 1e-13 at n = 64, but STAGNATES on
+# refinement — rel residual 1.4e-04 at n = 128 and ~6e-03 at n = 256.  It is
+# stagnation, not an exhausted budget: quadrupling ``pressure_maxit``
+# 100 -> 400 (2000 -> 8000 matvecs) leaves the n = 128 residual at 1.432e-04,
+# bit-identical.  The elliptic block is solved UNPRECONDITIONED, so its
+# condition number grows like O(1/h^2) and the attainable residual degrades
+# with every refinement.
+#
+# CONSEQUENCE, and why ``test_vam_second_order`` fails: the error in the
+# pressure modes is then set by the solver residual rather than by the
+# discretization, so P_0 / P_1 DIVERGE under refinement (per-row Richardson
+# rates -1.60 / -1.87) while the conservative rows h, q_0, q_1, r_0, r_1 all
+# converge with positive rates.  Loosening this constant would hide a real
+# defect behind a number that merely looks converged.
+VAM_PRESSURE_TOL = 1e-13
+
 # The cached SWASHES analytic tables live in the thesis case; zoomy_jax always
 # sits inside the superrepo, so this relative hop is stable.
 SWASHES_REF_DIR = (pathlib.Path(__file__).resolve().parents[3]
@@ -392,12 +413,28 @@ def chorin_split_for(model, sm):
     return (r.SM_pred, r.SM_press, r.SM_corr)
 
 
-def chorin_march(triple, mesh, cfl, t_end=None, n_steps=None,
+def chorin_march(triple, mesh, cfl, ic, t_end=None, n_steps=None,
                  h_scale=1.0, **solver_kw):
     """March the jax Chorin split VAM solver; return the inner (Q, Qaux).
 
     Fixed dt at the 1-D CFL law from the still depth ``h_scale`` — the split
     solver has no adaptive controller.  Exactly one of ``t_end`` / ``n_steps``.
+
+    ``ic`` is the initial-condition CALLABLE and is MANDATORY.  It is applied
+    to the solver state HERE, explicitly, because
+    ``ChorinSplitVAMSolverJax.setup_simulation`` **ignores initial conditions
+    entirely** — the string ``initial_conditions`` does not occur anywhere in
+    ``zoomy_jax/fvm/solver_chorin_vam_jax.py``.  Assigning
+    ``sm.initial_conditions`` (what the first cut of these tests did) is a
+    silent no-op: the march then ran from h == 0 in every cell, the elliptic
+    pressure block's bare 1/h went singular, GMRES burned its whole restart
+    budget every step, and the "reference" was a null state.  The thesis case
+    ``thesis/cases/escalante_vam_bump/run_jax.py:39-46`` injects the state by
+    hand for exactly this reason; this mirrors that proven pattern.
+
+    Time loop: ``run_jit_steps`` (jit + ``lax.scan``), NOT the ``step()``
+    wrapper.  ``step()`` drives ``chorin_cycle`` EAGERLY — measured 2.66 s per
+    step against 3.4 ms through the scan, bit-identical output (max|diff| = 0).
     """
     import jax.numpy as jnp
     from zoomy_jax.fvm.solver_chorin_vam_jax import ChorinSplitVAMSolverJax
@@ -406,19 +443,36 @@ def chorin_march(triple, mesh, cfl, t_end=None, n_steps=None,
         raise TypeError("chorin_march() takes exactly one of t_end / n_steps")
     sm_pred, sm_press, sm_corr = triple
     solver = ChorinSplitVAMSolverJax(sm_pred, sm_press, sm_corr, **solver_kw)
-    Q = solver.setup_simulation(mesh)
+    Q0 = np.array(solver.setup_simulation(mesh))     # writable host copy
+    nc = solver.nc
+
+    # ── explicit IC injection (see docstring) ──
+    xc = np.asarray(solver._rt_mesh.cell_centers)[:, :nc]
+    for j in range(nc):
+        Q0[:, j] = ic(xc[:, j])
+    # HARD guard: a dry-everywhere state is the exact failure this function
+    # exists to prevent, and it is otherwise invisible (it "runs", just ~780x
+    # slower and against a meaningless reference).  Fail, never warn.
+    assert Q0[1, :nc].max() > 0.0, (
+        "chorin_march: initial depth is zero in EVERY cell — the IC did not "
+        "reach the solver state. ChorinSplitVAMSolverJax ignores "
+        "sm.initial_conditions; the IC must be injected here.")
+    solver._sim_Q = jnp.asarray(Q0)
     solver.update_aux_variables()
-    Q, Qaux = solver._sim_Q, solver._sim_Qaux
 
     dx = float(np.asarray(solver._rt_mesh.cell_volumes)[0])
     dt = cfl * dx / (np.sqrt(G * h_scale) + 1.0)
     if n_steps is None:
-        n_steps = int(np.ceil(t_end / dt))
-    t = jnp.asarray(0.0)
-    for _ in range(n_steps):
-        Q = solver.step(jnp.asarray(dt), t, Q, Qaux)
-        t = t + dt
-    nc = solver.nc
+        # Land EXACTLY on t_end: take the CFL dt as an UPPER bound, then
+        # shrink it to divide t_end evenly.  dt only ever DECREASES here (by
+        # < one step's worth), so this respects the CFL law rather than
+        # relaxing it — the old ``ceil`` overshot t_end by up to a full step
+        # (measured t = 0.5095 for a requested 0.5).
+        n_steps = max(1, int(np.ceil(t_end / dt)))
+        dt = t_end / n_steps
+    Q, Qaux, _, _, _ = solver.run_jit_steps(
+        jnp.asarray(dt), n_steps, solver._sim_Q, solver._sim_Qaux,
+        solver.Qaux_press, solver.Qaux_corr, t_start=0.0)
     return np.asarray(Q)[:, :nc], np.asarray(Qaux)[:, :nc]
 
 

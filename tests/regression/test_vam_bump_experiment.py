@@ -22,11 +22,10 @@ def test_bump_vs_experiment(overwrite):
     triple = chorin_split_for(model, sm)
     print(describe(triple[0]))
     set_state_width(triple[0])
-    sm.initial_conditions = IC.UserFunction(function=bump_ic)
 
     mesh = LSQMesh.create_1d(domain=ESC_DOMAIN, n_inner_cells=ESC_NCELLS)
     t0 = time.perf_counter()
-    Q, Qaux = chorin_march(triple, mesh, cfl=CFL_1D, t_end=20.0,
+    Q, Qaux = chorin_march(triple, mesh, cfl=CFL_1D, ic=bump_ic, t_end=20.0,
                            h_scale=ESC_H_RES)
     elapsed = time.perf_counter() - t0
 

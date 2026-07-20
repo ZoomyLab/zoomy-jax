@@ -33,22 +33,40 @@ def test_vam_second_order(overwrite):
     triple = chorin_split_for(model, sm)
     print(describe(triple[0]))
     set_state_width(triple[0])
-    sm.initial_conditions = IC.UserFunction(function=smooth_vam_ic)
 
     sols, auxs = {}, {}
     t0 = time.perf_counter()
     for n in Ns:
         mesh = LSQMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=n)
         sols[n], auxs[n] = chorin_march(triple, mesh, cfl=CFL_1D,
-                                        t_end=T_END, pressure_tol=1e-13)
+                                        ic=smooth_vam_ic, t_end=T_END,
+                                        pressure_tol=VAM_PRESSURE_TOL)
     elapsed = time.perf_counter() - t0
 
-    d1 = np.abs(restrict(sols[Ns[1]]) - sols[Ns[0]]).mean()
-    d2 = np.abs(restrict(sols[Ns[2]]) - sols[Ns[1]]).mean()
+    D1 = np.abs(restrict(sols[Ns[1]]) - sols[Ns[0]])
+    D2 = np.abs(restrict(sols[Ns[2]]) - sols[Ns[1]])
+    d1, d2 = D1.mean(), D2.mean()
     rate = float(np.log2(d1 / d2))
+
+    # PER-ROW breakdown, always printed.  The whole-state mean is dominated by
+    # whichever row is worst, so a bare aggregate rate cannot say WHICH part of
+    # the scheme failed to converge — and here the answer is the whole finding:
+    # the conservative rows converge while the pressure modes diverge, because
+    # the unpreconditioned elliptic solve stagnates under refinement (see
+    # cases.VAM_PRESSURE_TOL).
+    print("VAM Richardson, per state row:")
+    for i, name in enumerate(str(s) for s in triple[0].state):
+        a, b = D1[i].mean(), D2[i].mean()
+        r = np.log2(a / b) if a > 0 and b > 0 else float("nan")
+        print(f"    {name:6s} |u_N-u_2N| {a:.3e}  |u_2N-u_4N| {b:.3e}  "
+              f"rate {r:+.3f}")
     print(f"VAM Richardson: |u_N-u_2N| {d1:.3e}, |u_2N-u_4N| {d2:.3e}, "
           f"observed order {rate:.3f}")
-    assert rate > ORDER_FLOOR[2], f"VAM observed order {rate:.3f} — not 2nd"
+    assert rate > ORDER_FLOOR[2], (
+        f"VAM observed order {rate:.3f} — not 2nd. See the per-row breakdown "
+        f"above: if the P_* rows carry negative rates while h/q/r are "
+        f"positive, this is the stagnating unpreconditioned pressure solve "
+        f"(cases.VAM_PRESSURE_TOL), not a defect in the spatial scheme.")
     refs.check("vam_order2", overwrite, Q=sols[Ns[2]], Qaux=auxs[Ns[2]],
                N=np.array(Ns), diffs=np.array([d1, d2]),
                rate=np.array([rate]))
