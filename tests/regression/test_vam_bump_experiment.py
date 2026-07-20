@@ -31,6 +31,10 @@ def test_bump_vs_experiment(overwrite):
 
     rms = rms_vs_experiment(Q, mesh)
     print(f"VAM bump vs Escalante experiment: eta RMS {rms:.4e}")
+    # Dumped BEFORE the gate (see refs.dump): this is a CORRECTNESS gate that
+    # currently fires, and the profile just computed is what a reader needs in
+    # order to see HOW the march misses the experiment.
+    refs.dump("vam_bump", rms=np.array([rms]), Q=Q)
     assert rms < 1.5e-2, f"eta RMS vs experiment {rms:.3e}"
     refs.check("vam_bump", overwrite, Q=Q, Qaux=Qaux, rms=np.array([rms]))
     refs.check_time("vam_bump", elapsed, overwrite)

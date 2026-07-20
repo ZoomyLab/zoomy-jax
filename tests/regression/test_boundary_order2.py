@@ -43,6 +43,16 @@ def test_second_order_at_boundaries(overwrite):
     rates = {w: fit_order(Ns, e) for w, e in err.items()}
     print("boundary-decomposed rates: "
           + ", ".join(f"{w} {r:.3f}" for w, r in rates.items()))
+    for w, e in err.items():
+        print(f"    {w:9s} L1 " + "  ".join(f"{v:.4e}" for v in e))
+    # Dumped BEFORE the floor assert.  This IS a smooth problem, so unlike the
+    # SWASHES cases the floor below is legitimate and must stay — and while
+    # the left-boundary defect stands it is expected to fire, at which point
+    # these error vectors are the only evidence of WHERE it failed.
+    refs.dump("boundary_order2", N=np.array(Ns),
+              **{f"l1_{w}": np.array(e) for w, e in err.items()},
+              **{f"rate_{w}": np.array([r]) for w, r in rates.items()},
+              h=np.asarray(Q[1], float))
     for w, r in rates.items():
         assert r > ORDER_FLOOR[2], \
             f"order-2 rate in the {w} window is {r:.3f} — not clean there"

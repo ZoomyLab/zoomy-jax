@@ -62,6 +62,14 @@ def test_vam_second_order(overwrite):
               f"rate {r:+.3f}")
     print(f"VAM Richardson: |u_N-u_2N| {d1:.3e}, |u_2N-u_4N| {d2:.3e}, "
           f"observed order {rate:.3f}")
+    # Dumped BEFORE the floor assert (see refs.dump): the per-row rates ARE
+    # the finding here, and the assert below destroys them.
+    rows = [str(s) for s in triple[0].state]
+    refs.dump("vam_order2", N=np.array(Ns), diffs=np.array([d1, d2]),
+              rate=np.array([rate]), rows=np.array(rows),
+              d1_rows=np.array([D1[i].mean() for i in range(len(rows))]),
+              d2_rows=np.array([D2[i].mean() for i in range(len(rows))]),
+              Q=sols[Ns[2]])
     assert rate > ORDER_FLOOR[2], (
         f"VAM observed order {rate:.3f} — not 2nd. See the per-row breakdown "
         f"above: if the P_* rows carry negative rates while h/q/r are "

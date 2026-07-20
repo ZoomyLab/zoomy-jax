@@ -6,8 +6,29 @@
 import json, pathlib, numpy as np
 
 DIR = pathlib.Path(__file__).parent / "refs"
+DIAG = DIR / "diagnostics"
 TIMES = DIR / "timings.json"
 SLOWER_OK = 1.10          # a test may get 10% slower; faster ratchets down
+
+
+def dump(name, **arrays):
+    """Write a test's own measured arrays UNCONDITIONALLY, to
+    ``refs/diagnostics/<name>.npz``.
+
+    Not a golden and never compared — call it BEFORE the asserts.  A
+    convergence test that trips its order floor dies before ``check()`` and
+    destroys the very error vectors a reader needs in order to judge whether
+    the floor or the scheme is at fault: the whole deliverable of this tier is
+    "every fitted rate WITH its error vector", and a bare
+    ``AssertionError: rate 0.736`` cannot supply that.  Measured cost is a few
+    kB per test.
+
+    ``refs/diagnostics/`` is gitignored: it is regenerated on every run and
+    would otherwise churn the repo on each march.
+    """
+    DIAG.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(DIAG / f"{name}.npz", **arrays)
+    print(f"[diag] wrote diagnostics/{name}.npz")
 
 
 def check(name, overwrite=False, **arrays):

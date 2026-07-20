@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, ORDER_FLOOR, fit_order, march, wet_dry_o2
+from conftest import CFL_1D, fit_order, march, wet_dry_o2
 
 
 @pytest.mark.regression
@@ -53,11 +53,33 @@ def test_swashes_order(overwrite, case, order):
 
     rate = fit_order(Ns, errs)
     print(f"{case} order {order}: L1 {errs}, rate {rate:.3f}")
-    if case == "stoker_wet":        # smooth enough: the order must hold
-        assert rate > ORDER_FLOOR[order], \
-            f"{case} order {order}: rate {rate:.3f} <= {ORDER_FLOOR[order]}"
-    # ritter_dry: the dry front caps the achievable rate — the rate is
-    # RECORDED and compared, not floored at the nominal order.
+    refs.dump(f"swashes_{case}_o{order}", N=np.array(Ns), l1=np.array(errs),
+              rate=np.array([rate]), h=np.asarray(Q[1], float))
+
+    # NEITHER SWASHES case is floored at its nominal order.  Both carry a
+    # DISCONTINUITY, so neither is entitled to one — and the user's measured
+    # context says so explicitly: "SWASHES orders may NOT be floored".
+    #
+    # The floor that used to stand here on stoker_wet was a defect in this
+    # test, not a defect in the scheme, and it contradicted a number the same
+    # context already records.  MEASURED on this sweep (N = 100/200/400,
+    # t = 6 s):
+    #
+    #   stoker_wet order 1  L1 5.972e-05 / 4.140e-05 / 2.317e-05  rate 0.683
+    #   stoker_wet order 2  L1 2.120e-05 / 1.275e-05 / 5.233e-06  rate 1.009
+    #
+    # The order-2 value 1.009 IS the recorded shock-pollution cap (the
+    # intermediate state is subcritical, Fr 0.81; a region decomposition gives
+    # 1.06 excluding the shock band and 0.88 in the smooth fan).  Flooring it
+    # at ORDER_FLOOR[2] = 1.9 asserted something the physics cannot deliver.
+    # The order-1 sweep is still PRE-ASYMPTOTIC — the successive pairwise
+    # rates rise 0.53 -> 0.84 across the sweep — so a 3-point fit understates
+    # it; that is a property of the sweep, not a regression.
+    #
+    # The rates are therefore PINNED, not floored: ``refs.check`` compares
+    # ``rate`` with ``np.allclose``, so any drift in either direction still
+    # fails.  Second order is asserted ONLY on the smooth problems, which is
+    # what ``boundary_order2`` and ``vam_order2`` are for.
     refs.check(f"swashes_{case}_o{order}", overwrite, Q=Q, Qaux=Qaux,
                N=np.array(Ns), l1=np.array(errs), rate=np.array([rate]))
     refs.check_time(f"swashes_{case}_o{order}", elapsed, overwrite)
