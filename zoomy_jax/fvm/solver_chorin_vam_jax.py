@@ -59,6 +59,17 @@ from zoomy_jax.transformation.jax_runtime import JaxRuntime
 # ── The solver ───────────────────────────────────────────────────────
 
 
+class EllipticSolveError(RuntimeError):
+    """The elliptic (pressure) stage missed its tolerance.
+
+    Raised — never warned.  An unconverged projection makes the corrector
+    apply a pressure that does not satisfy the elliptic constraint; the
+    march then produces plausible-looking numbers that are simply wrong,
+    and (measured on Escalante) goes non-finite a handful of steps later.
+    A solver that keeps marching on that is producing garbage silently,
+    which is worse than stopping."""
+
+
 class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
     """JAX port of ``ChorinSplitVAMSolver``.
 
@@ -251,11 +262,37 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
                     or entry.get("target_kind") != "state"
                     or entry.get("state_index") not in press_idx_set):
                 continue
+            if (entry.get("kind") == "limited_derivative"
+                    and entry.get("limiter_scheme") is not None):
+                # numpy applies `_apply_cell_limiter` INSIDE the pressure
+                # matvec (solver_chorin_vam_numpy.py:1141-1144); this backend
+                # does not.  Assembling a different elliptic operator than the
+                # reference backend, silently, is not an option — fail here.
+                raise NotImplementedError(
+                    "jax Chorin: pressure aux row %d (state %d) carries "
+                    "limiter_scheme %r; the jax elliptic matvec has no cell "
+                    "limiter, so it would assemble a DIFFERENT operator than "
+                    "the numpy reference.  Implement the limiter in "
+                    "_refresh_pressure_aux before using this model."
+                    % (int(entry["row"]), int(entry["state_index"]),
+                       entry.get("limiter_scheme")))
             self._press_aux_recompute.append({
                 "row": int(entry["row"]),
                 "state_index": int(entry["state_index"]),
                 "multi_index": tuple(entry["multi_index"]),
             })
+
+        # Depth row, for the elliptic abort diagnostic (h_min).  Resolved by
+        # NAME off the predictor sub-model's variable list; absent ⇒ the
+        # diagnostic just omits h_min (never a hard failure, and never used
+        # to clip or floor anything).
+        self._h_row = None
+        try:
+            names = [str(k) for k in self.sm_pred.variables.keys()]
+            if "h" in names:
+                self._h_row = names.index("h")
+        except Exception:
+            self._h_row = None
 
         # Elliptic-stage boundary conditions (REQ-174).  The BC *vocabulary* —
         # what counts as a declared Dirichlet, how a PerFieldBoundary delegates
@@ -387,7 +424,29 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         """One predictor → pressure → corrector cycle as a PURE
         function of ``(Q, Qaux_pred, Qaux_press, Qaux_corr)`` — no
         ``self._sim_*`` mutations during the call.  This is the
-        JIT-able entry point.  Returns the updated 4-tuple."""
+        JIT-able entry point.  Returns the updated 4-tuple.
+
+        The three pools are re-derived from the INCOMING ``Q`` before the
+        predictor runs.  That is not belt-and-braces: the predictor consumes
+        ``Qaux_pred`` (``b_x``, ``h_x``, ``q_Uk_x``, ``hinv`` …) as its FIRST
+        act, so whatever the caller hands in is what the predictor integrates
+        with.  ``step()`` below takes that pool as an argument, and a driver
+        that captures ``solver._sim_Qaux`` once and passes the same handle
+        back every step (the shape ``thesis/cases/escalante_vam_bump/run_jax.py``
+        has) pinned the predictor's derivatives at their step-0 values for the
+        whole march.  Measured consequence on the Escalante bump, 60 cells,
+        CFL 0.4: the elliptic RHS goes inconsistent, GMRES stalls at
+        rel_resid 7.9e-06, and the state is non-finite at step 7 — at EVERY
+        CFL, because aux staleness grows with step COUNT, not with dt.  The
+        numpy solver cannot be driven that way (``_chorin_cycle`` owns
+        ``self._sim_Qaux`` end to end); this refresh closes the same hole
+        here.  For a correctly-threaded caller it is idempotent — the pools
+        were already refreshed against this same ``Q`` at the end of the
+        previous cycle — so it costs one aux sweep and changes no answer."""
+        Qaux_pred = self._refresh_aux_for_sm(Qaux_pred, self.sm_pred, Q)
+        Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
+        Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
+
         # 1. Predictor (parent JAX HyperbolicSolver step).
         Q = super().step(dt, time, Q, Qaux_pred)
         Qaux_pred = self._refresh_aux_for_sm(Qaux_pred, self.sm_pred, Q)
@@ -395,7 +454,7 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
 
         # 2. Pressure step (matrix-free GMRES via JVP).
-        Q, Qaux_press = self._step_pressure_pure(Q, Qaux_press, dt)
+        Q, Qaux_press = self._step_pressure_pure(Q, Qaux_press, dt, time)
         Qaux_pred = self._refresh_aux_for_sm(Qaux_pred, self.sm_pred, Q)
         Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
         Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
@@ -408,12 +467,21 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
 
         return Q, Qaux_pred, Qaux_press, Qaux_corr
 
-    def step(self, dt, time, Q, Qaux):
+    def step(self, dt, time, Q, Qaux=None):
         """Host-side wrapper that drives one Chorin cycle and mutates
-        ``self._sim_Q`` / ``self.Qaux_press`` / ``self.Qaux_corr``.
-        Calls the pure-functional :meth:`chorin_cycle` internally.
-        Tests and notebooks that want a JIT'd run loop should call
-        :meth:`chorin_cycle` (or :meth:`run_jit_steps`) directly."""
+        ``self._sim_Q`` / ``self._sim_Qaux`` / ``self.Qaux_press`` /
+        ``self.Qaux_corr``.  Calls the pure-functional :meth:`chorin_cycle`
+        internally.  Tests and notebooks that want a JIT'd run loop should
+        call :meth:`chorin_cycle` (or :meth:`run_jit_steps`) directly.
+
+        ``Qaux`` defaults to the solver-owned predictor pool
+        (``self._sim_Qaux``), which is the only pool consistent with the
+        march.  It is still accepted positionally for the base-class
+        signature, but passing a stale handle is now harmless:
+        :meth:`chorin_cycle` re-derives all three pools from ``Q`` on
+        entry (see its docstring for the failure that motivated it)."""
+        if Qaux is None:
+            Qaux = self._sim_Qaux
         Q, Qaux_pred, Qaux_press, Qaux_corr = self.chorin_cycle(
             dt, time, Q, Qaux, self.Qaux_press, self.Qaux_corr)
         self._sim_Q = Q
@@ -455,7 +523,7 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         return run(dt, Q, Qaux_pred, Qaux_press, Qaux_corr,
                    jnp.asarray(t_start, dtype=Q.dtype))
 
-    def _step_pressure_pure(self, Q, Qaux_press, dt):
+    def _step_pressure_pure(self, Q, Qaux_press, dt, time=0.0):
         """Pure-functional pressure step: matrix-free GMRES on the
         elliptic block.  Returns ``(Q_new, Qaux_press_new)``.
 
@@ -568,16 +636,55 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         b_norm = jnp.linalg.norm(b)
         rel_resid = jnp.linalg.norm(matvec(p_new) + b) / jnp.where(
             b_norm > 0, b_norm, 1.0)
-        jax.lax.cond(
-            rel_resid > self.pressure_tol,
-            lambda r: jax.debug.print(
-                "[chorin] pressure NOT converged: rel residual {r:.3e} > tol "
-                "{t:.1e} (restart=20 x maxiter={m}); the step continues on an "
-                "UNCONVERGED pressure", r=r, t=self.pressure_tol,
-                m=self.pressure_maxit),
-            lambda r: None,
-            rel_resid,
-        )
+
+        # A missed tolerance is FATAL.  It used to `jax.debug.print` a warning
+        # and march on; on the Escalante bump that produced six more
+        # plausible-looking steps and then a non-finite state, with the actual
+        # cause (a stale predictor aux pool) buried under a "pressure not
+        # converged" line nobody could act on.  The abort is delivered through
+        # `jax.debug.callback` so it fires from inside jit/scan too, where a
+        # Python `raise` on a tracer is impossible.
+        h_min = (jnp.min(Q[self._h_row, :self.nc])
+                 if self._h_row is not None else jnp.asarray(jnp.nan))
+        tol = float(self.pressure_tol)
+        maxit = int(self.pressure_maxit)
+
+        def _abort(r, t_now, dt_now, hm):
+            r = float(r)
+            self.last_elliptic_rel_resid = r
+            t_now, dt_now, hm = float(t_now), float(dt_now), float(hm)
+            step_no = int(round(t_now / dt_now)) + 1 if dt_now > 0 else -1
+            raise EllipticSolveError(
+                "Chorin elliptic (pressure) stage did NOT converge at step "
+                f"{step_no} (t={t_now:.6g}, dt={dt_now:.6g}): rel residual "
+                f"{r:.3e} > tol {tol:.1e} after the full GMRES budget "
+                f"(restart=20 x maxiter={maxit} ~ {20 * maxit} matvecs); "
+                f"min(h)={hm:.6g}.  The march is ABORTED — a projection that "
+                "misses its tolerance leaves the corrector applying a "
+                "pressure that does not satisfy the elliptic constraint, and "
+                "the state goes non-finite a few steps later.  Check the aux "
+                "pools handed to step() and the elliptic RHS before touching "
+                "the tolerance.")
+
+        try:
+            # EAGER path: rel_resid is concrete, so raise from Python and get a
+            # real EllipticSolveError with a real traceback.  Also REQ-174 —
+            # the residual stays on `self` for the converged path (inside
+            # jit/scan it is a tracer, and stashing a tracer on self is a trap,
+            # not a diagnostic, so that path deliberately does not).
+            rr = float(rel_resid)
+        except Exception:
+            jax.lax.cond(
+                rel_resid > self.pressure_tol,
+                lambda r, tn, dn, hm: jax.debug.callback(_abort, r, tn, dn, hm),
+                lambda r, tn, dn, hm: None,
+                rel_resid, jnp.asarray(time, dtype=rel_resid.dtype),
+                jnp.asarray(dt, dtype=rel_resid.dtype), h_min,
+            )
+        else:
+            self.last_elliptic_rel_resid = rr
+            if rr > tol:
+                _abort(rr, time, dt, h_min)
         Q_new = Q.at[e2s, :].set(p_new.reshape(nP, nc))
         Qaux_press_new = _refresh_pressure_aux(
             p_new.reshape(nP, nc), Qaux_press)
