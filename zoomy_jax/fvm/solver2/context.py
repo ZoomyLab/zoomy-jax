@@ -169,9 +169,19 @@ def build_operators(runtime, MeshRT_, *, reconstruct, order, h_index,
     from zoomy_jax.fvm.reconstruction_jax import ConstantReconstruction
 
     rt_ncm = getattr(runtime, "nonconservative_matrix", None)
-    use_interior_ncp = bool(
-        order >= 2 and rt_ncm is not None
-        and hasattr(reconstruct, "reconstruct_with_grad"))
+    # A class opts in by providing its OWN reconstruct_with_grad, or by
+    # declaring supports_grad_recon in its own class body.  INHERITING either
+    # is not opting in: a subclass whose positivity / wet-dry treatment lives
+    # only in __call__ would otherwise route the order>=2 interior-NCP path
+    # through the untreated base reconstruction (measured on production:
+    # min h_face = -3.1e-03, negative depth).  Must stay identical to the
+    # guard at solver_jax.py:592-601 — a hasattr() test here silently accepts
+    # exactly the case production rejects.
+    _cls = type(reconstruct)
+    _grad_recon_ok = ("reconstruct_with_grad" in _cls.__dict__
+                      or bool(_cls.__dict__.get("supports_grad_recon", False)))
+    use_interior_ncp = bool(order >= 2 and rt_ncm is not None
+                            and _grad_recon_ok)
     if order >= 2 and rt_ncm is not None and not use_interior_ncp:
         # Silently dropping the interior NCP at order >= 2 loses
         # well-balancing for NCP-bearing models — same guard as solver_jax.
