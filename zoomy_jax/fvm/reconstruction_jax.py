@@ -892,12 +892,55 @@ class PositivityPreservingLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
             new_phi = new_phi.at[mi, :].multiply(theta)
         return new_phi
 
-    def __call__(self, Q, bf_face_values):
+    # ``supports_grad_recon`` is the EXPLICIT opt-in the flux operator tests
+    # before routing the order≥2 cell-interior NCP integral through
+    # ``reconstruct_with_grad``.  ``hasattr`` is NOT a valid test: it succeeds
+    # on an INHERITED base-class method and so silently routes an NCP-bearing
+    # model through a reconstruction whose positivity/WB treatment was never
+    # applied (see ``solver_jax.get_flux_operator``).
+    supports_grad_recon = True
+
+    def reconstruct_with_grad(self, Q, bf_face_values):
+        """Positivity-preserving twin of :meth:`__call__` that also returns
+        the LIMITED cell gradient for the order≥2 interior NCP integral.
+
+        MUST exist on this class.  Without it the inherited
+        ``LSQMUSCLReconstructionJAX.reconstruct_with_grad`` runs, which skips
+        :meth:`_xing_zhang_scale_phi` entirely — so an NCP-bearing model at
+        order ≥ 2 gets face states with NO a-priori positivity cap even
+        though ``__call__`` has one.  Measured divergence between the two
+        paths on a 1-D draining bed (state ``[b, h, q]``, b = 0.5x,
+        h = max(0.25 − 0.5x, 0)):
+
+            max|Q_L(__call__) − Q_L(reconstruct_with_grad)| = 3.125e-03
+            min h_face via __call__              = −2.07e-25  (θ fired)
+            min h_face via reconstruct_with_grad = −3.125e-03  (NEGATIVE
+                                                                DEPTH)
+            max|lim_grad − XZ-scaled lim_grad|   = 0.125
+
+        The path is reachable for the DERIVED model: SME(level=0, dim=2)
+        derives a nonzero ``nonconservative_matrix`` (B[q, b] = g·h), so the
+        solver turns the interior NCP on at order ≥ 2.
+
+        Scope note: the defect is POSITIVITY only, not well-balancing.  The
+        base method returns the conservative-h limited slope, which IS the
+        slope the conservative / xz face reconstruction is consistent with;
+        the WB weakness of those modes is inherent to reconstructing
+        conservative ``h`` (which is why ``EtaWellBalancedLSQMUSCLJAX``
+        exists), not a leak from this missing override.
+        """
         n_var = Q.shape[0]
         grads = self._compute_gradients(Q, n_var, bf_face_values)
         phi = self._compute_phi(Q, n_var, bf_face_values, grads)
         phi = self._xing_zhang_scale_phi(Q, grads, phi)
-        return self._reconstruct(Q, grads, phi, bf_face_values)
+        Q_L, Q_R = self._reconstruct(Q, grads, phi, bf_face_values)
+        return Q_L, Q_R, phi[:, jnp.newaxis, :] * grads
+
+    def __call__(self, Q, bf_face_values):
+        # Single body, single source of truth: the two entry points CANNOT
+        # drift apart again (that drift is exactly what this class shipped).
+        Q_L, Q_R, _ = self.reconstruct_with_grad(Q, bf_face_values)
+        return Q_L, Q_R
 
 
 class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
