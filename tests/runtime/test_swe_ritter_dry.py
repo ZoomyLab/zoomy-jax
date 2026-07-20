@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, march
+from conftest import CFL_1D, march, wet_dry_o2
 
 
 @pytest.mark.small
@@ -41,7 +41,18 @@ def test_ritter_dry(overwrite):
 @pytest.mark.jax
 def test_ritter_dry_o2_small(overwrite):
     """Small twin of swashes_ritter_o2: same model, order 2, 20 cells,
-    2 steps.  Pins the pipeline that produces the recorded dry-front rate."""
+    2 steps.  Pins the pipeline that produces the recorded dry-front rate.
+
+    ORDER-2 WET/DRY NUMERICS ARE EXPLICIT (``wet_dry_o2``).  As first landed
+    this test passed NO solver kwargs, so it marched plain conservative
+    LSQ-MUSCL with no η reconstruction, no front pre-detector and MOOD OFF —
+    ``ReconstructionSpec`` carries only ``order`` / ``limiter`` to the jax
+    backend, so ``positivity="mood"`` on the spec would ALSO have been a
+    no-op.  Measured consequence at 20 cells: h = -7.200562e+04 on step 2.
+    Nothing in the solver was broken — the test simply never asked for the
+    positivity mechanism it asserts on.  Documented so it is not "simplified"
+    back out.
+    """
     model = models.swe(dimension=2, bc="swashes")
     sm = SystemModel.from_model(model)
     sm.initial_conditions = IC.UserFunction(function=ritter_ic)
@@ -52,7 +63,7 @@ def test_ritter_dry_o2_small(overwrite):
 
     mesh = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=20)
     t0 = time.perf_counter()
-    Q, Qaux = march(nsm, mesh, cfl=CFL_1D, n_steps=2)
+    Q, Qaux = march(nsm, mesh, cfl=CFL_1D, n_steps=2, **wet_dry_o2(nsm))
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all()

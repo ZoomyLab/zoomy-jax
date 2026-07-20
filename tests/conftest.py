@@ -118,32 +118,44 @@ def overwrite(request):
 
 
 # ── the one shared runner ───────────────────────────────────────────────────
-def march(nsm, mesh, cfl, t_end=None, n_steps=None, n_devices=1):
+def march(nsm, mesh, cfl, t_end=None, n_steps=None, n_devices=1, **solver_kw):
     """Run the jax HyperbolicSolver; return the INNER ``(Q, Qaux)`` block.
 
     Exactly one of ``t_end`` / ``n_steps`` is given.  ``n_steps`` stops after
     that many adaptive steps (the small-twin idiom: identical construction to
     the regression march, two steps, full state stored).  ``n_devices > 1``
     routes to the SPMD path — see :func:`march_sharded`.
+
+    ``solver_kw`` is forwarded verbatim to ``HyperbolicSolver``.  This is how
+    a test asks for the wet/dry numerics: ``ReconstructionSpec`` (the NSM
+    slot) carries ONLY ``order`` / ``limiter`` as far as the jax backend is
+    concerned — the free-surface reconstruction variables, the a-priori front
+    pre-detector and the a-posteriori MOOD corrector are all *solver* params
+    (``zoomy_jax/fvm/solver_jax.py:184-226``), not NSM ones.  A test that
+    builds ``ReconstructionSpec(order=2, positivity="mood")`` and marches gets
+    plain conservative LSQ-MUSCL with NO positivity mechanism whatsoever: the
+    spec field is never read on this path.  See ``wet_dry_o2`` below.
     """
     if (t_end is None) == (n_steps is None):
         raise TypeError("march() takes exactly one of t_end / n_steps")
     if n_devices != 1:
         return march_sharded(nsm, mesh, cfl, n_devices,
-                             t_end=t_end, n_steps=n_steps)
+                             t_end=t_end, n_steps=n_steps, **solver_kw)
 
     from zoomy_jax.fvm.solver_jax import HyperbolicSolver
 
     n = mesh.n_inner_cells
     if t_end is not None:
-        solver = HyperbolicSolver(time_end=t_end, compute_dt=_adaptive(cfl))
+        solver = HyperbolicSolver(time_end=t_end, compute_dt=_adaptive(cfl),
+                                  **solver_kw)
         Q, Qaux = solver.solve(mesh, nsm, write_output=False)
         return np.asarray(Q)[:, :n], np.asarray(Qaux)[:, :n]
 
     # n_steps: drive step/post_step directly so the count is EXACT.  Marching
     # to a t_end guessed from dt would silently take a different number of
     # steps as soon as the wave speed changes.
-    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl))
+    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl),
+                              **solver_kw)
     Q, Qaux = solver.setup_simulation(mesh, nsm)
     t = 0.0
     for _ in range(n_steps):
@@ -157,7 +169,46 @@ def march(nsm, mesh, cfl, t_end=None, n_steps=None, n_devices=1):
     return np.asarray(Q)[:, :n], np.asarray(Qaux)[:, :n]
 
 
-def march_sharded(nsm, mesh, cfl, n_devices, t_end=None, n_steps=None):
+def wet_dry_o2(nsm, mood=True, front_tol=None):
+    """The ``march(**solver_kw)`` block that turns ON the order-2 wet/dry
+    numerics for a free-surface model whose state is ``[b, h, q_0(, q_1)]``.
+
+    Order 2 on a DRY front is only positivity-preserving with these three
+    switched on together (``solver_jax.py:469-520, 909-925``):
+
+    * ``reconstruction_variables="eta"`` — Audusse-Bouchut 2005 /
+      Kurganov-Petrova 2007 well-balanced reconstruction on
+      ``(b, η = h+b, hu)`` with the ``h_f = max(η_f − b_f, 0)`` face clip.
+      Also the ONLY reconstruction that exposes ``supports_force_o1``;
+    * ``free_surface_h_index`` / ``_b_index`` / ``_momentum_indices`` — the
+      solver does NOT auto-detect these from state names (its own docstring
+      says "caller-driven"), and ``reconstruction_variables='eta'`` asserts
+      on a missing ``h_index``;
+    * ``mood=True`` — the a-posteriori corrector.  Without it nothing at all
+      enforces ``h ≥ 0`` on the accepted cell mean at order 2 unless
+      ``positivity_method="zhang_shu"`` is used instead (which would need
+      CFL ≤ 1/3 and so is barred by the CFL law).
+
+    Indices are resolved BY NAME through ``models.state_index`` — never
+    positionally.
+    """
+    import models
+    names = [str(s) for s in nsm.state]
+    mom = [i for i, s in enumerate(names)
+           if s.startswith("q_") or s.startswith("hu")]
+    assert mom, f"no momentum rows found in state {names}"
+    return dict(
+        reconstruction_variables="eta",
+        free_surface_b_index=models.state_index(nsm, "b"),
+        free_surface_h_index=models.state_index(nsm, "h"),
+        free_surface_momentum_indices=mom,
+        front_theta_tol=front_tol,
+        mood=mood,
+    )
+
+
+def march_sharded(nsm, mesh, cfl, n_devices, t_end=None, n_steps=None,
+                  **solver_kw):
     """The SPMD twin of :func:`march`: the REAL ``solver.step`` inside
     ``jax.shard_map`` over a contiguous 1-D partition with a ring halo
     (``zoomy_jax.fvm.spmd_jax.run_solver_sharded``).
@@ -185,12 +236,14 @@ def march_sharded(nsm, mesh, cfl, n_devices, t_end=None, n_steps=None):
     n = mesh.n_inner_cells
 
     # dt from the unsharded mesh at the SAME CFL law, then frozen.
-    ref = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl))
+    ref = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl),
+                           **solver_kw)
     Q0, Qaux0 = ref.setup_simulation(mesh, nsm)
     dt = float(ref.compute_timestep(Q0, Qaux0))
 
     parts = partition_1d_contiguous(mesh, n_parts=n_devices, halo=halo)
-    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl))
+    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl),
+                              **solver_kw)
     solver.setup_simulation(parts[0], nsm)
 
     Q_pad, n_local = shard_global_state(np.asarray(Q0)[:, :n], n_devices, halo)
