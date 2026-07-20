@@ -1,47 +1,55 @@
-"""zoomy_jax test-suite conftest — determinism, tiers, derived-model builders.
+"""zoomy_jax test-suite conftest — determinism, tiers, the march helpers.
 
-Determinism (cid=13 spec):
+Determinism:
 
 * ``JAX_PLATFORMS=cpu`` is pinned HERE, at module top, BEFORE any jax /
   zoomy_jax import anywhere in the suite (conftest imports first).
+* ``XLA_FLAGS=--xla_force_host_platform_device_count=2`` gives the
+  parallelization twin two real CPU devices — also before the first jax
+  import, because a test-file-level setdefault would be too late.
 * x64 is ASSERTED, not set: ``zoomy_jax/__init__.py`` enables it by default,
   but a stray ``ZOOMY_JAX_ENABLE_X64=0`` in the environment silently flips the
   whole suite to float32 (LSQ error differs ~9 orders).  We hard-fail loudly
   instead of setdefault-ing over it.
 
-Tiers (mirrors ``zoomy_core/tests/conftest.py``):
+Tiers:
 
-* default run = the small tier (every test < ~a minute, CPU, x64);
-* ``--run-large`` adds the ``@pytest.mark.large`` marches;
+* default run = the ``small`` gate tier (seconds per test);
+* ``-m regression`` runs the reference marches; ``--run-large`` adds the
+  ``@pytest.mark.large`` ones;
 * an explicit ``-m`` expression takes over selection entirely.
-* NO ``--run-rederive`` here — zoomy_jax owns no derivation cache; models
-  come from zoomy_core's warm cache.
 
-Models: ALL derived (user mandate) — shallow water is the SME(level=0)
-composition from ``zoomy_core/tests/goldens/goldenlib.py:433-450``
-(``_swe_model``), re-implemented locally below (never imported from core test
-internals).  The hand-built ``SWE`` / ``SWE1D`` classes in the pre-existing
-REQ-numbered test files are LEGACY and stay untouched (pin history).
+References: every test compares the FULL ``Q`` and ``Qaux`` against
+``tests/refs/<name>.npz`` and records its wall time in
+``tests/refs/timings.json`` (see ``refs.py``).  ``--overwrite-results``
+regenerates instead of comparing.
 
-Wet/dry policy (user ruling cid=54): NO h floor / clip / momentum cap.  The
-builders below HARD-ASSERT ``nsm.update_variables is None`` (cap-free); the
-only depth regularization is the NSM-level KP hinv sweep, automatic on
-promotion.  The mandated pre-march operator-matrix print lives in
-``describe_nsm`` and runs inside every builder.
+DEVIATION FROM THE PROPOSAL (import style, deliberate): the proposal writes
+``from tests import models, refs``.  The top-level package name ``tests`` is
+already taken by the superrepo (``~/git/Zoomy/tests/__init__.py`` EXISTS,
+verified) and this directory has no ``__init__.py``, so ``tests.models`` would
+resolve to the superrepo package under a superrepo-wide run.  This directory
+is therefore injected onto ``sys.path`` and the shared modules import bare
+(``import models, refs``), exactly as ``zoomy_core/tests`` exposes
+``goldenlib``.  Module and symbol names are otherwise EXACTLY the proposal's.
 
-Regression baselines: ``tests/goldens/candidate_baselines.json`` — see the
-``baseline`` fixture.  A missing key SKIPS ("awaiting user blessing"); blessed
-values are committed only after explicit user approval (re-bless protocol,
-mirroring core's goldens: a baseline detects CHANGE, not WRONGNESS).
+Models: ALL derived (user mandate), ALL from the derivation cache.  Shallow
+water is SME(level=0).  Wet/dry cap OFF; nothing floors or clips h — the only
+depth regularization is the automatic NSM-level KP hinv sweep.
 """
 from __future__ import annotations
 
-import json
 import os
 import pathlib
+import sys
 
 # ── determinism: BEFORE any jax import ──────────────────────────────────────
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
+# 2 CPU devices for the parallelization test — BEFORE the first jax import.
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=2")
+
+# shared test modules (refs / models / cases) import bare
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import numpy as np
 import pytest
@@ -63,21 +71,30 @@ from loguru import logger
 
 logger.remove()
 
-GOLDENS_DIR = pathlib.Path(__file__).resolve().parent / "goldens"
+
+# ── the CFL law (user mandate — no augmentation, ever) ──────────────────────
+CFL_1D, CFL_2D = 0.9, 0.45          # user law — no augmentation, ever
+ORDER_FLOOR = {1: 0.9, 2: 1.9}      # measured smooth rates are 1.95-2.11
+
+G = 9.81
 
 
-# ── tiers ────────────────────────────────────────────────────────────────────
+# ── tiers + the results option ──────────────────────────────────────────────
 def pytest_addoption(parser):
     # zoomy_core/tests/conftest.py registers the same option; when a
     # superrepo-wide run collects both suites the second registration would
     # raise — tolerate it (either registration serves both).
-    try:
-        parser.getgroup("zoomy test tiers").addoption(
-            "--run-large", action="store_true", default=False,
-            help="run @pytest.mark.large tests (real time-march / simulation).",
-        )
-    except ValueError:
-        pass
+    group = parser.getgroup("zoomy test tiers")
+    for flag, helptext in (
+        ("--run-large", "run @pytest.mark.large tests (real time-march)."),
+        ("--overwrite-results",
+         "regenerate reference .npz / timings instead of comparing"),
+    ):
+        try:
+            group.addoption(flag, action="store_true", default=False,
+                            help=helptext)
+        except ValueError:
+            pass
 
 
 def pytest_collection_modifyitems(config, items):
@@ -94,190 +111,115 @@ def pytest_collection_modifyitems(config, items):
         items[:] = selected
 
 
-# ── the DERIVED shallow-water builder (goldenlib _swe_model pattern) ─────────
-G = 9.81
-
-
-def _swe_model(dimension: int, bcs):
-    """SME(level=0) + [Newtonian, ManningFriction, StressFree] — the derived
-    shallow-water composition (goldenlib.py:433-450).  All closure parameters
-    at their zero defaults → inviscid, frictionless.  NEVER the hand-built
-    ``SWE`` class (user mandate)."""
-    from zoomy_core.model.models import SME
-    from zoomy_core.model.models.closures import (
-        ManningFriction, Newtonian, StressFree)
-    return SME(level=0, dimension=dimension,
-               closures=[Newtonian(), ManningFriction(), StressFree()],
-               boundary_conditions=bcs)
-
-
-def describe_nsm(nsm) -> str:
-    """Render the NSM operator matrices — the MANDATED pre-march print."""
-    return "\n".join([
-        "── NSM operator matrices (pre-march sanity print) ──",
-        f"state: {list(nsm.state)}",
-        f"aux_state: {list(nsm.aux_state)}",
-        f"parameter_values: {nsm.parameter_values}",
-        f"flux:\n{nsm.flux}",
-        f"hydrostatic_pressure:\n{getattr(nsm, 'hydrostatic_pressure', None)}",
-        f"nonconservative_matrix:\n{nsm.nonconservative_matrix}",
-        f"source:\n{nsm.source}",
-        f"eigenvalues:\n{nsm.eigenvalues}",
-        f"update_variables (must be None — cap-free): {nsm.update_variables}",
-        f"riemann: {nsm.riemann}",
-        f"dt_max: {nsm.dt_max}",
-    ])
-
-
-def sanity_check_swe_nsm(nsm) -> None:
-    """Slot checks for the derived SWE NSM — HARD failures, never warnings."""
-    names = [str(s) for s in nsm.state]
-    assert names[:2] == ["b", "h"], f"unexpected state layout {names}"
-    assert nsm.update_variables is None, (
-        "wet/dry momentum cap must be OFF (cid=54): update_variables is "
-        f"{nsm.update_variables!r}, expected None")
-    aux = [str(s) for s in nsm.aux_state]
-    assert "hinv" in aux, (
-        f"KP hinv sweep missing from aux_state {aux} — depth regularization "
-        "must be the automatic NSM-level hinv desingularization, nothing else")
-
-
-def build_swe_nsm_1d(ic_func, order=1, riemann=None, bcs=None,
-                     aux_zero=True, limiter="minmod"):
-    """Derived SME(level=0, dimension=2) → SystemModel → NSM, with the
-    mandated operator-matrix print + hard slot sanity checks."""
-    import zoomy_core.model.boundary_conditions as BC
-    import zoomy_core.model.initial_conditions as IC
-    from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
-    from zoomy_core.systemmodel.system_model import SystemModel
-
-    if bcs is None:
-        bcs = BC.BoundaryConditions(
-            [BC.Extrapolation(tag="left"), BC.Extrapolation(tag="right")])
-    model = _swe_model(2, bcs)
-    sm = SystemModel.from_model(model)
-    sm.initial_conditions = IC.UserFunction(function=ic_func)
-    if aux_zero:
-        sm.aux_initial_conditions = IC.Constant(
-            constants=lambda k: np.zeros(k))
-    kwargs = dict(reconstruction=ReconstructionSpec(order=order,
-                                                    limiter=limiter))
-    if riemann is not None:
-        kwargs["riemann"] = riemann
-    nsm = NumericalSystemModel.from_system_model(sm, **kwargs)
-    print(describe_nsm(nsm))
-    sanity_check_swe_nsm(nsm)
-    return nsm
-
-
-def build_swe_nsm_2d(ic_func, order=1, riemann=None, bcs=None):
-    """Derived SME(level=0, dimension=3) — the 2-D twin of the 1-D builder."""
-    import zoomy_core.model.boundary_conditions as BC
-    import zoomy_core.model.initial_conditions as IC
-    from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
-    from zoomy_core.systemmodel.system_model import SystemModel
-
-    if bcs is None:
-        bcs = BC.BoundaryConditions(
-            [BC.Extrapolation(tag=t)
-             for t in ("left", "right", "top", "bottom")])
-    model = _swe_model(3, bcs)
-    sm = SystemModel.from_model(model)
-    sm.initial_conditions = IC.UserFunction(function=ic_func)
-    sm.aux_initial_conditions = IC.Constant(constants=lambda k: np.zeros(k))
-    kwargs = dict(reconstruction=ReconstructionSpec(order=order,
-                                                    limiter="minmod"))
-    if riemann is not None:
-        kwargs["riemann"] = riemann
-    nsm = NumericalSystemModel.from_system_model(sm, **kwargs)
-    print(describe_nsm(nsm))
-    sanity_check_swe_nsm(nsm)
-    return nsm
-
-
 @pytest.fixture
-def derived_swe_nsm_1d():
-    return build_swe_nsm_1d
+def overwrite(request):
+    return (request.config.getoption("--overwrite-results")
+            or os.environ.get("ZOOMY_OVERWRITE_RESULTS") == "1")
 
 
-@pytest.fixture
-def derived_swe_nsm_2d():
-    return build_swe_nsm_2d
+# ── the one shared runner ───────────────────────────────────────────────────
+def march(nsm, mesh, cfl, t_end=None, n_steps=None, n_devices=1):
+    """Run the jax HyperbolicSolver; return the INNER ``(Q, Qaux)`` block.
 
+    Exactly one of ``t_end`` / ``n_steps`` is given.  ``n_steps`` stops after
+    that many adaptive steps (the small-twin idiom: identical construction to
+    the regression march, two steps, full state stored).  ``n_devices > 1``
+    routes to the SPMD path — see :func:`march_sharded`.
+    """
+    if (t_end is None) == (n_steps is None):
+        raise TypeError("march() takes exactly one of t_end / n_steps")
+    if n_devices != 1:
+        return march_sharded(nsm, mesh, cfl, n_devices,
+                             t_end=t_end, n_steps=n_steps)
 
-# ── Ritter (1892) dry dam-break closed form — shared analytic reference ─────
-def ritter_h(x, t, h_l=0.005, x0=5.0, g=G):
-    """Exact h(x, t) of the dry-bed dam break (what SWASHES 1 3 1 2 emits)."""
-    x = np.asarray(x, float)
-    c = np.sqrt(g * h_l)
-    h = np.where(x < x0 - c * t, h_l, 0.0)
-    m = (x >= x0 - c * t) & (x <= x0 + 2 * c * t)
-    return np.where(m, (2 * c - (x - x0) / max(t, 1e-12)) ** 2 / (9 * g), h)
+    from zoomy_jax.fvm.solver_jax import HyperbolicSolver
 
+    n = mesh.n_inner_cells
+    if t_end is not None:
+        solver = HyperbolicSolver(time_end=t_end, compute_dt=_adaptive(cfl))
+        Q, Qaux = solver.solve(mesh, nsm, write_output=False)
+        return np.asarray(Q)[:, :n], np.asarray(Qaux)[:, :n]
 
-@pytest.fixture(scope="session")
-def ritter():
-    return ritter_h
-
-
-# ── one-adaptive-step twin (the jax port of core's fixture) ──────────────────
-@pytest.fixture
-def one_hyperbolic_step_jax():
-    """Advance the JAX ``HyperbolicSolver`` exactly ONE adaptive step and
-    return ``(Q, Qaux, dt)`` as numpy arrays — the small-twin idiom for every
-    large march (core ``one_hyperbolic_step``, ported to the functional jax
-    step/post_step API)."""
-
-    def _run(solver, mesh, nsm):
-        Q, Qaux = solver.setup_simulation(mesh, nsm)
+    # n_steps: drive step/post_step directly so the count is EXACT.  Marching
+    # to a t_end guessed from dt would silently take a different number of
+    # steps as soon as the wave speed changes.
+    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl))
+    Q, Qaux = solver.setup_simulation(mesh, nsm)
+    t = 0.0
+    for _ in range(n_steps):
         dt = float(solver.compute_timestep(Q, Qaux))
-        Qn = solver.step(dt, 0.0, Q, Qaux)
-        Qn, Qauxn = solver.post_step(dt, dt, Qn, Q, Qaux)
-        return np.asarray(Qn, float), np.asarray(Qauxn, float), dt
-
-    return _run
-
-
-# ── regression baselines (blessed) + candidate recording ────────────────────
-@pytest.fixture(scope="session")
-def _blessed_baselines():
-    path = GOLDENS_DIR / "candidate_baselines.json"
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text())
+        assert dt > 0.0 and np.isfinite(dt), (
+            f"non-positive/non-finite dt = {dt} at t = {t} — the march "
+            f"stalled; this is a FAILURE, not a stopping condition")
+        Qn = solver.step(dt, t, Q, Qaux)
+        Q, Qaux = solver.post_step(t + dt, dt, Qn, Q, Qaux)
+        t += dt
+    return np.asarray(Q)[:, :n], np.asarray(Qaux)[:, :n]
 
 
-@pytest.fixture
-def baseline(_blessed_baselines):
-    """``baseline('key')`` → the blessed value, or SKIP when unblessed."""
+def march_sharded(nsm, mesh, cfl, n_devices, t_end=None, n_steps=None):
+    """The SPMD twin of :func:`march`: the REAL ``solver.step`` inside
+    ``jax.shard_map`` over a contiguous 1-D partition with a ring halo
+    (``zoomy_jax.fvm.spmd_jax.run_solver_sharded``).
 
-    def _get(key):
-        if key not in _blessed_baselines:
-            pytest.skip(
-                f"regression baseline '{key}' absent from "
-                "tests/goldens/candidate_baselines.json — awaiting user "
-                "blessing (candidates are generated to the scratchpad by the "
-                "Run phase and promoted only after explicit approval)")
-        return _blessed_baselines[key]
+    Two structural constraints of that path, both honoured here:
 
-    return _get
+    * **fixed dt** — a global adaptive dt would need a ``lax.pmin``
+      collective, so the step size is computed ONCE on the unsharded mesh at
+      the SAME CFL law and then held.  The 1-device comparison run uses the
+      identical fixed dt, so the twin compares SHARDING, not time-stepping.
+    * **periodic halo** — ``halo_exchange_periodic`` wraps the ring, so the
+      model must carry periodic BCs for the sharded and unsharded runs to be
+      the same problem.
+
+    Returns the gathered owned cells as ``(Q, Qaux)``.
+    """
+    import jax.numpy as jnp
+    from zoomy_jax.fvm.solver_jax import HyperbolicSolver
+    from zoomy_jax.fvm.spmd_jax import (gather_owned, run_solver_sharded,
+                                        shard_global_state)
+    from zoomy_jax.mesh import partition_1d_contiguous
+
+    assert n_steps is not None, "the sharded path marches a fixed step count"
+    halo = 2                     # >= 2 keeps MUSCL bit-identical at seams
+    n = mesh.n_inner_cells
+
+    # dt from the unsharded mesh at the SAME CFL law, then frozen.
+    ref = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl))
+    Q0, Qaux0 = ref.setup_simulation(mesh, nsm)
+    dt = float(ref.compute_timestep(Q0, Qaux0))
+
+    parts = partition_1d_contiguous(mesh, n_parts=n_devices, halo=halo)
+    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl))
+    solver.setup_simulation(parts[0], nsm)
+
+    Q_pad, n_local = shard_global_state(np.asarray(Q0)[:, :n], n_devices, halo)
+    Qaux_pad, _ = shard_global_state(np.asarray(Qaux0)[:, :n], n_devices, halo)
+    run = run_solver_sharded(solver, n_devices, halo, n_steps, dt)
+    Q_out, Qaux_out = run(jnp.asarray(Q_pad), jnp.asarray(Qaux_pad))
+    # Record how many devices actually held a shard, so the test can assert
+    # the run did not silently collapse onto one device (see
+    # ``cases.used_devices``).  Read off the real output sharding, not the
+    # requested count.
+    sharding = getattr(Q_out, "sharding", None)
+    devs = getattr(sharding, "device_set", None)
+    LAST_SHARD["devices"] = len(devs) if devs else 1
+    return (gather_owned(np.asarray(Q_out), n_devices, n_local, halo),
+            gather_owned(np.asarray(Qaux_out), n_devices, n_local, halo))
 
 
-@pytest.fixture
-def record_candidate():
-    """Append a measured value to the CANDIDATE baselines file named by
-    ``$ZOOMY_JAX_CANDIDATE_BASELINES`` (the Run phase points this at the
-    scratchpad).  No-op when the env var is unset — regression tests must
-    stay side-effect-free by default."""
+# How many devices the last :func:`march_sharded` actually sharded across.
+LAST_SHARD: dict = {"devices": 1}
 
-    def _rec(key, value):
-        path = os.environ.get("ZOOMY_JAX_CANDIDATE_BASELINES", "")
-        if not path:
-            return
-        p = pathlib.Path(path)
-        data = json.loads(p.read_text()) if p.exists() else {}
-        data[key] = value
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
-    return _rec
+def _adaptive(cfl):
+    import zoomy_core.fvm.timestepping as timestepping
+    return timestepping.adaptive(CFL=cfl)
+
+
+def fit_order(sizes, errors):
+    return float(-np.polyfit(np.log(sizes), np.log(errors), 1)[0])
+
+
+def restrict(fine):      # conservative fine -> coarse, exact for cell averages
+    return 0.5 * (fine[:, 0::2] + fine[:, 1::2])

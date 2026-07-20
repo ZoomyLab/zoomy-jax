@@ -430,7 +430,36 @@ class LSQMUSCLReconstructionJAX:
 
     def _lsq_gradient_scalar(self, u, u_bf):
         """Cell-center gradient for a single scalar field via the LSQ
-        stencil.  vmap'd over the cell axis inside ``_compute_gradients``."""
+        stencil.  vmap'd over the cell axis inside ``_compute_gradients``.
+
+        **Ghost-distance convention: prescribed face values enter the LSQ
+        row as ``2·(u_face - u_cell)``.**
+
+        The LSQ stencil places its virtual boundary point at the GHOST-CELL
+        offset ``2·(face - cell)`` — the symmetric image of the inner cell
+        through the boundary face (``zoomy_core/mesh/base_mesh.py:318,323``
+        for the ghost centers; ``zoomy_core/mesh/lsq_reconstruction.py:299-319``
+        for the stencil rationale, which explicitly rejects face placement as
+        over-constraining Neumann-zero rows).  BC kernels, however, evaluate
+        at the FACE CENTER.  The bridge between the two conventions is
+        ``u_ghost = 2·u_face - u_cell``, so the delta carried at the ghost
+        position is ``2·(u_face - u_cell)``.
+
+        Using the bare face delta places a face-valued sample at the ghost
+        position: the boundary-cell gradient is HALVED, boundary cells drop
+        to 1st order, and the global order-2 convergence rate is lost.  This
+        is invisible to Wall/Extrapolation/periodic BCs and to flat
+        lake-at-rest suites (delta ≈ 0 or pure state reflection) — it only
+        shows up for a Dirichlet/inflow-prescribed field with a NONZERO
+        boundary slope.
+
+        Mirrors the numpy twin ``zoomy_core/fvm/reconstruction.py:571``
+        (REQ-46, commit 341ccd8) and ``zoomy_core/mesh/
+        lsq_reconstruction.py:425`` (``_resolve_u_boundary_face``).  The
+        factor is UNCONDITIONAL on ``bf >= 0``: the extrapolation /
+        Neumann-zero case self-cancels because ``u_bf_i = u_i`` there makes
+        the delta 0, and ``2·0 = 0`` is still the correct ghost = inner-cell
+        value."""
         nc = self._nc
         dim = self.dim
         A_glob = self._lsq_gradQ
@@ -448,12 +477,22 @@ class LSQMUSCLReconstructionJAX:
             u_cells = u[nbr_idx] - u_i
             if has_bdy:
                 bf = bdy_nbr[i]
-                u_bf_i = jnp.where(
-                    bf >= 0,
-                    u_bf[jnp.maximum(bf, 0)],
-                    u_i,
-                )
-                u_bf_delta = jnp.where(bf >= 0, u_bf_i - u_i, 0.0)
+                # ``bf < 0`` means "no boundary face on this side"; ``u_bf is
+                # None`` means extrapolation (Neumann-zero) — both collapse to
+                # the inner cell value, i.e. a zero delta (numpy twin:
+                # ``np.full_like(bf, u_i)``).
+                if u_bf is None:
+                    u_bf_i = jnp.full(bf.shape, u_i, dtype=u.dtype)
+                else:
+                    u_bf_i = jnp.where(
+                        bf >= 0,
+                        u_bf[jnp.maximum(bf, 0)],
+                        u_i,
+                    )
+                # Ghost-distance convention (see docstring): the virtual point
+                # sits at the ghost offset 2·(face - cell), so its delta is the
+                # GHOST delta u_ghost - u_cell = 2·(u_face - u_cell).
+                u_bf_delta = jnp.where(bf >= 0, 2.0 * (u_bf_i - u_i), 0.0)
                 delta_u = jnp.concatenate([u_cells, u_bf_delta])
             else:
                 delta_u = u_cells

@@ -1,0 +1,488 @@
+"""Case content for the jax test suite: ICs, BCs, analytic comparisons.
+
+The module the code proposal (``2026-07-20-jax-test-suite-code.md``) names but
+does not write.  It owns everything case-shaped so the test files stay short:
+initial conditions, boundary conditions, the SWASHES analytic comparison, the
+long-march history helper, the Escalante bump comparison and the AHS26 helper.
+
+**Boundary conditions are declared ON THE MODEL, before ``from_model``.**
+``SystemModel.boundary_conditions`` is a COMPILED symbolic kernel built at
+``SystemModel.from_model`` time, not a declaration slot — assigning a
+``BC.BoundaryConditions`` onto a built SystemModel would clobber that kernel.
+``models.py`` therefore takes a hashable ``bc`` STRING (so its ``lru_cache``
+still keys correctly) and calls :func:`bcs_for` inside to build the live
+objects.  Only ``initial_conditions`` is assigned post-build, which is what
+the proposal does.
+
+Import style: bare (``from cases import ...``) — see ``conftest.py`` for why
+``tests.cases`` cannot be used here.
+"""
+from __future__ import annotations
+
+import csv
+import functools
+import pathlib
+
+import numpy as np
+
+G = 9.81
+
+# SWASHES depths — the exact configuration the hand-built SWE's
+# wet_dry_eps=1e-2 cap silently zeroed (cid=54).
+ETA_L, ETA_R, DAM_X = 0.005, 0.001, 5.0
+SWASHES_DOMAIN = (0.0, 10.0)
+SWASHES_T_END = 6.0
+
+AHS26_DOMAIN, AHS26_T_END = (0.0, 1.0), 0.5
+
+ESC_DOMAIN, ESC_NCELLS = (-1.5, 1.5), 60
+ESC_H_RES, ESC_H_DRY = 0.34, 0.015
+
+# The cached SWASHES analytic tables live in the thesis case; zoomy_jax always
+# sits inside the superrepo, so this relative hop is stable.
+SWASHES_REF_DIR = (pathlib.Path(__file__).resolve().parents[3]
+                   / "thesis" / "cases" / "swe_swashes_verification"
+                   / "reference")
+
+
+# ── boundary conditions ─────────────────────────────────────────────────────
+def bcs_for(kind: str, dimension: int):
+    """Live ``BoundaryConditions`` for a named kind.
+
+    ``dimension`` is the MODEL dimension: 2 -> 1-D horizontal (tags
+    left/right), 3 -> 2-D horizontal (left/right/top/bottom).
+    """
+    import zoomy_core.model.boundary_conditions as BC
+
+    tags = (("left", "right") if dimension == 2
+            else ("left", "right", "top", "bottom"))
+
+    if kind in ("extrapolation", "swashes", "bump"):
+        # SWASHES and the Escalante bump both run open (extrapolation) ends.
+        return BC.BoundaryConditions([BC.Extrapolation(tag=t) for t in tags])
+    if kind == "wall":
+        # ``Wall.momentum_field_indices`` DEFAULTS to [[1, 2]] — a
+        # two-component momentum at state rows 1,2.  Our state is
+        # [b, h, q_0(, q_1)], so the default would reflect (h, q_0) as a
+        # 2-vector and raise a sympy ShapeError against a 1-D normal.  The
+        # momentum rows are 2 for 1-D horizontal, (2, 3) for 2-D.
+        mom = [[2]] if dimension == 2 else [[2, 3]]
+        return BC.BoundaryConditions(
+            [BC.Wall(tag=t, momentum_field_indices=mom) for t in tags])
+    if kind == "periodic":
+        # Periodic BCs come in PAIRS: each carries the tag it maps onto.
+        # Leaving ``periodic_to_physical_tag`` at its "" default makes the
+        # mesh raise KeyError('') when it resolves the partner.
+        pairs = [("left", "right"), ("top", "bottom")][:len(tags) // 2]
+        return BC.BoundaryConditions(
+            [BC.Periodic(tag=a, periodic_to_physical_tag=b)
+             for a, b in pairs]
+            + [BC.Periodic(tag=b, periodic_to_physical_tag=a)
+               for a, b in pairs])
+    if kind == "inflow":
+        # Dirichlet on h AND q_0 at both ends, at the SMOOTH IC's own boundary
+        # values.  The prescribed value differs from the boundary CELL AVERAGE
+        # (the profile has NONZERO slope there), so the LSQ boundary row
+        # carries a nonzero delta — this is the ONLY BC family that can see
+        # the halved boundary gradient (REQ-46).  Wall / Extrapolation /
+        # periodic all produce a zero or reflected delta and are structurally
+        # blind to it.
+        hl, ql = smooth_state(0.0)
+        hr, qr = smooth_state(1.0)
+        return BC.BoundaryConditions([
+            BC.Dirichlet(tag="left", on="h", value=hl),
+            BC.Dirichlet(tag="left", on="q_0", value=ql),
+            BC.Dirichlet(tag="right", on="h", value=hr),
+            BC.Dirichlet(tag="right", on="q_0", value=qr),
+        ])
+    raise KeyError(f"unknown BC kind {kind!r}")
+
+
+# ── initial conditions ──────────────────────────────────────────────────────
+def stoker_ic(x):
+    """Wet dam break (Stoker): both states wet, flat bed."""
+    return np.array([0.0, ETA_L if float(x[0]) < DAM_X else ETA_R, 0.0])
+
+
+def ritter_ic(x):
+    """Dry dam break (Ritter): capless dry front, flat bed.  The dry side is
+    EXACTLY zero — no floor anywhere (user law: never clip h)."""
+    return np.array([0.0, ETA_L if float(x[0]) < DAM_X else 0.0, 0.0])
+
+
+def lake_at_rest_ic(x):
+    """Flat surface over a Gaussian bump — the topography gate.  Mass
+    conservation is BLIND to well-balancing; this is not."""
+    X = float(x[0])
+    b = 0.1 * np.exp(-((X - 5.0) ** 2) / 0.5)
+    return np.array([b, 0.3 - b, 0.0])
+
+
+def tilted_ic(x):
+    """A tilted free surface on the unit domain: whatever the BC does, the
+    interior will move, so the BC kernel is actually exercised."""
+    X = float(x[0])
+    return np.array([0.0, 0.5 + 0.05 * (X - 0.5), 0.0])
+
+
+def gaussian_pulse_2d(x):
+    """Radial pulse in a closed basin — exercises both horizontal dims."""
+    r2 = float(x[0]) ** 2 + float(x[1]) ** 2
+    return np.array([0.0, 0.5 + 0.05 * np.exp(-r2 / 0.2), 0.0, 0.0])
+
+
+def smooth_state(X: float):
+    """The smooth (h, q) profile of the boundary-order study.  Slope is
+    NONZERO at both x = 0 and x = 1 — that is the whole point."""
+    h = 1.0 + 0.1 * np.sin(2.0 * np.pi * X + 0.7)
+    q = 0.1 * np.cos(2.0 * np.pi * X)
+    return float(h), float(q)
+
+
+def smooth_dirichlet_ic(x):
+    h, q = smooth_state(float(x[0]))
+    return np.array([0.0, h, q])
+
+
+def bump_ic(x):
+    """Escalante dam break over a Gaussian bump (thesis/cases/
+    escalante_vam_bump).  The dry side sits at the PHYSICAL still depth of the
+    experiment — an initial condition, not a floor: nothing clips h after."""
+    X = float(x[0])
+    b = 0.20 * np.exp(-(X ** 2) / (2 * 0.20 ** 2))
+    h = (ESC_H_RES - b) if X < 1.0 else ESC_H_DRY
+    return _pad_state(np.array([b, h]))
+
+
+def smooth_vam_ic(x):
+    """A smooth periodic VAM state — the Richardson order study needs
+    smoothness (a discontinuity caps the observable rate at 1)."""
+    X = float(x[0])
+    h = 1.0 + 0.1 * np.sin(2.0 * np.pi * X)
+    q = 0.1 * np.cos(2.0 * np.pi * X)
+    return _pad_state(np.array([0.0, h, q]))
+
+
+def ahs26_ic(x):
+    """AHS26 (Sec. 3.1) lake-at-rest multilayer gate: flat surface over a
+    smooth bed, both layers quiescent."""
+    X = float(x[0])
+    b = 0.1 * np.exp(-((X - 0.5) ** 2) / 0.02)
+    return _pad_state(np.array([b, 0.5 - b]))
+
+
+_STATE_WIDTH = {}
+
+
+def _pad_state(head):
+    """Zero-pad an IC head (b, h, ...) to the model's state width.
+
+    The VAM / ML-SME state widths are model-derived, so the test must not
+    hard-code them: ``models.state_width`` records the true width when the NSM
+    is built and this pads to it.  A missing width RAISES rather than guessing
+    — a silently short IC would make the extra rows read whatever the solver
+    allocated (user law: no silent defaults for state rows).
+    """
+    n = _STATE_WIDTH.get("n")
+    if n is None:
+        raise AssertionError(
+            "state width unknown — call cases.set_state_width(nsm) after "
+            "building the NSM and before marching")
+    if len(head) > n:
+        raise AssertionError(f"IC head of {len(head)} rows exceeds state {n}")
+    out = np.zeros(n)
+    out[:len(head)] = head
+    return out
+
+
+def set_state_width(nsm):
+    """Record the model's state width so the padded ICs above know it."""
+    _STATE_WIDTH["n"] = len(list(nsm.state))
+
+
+def ic_for(case: str):
+    return {"stoker_wet": stoker_ic, "ritter_dry": ritter_ic}[case]
+
+
+# ── the MANDATED pre-march operator print ───────────────────────────────────
+def describe(nsm) -> str:
+    """Render the NSM operator matrices — the MANDATED pre-march print."""
+    return "\n".join([
+        "── NSM operator matrices (pre-march sanity print) ──",
+        f"state: {list(nsm.state)}",
+        f"aux_state: {list(nsm.aux_state)}",
+        f"parameter_values: {getattr(nsm, 'parameter_values', None)}",
+        f"flux:\n{nsm.flux}",
+        f"hydrostatic_pressure:\n{getattr(nsm, 'hydrostatic_pressure', None)}",
+        f"nonconservative_matrix:\n{nsm.nonconservative_matrix}",
+        f"source:\n{nsm.source}",
+        f"eigenvalues:\n{getattr(nsm, 'eigenvalues', None)}",
+        f"update_variables (must be None — cap-free): "
+        f"{getattr(nsm, 'update_variables', None)}",
+        f"riemann: {getattr(nsm, 'riemann', None)}",
+        f"dt_max: {getattr(nsm, 'dt_max', None)}",
+    ])
+
+
+# ── SWASHES analytic comparison ─────────────────────────────────────────────
+def swashes_table(case: str) -> dict:
+    """The cached SWASHES analytic table (the library's own output).
+
+    Generated by the ``swashes`` binary at t = 6 s over (0, 10) and cached in
+    the thesis case.  We read the cache rather than shelling out so the suite
+    is reproducible without the binary.
+    """
+    path = SWASHES_REF_DIR / f"{case}.csv"
+    if not path.exists():
+        raise AssertionError(
+            f"missing SWASHES analytic table {path} — regenerate it with "
+            f"`python run_verification.py` in thesis/cases/"
+            f"swe_swashes_verification (needs the `swashes` binary).")
+    cols: dict = {}
+    with path.open() as fh:
+        for row in csv.DictReader(fh):
+            for k, v in row.items():
+                cols.setdefault(k, []).append(float(v))
+    return {k: np.asarray(v) for k, v in cols.items()}
+
+
+def l1_vs_analytic(Q, mesh, case: str, t: float) -> float:
+    """Mesh-normalized L1 error of h against the SWASHES analytic solution.
+
+    ``t`` is ASSERTED against the table's time rather than used: the cached
+    tables are t = 6 s only, and silently comparing a t = 1 s run against a
+    t = 6 s table would manufacture a meaningless "error" that still
+    converges.
+    """
+    assert abs(t - SWASHES_T_END) < 1e-12, (
+        f"the cached SWASHES tables are t = {SWASHES_T_END} s only; got "
+        f"t = {t}. Generate a new table before comparing at another time.")
+    ref = swashes_table(case)
+    n = mesh.n_inner_cells
+    x = np.asarray(mesh.cell_centers[0, :n], float)
+    dx = np.asarray(mesh.cell_volumes[:n], float)
+    h_exact = np.interp(x, ref["x"], ref["h"])
+    h = np.asarray(Q[1], float)
+    return float(np.sum(np.abs(h - h_exact) * dx) / np.sum(dx))
+
+
+# ── region-decomposed convergence (the REQ-46 boundary probe) ───────────────
+BOUNDARY_DOMAIN, BOUNDARY_T_END, BOUNDARY_N_REF = (0.0, 1.0), 0.2, 1600
+
+
+@functools.lru_cache(maxsize=None)
+def _boundary_reference(t_end: float, n_ref: int):
+    """A well-resolved reference for the smooth-Dirichlet march.
+
+    There is no closed form for the nonlinear SWE with this IC, so the error
+    is measured against a run at ``n_ref`` cells — 4x the finest study mesh —
+    conservatively averaged down.  Computed ONCE per session (lru_cache).
+    """
+    import models
+    from conftest import CFL_1D, march
+    from zoomy_core.mesh import LSQMesh
+    from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+    from zoomy_core.systemmodel.system_model import SystemModel
+    import zoomy_core.model.initial_conditions as IC
+
+    sm = SystemModel.from_model(models.swe(dimension=2, bc="inflow"))
+    sm.initial_conditions = IC.UserFunction(function=smooth_dirichlet_ic)
+    nsm = NumericalSystemModel.from_system_model(
+        sm, reconstruction=ReconstructionSpec(order=2, limiter="minmod"))
+    set_state_width(nsm)
+    mesh = LSQMesh.create_1d(domain=BOUNDARY_DOMAIN, n_inner_cells=n_ref)
+    Q, _ = march(nsm, mesh, cfl=CFL_1D, t_end=t_end)
+    return np.asarray(Q[1], float)
+
+
+def coarsen(fine: np.ndarray, factor: int) -> np.ndarray:
+    """Conservative cell average of a fine field onto a coarse mesh."""
+    assert fine.size % factor == 0, (fine.size, factor)
+    return fine.reshape(-1, factor).mean(axis=1)
+
+
+def l1_by_window(Q, mesh, t: float) -> dict:
+    """L1 error of h against the fine reference, decomposed into
+    full / interior / left-strip / right-strip windows.
+
+    The strips are the outer 10 % at each end — the region where a halved
+    boundary gradient (REQ-46) shows up and where a full-domain norm dilutes
+    it below visibility.
+    """
+    n = mesh.n_inner_cells
+    ref_fine = _boundary_reference(t, BOUNDARY_N_REF)
+    assert BOUNDARY_N_REF % n == 0, (
+        f"reference {BOUNDARY_N_REF} not a multiple of {n} — the conservative "
+        f"average would be inexact and would fake an error floor")
+    h_ref = coarsen(ref_fine, BOUNDARY_N_REF // n)
+    h = np.asarray(Q[1], float)
+    x = np.asarray(mesh.cell_centers[0, :n], float)
+    dx = np.asarray(mesh.cell_volumes[:n], float)
+    err = np.abs(h - h_ref)
+
+    lo, hi = BOUNDARY_DOMAIN
+    L = hi - lo
+    left, right = x < lo + 0.1 * L, x > hi - 0.1 * L
+    masks = {"full": np.ones_like(x, bool), "interior": ~(left | right),
+             "left": left, "right": right}
+    return {w: float(np.sum(err[m] * dx[m]) / np.sum(dx[m]))
+            for w, m in masks.items()}
+
+
+# ── long-march history (well-balancing drift over time) ─────────────────────
+def march_with_history(nsm, mesh, t_end, cfl, n_samples: int = 50):
+    """March ONCE to ``t_end``, sampling the lake-at-rest drift on the way.
+
+    Returns ``(Q, Qaux, t, drift, umax)``: the final inner state, then sample
+    times, max|eta - eta0| and max|u| at each sample.  Sampling (rather than a
+    single end state) is what makes the DRIFT HISTORY observable — an end
+    state alone cannot distinguish "never drifted" from "drifted and came
+    back".
+
+    Implemented on the step API, advancing ONE continuous trajectory.  The
+    obvious alternative — one fresh ``solve`` per sample time — is O(n^2) in
+    the sample count and cannot fit the regression budget.
+    """
+    from zoomy_jax.fvm.solver_jax import HyperbolicSolver
+    from conftest import _adaptive
+
+    n = mesh.n_inner_cells
+    solver = HyperbolicSolver(time_end=t_end, compute_dt=_adaptive(cfl))
+    Q, Qaux = solver.setup_simulation(mesh, nsm)
+    Qi = np.asarray(Q)[:, :n]
+    eta0 = float((Qi[0] + Qi[1])[0])
+    targets = [t_end * k / n_samples for k in range(1, n_samples + 1)]
+
+    ts, drifts, umaxs = [], [], []
+    t = 0.0
+    for t_target in targets:
+        while t < t_target - 1e-15:
+            dt = float(solver.compute_timestep(Q, Qaux))
+            assert dt > 0.0 and np.isfinite(dt), (
+                f"non-positive/non-finite dt = {dt} at t = {t} — the march "
+                f"stalled; this is a FAILURE, not a stopping condition")
+            dt = min(dt, t_target - t)
+            Qn = solver.step(dt, t, Q, Qaux)
+            Q, Qaux = solver.post_step(t + dt, dt, Qn, Q, Qaux)
+            t += dt
+        Qi = np.asarray(Q)[:, :n]
+        eta = Qi[0] + Qi[1]
+        ts.append(t)
+        drifts.append(float(np.abs(eta - eta0).max()))
+        umaxs.append(float(np.abs(Qi[2] / Qi[1]).max()))
+    return (np.asarray(Q)[:, :n], np.asarray(Qaux)[:, :n],
+            np.asarray(ts), np.asarray(drifts), np.asarray(umaxs))
+
+
+# ── the Chorin split-solver march ───────────────────────────────────────────
+def chorin_split_for(model, sm):
+    """``model.chorin_split`` -> the ``(SM_pred, SM_press, SM_corr)`` triple.
+
+    DEVIATION FROM THE PROPOSAL (API, forced): the proposal writes
+    ``solver.solve(mesh, split)``, but ``ChorinSplitVAMSolverJax`` has NO
+    ``solve`` method — its API is ``__init__(sm_pred, sm_press, sm_corr)`` +
+    ``setup_simulation(mesh)`` + ``step(dt, t, Q, Qaux)`` (verified in
+    ``zoomy_jax/fvm/solver_chorin_vam_jax.py:87,158,411``).  ``chorin_split``
+    returns a ``SplitForPressureResult`` dataclass (``.SM_pred`` / ``.SM_press``
+    / ``.SM_corr``), NOT a subscriptable tuple.  So the stages are unpacked
+    here and :func:`chorin_march` drives the step loop.
+    """
+    import sympy as sp
+    r = model.chorin_split(sp.Symbol("dt"), system_model=sm)
+    return (r.SM_pred, r.SM_press, r.SM_corr)
+
+
+def chorin_march(triple, mesh, cfl, t_end=None, n_steps=None,
+                 h_scale=1.0, **solver_kw):
+    """March the jax Chorin split VAM solver; return the inner (Q, Qaux).
+
+    Fixed dt at the 1-D CFL law from the still depth ``h_scale`` — the split
+    solver has no adaptive controller.  Exactly one of ``t_end`` / ``n_steps``.
+    """
+    import jax.numpy as jnp
+    from zoomy_jax.fvm.solver_chorin_vam_jax import ChorinSplitVAMSolverJax
+
+    if (t_end is None) == (n_steps is None):
+        raise TypeError("chorin_march() takes exactly one of t_end / n_steps")
+    sm_pred, sm_press, sm_corr = triple
+    solver = ChorinSplitVAMSolverJax(sm_pred, sm_press, sm_corr, **solver_kw)
+    Q = solver.setup_simulation(mesh)
+    solver.update_aux_variables()
+    Q, Qaux = solver._sim_Q, solver._sim_Qaux
+
+    dx = float(np.asarray(solver._rt_mesh.cell_volumes)[0])
+    dt = cfl * dx / (np.sqrt(G * h_scale) + 1.0)
+    if n_steps is None:
+        n_steps = int(np.ceil(t_end / dt))
+    t = jnp.asarray(0.0)
+    for _ in range(n_steps):
+        Q = solver.step(jnp.asarray(dt), t, Q, Qaux)
+        t = t + dt
+    nc = solver.nc
+    return np.asarray(Q)[:, :nc], np.asarray(Qaux)[:, :nc]
+
+
+# ── Escalante dam-break over a bump ─────────────────────────────────────────
+def escalante_experiment():
+    """The digitized Escalante (2024) experiment arrays shipped by the case."""
+    case = (pathlib.Path(__file__).resolve().parents[3]
+            / "thesis" / "cases" / "escalante_vam_bump" / "run.py")
+    if not case.exists():
+        raise AssertionError(f"missing Escalante case {case}")
+    # ``run.py`` executes a full case at import; read the literals instead.
+    src = case.read_text()
+    ns: dict = {"np": np}
+    for name in ("ETA_EXP_X", "ETA_EXP_Y"):
+        line = next(l for l in src.splitlines() if l.startswith(f"{name} ="))
+        exec(line, ns)  # noqa: S102 — a single np.array literal from our repo
+    return ns["ETA_EXP_X"], ns["ETA_EXP_Y"]
+
+
+def rms_vs_experiment(Q, mesh) -> float:
+    """RMS of the computed free surface against the digitized experiment,
+    sampled at the EXPERIMENT's own x stations."""
+    xe, ye = escalante_experiment()
+    n = mesh.n_inner_cells
+    x = np.asarray(mesh.cell_centers[0, :n], float)
+    eta = np.asarray(Q[0], float) + np.asarray(Q[1], float)
+    order = np.argsort(x)
+    eta_at = np.interp(xe, x[order], eta[order])
+    return float(np.sqrt(np.mean((eta_at - ye) ** 2)))
+
+
+# ── AHS26 multilayer ────────────────────────────────────────────────────────
+def ahs26_l1_vs_reference(Q, mesh) -> float:
+    """L1 departure of the free surface from the flat equilibrium.
+
+    The thesis case (``thesis/cases/hoern``) refines MLSME(level=0) over
+    layers; core golden ``m10`` pins MLSME(n_layers=2, level=1, dimension=2).
+    Every model the jax suite runs must be golden-covered, so this uses the
+    GOLDEN model and measures what the AHS26 protocol measures on it: the L1
+    departure from the initial well-balanced equilibrium.  It is a
+    well-balancing drift norm, NOT a reproduction of the published Table 1
+    numbers (those are a different model and a different refinement path).
+    """
+    n = mesh.n_inner_cells
+    dx = np.asarray(mesh.cell_volumes[:n], float)
+    eta = np.asarray(Q[0], float) + np.asarray(Q[1], float)
+    return float(np.sum(np.abs(eta - 0.5) * dx) / np.sum(dx))
+
+
+# ── SPMD helper ─────────────────────────────────────────────────────────────
+def used_devices(arr=None) -> int:
+    """How many devices actually held a shard of the last sharded march.
+
+    A 2-device run that silently fell back to one device would otherwise pass
+    the state comparison trivially, so the parallel test asserts on this.
+    ``march_sharded`` gathers its result to host before returning (the caller
+    needs a plain array to compare), so the sharding is read off the on-device
+    output THERE and recorded in ``conftest.LAST_SHARD``; ``arr`` is accepted
+    for call-site symmetry with the proposal and used only if it still carries
+    a sharding of its own.
+    """
+    sharding = getattr(arr, "sharding", None)
+    devs = getattr(sharding, "device_set", None)
+    if devs:
+        return len(devs)
+    from conftest import LAST_SHARD
+    return LAST_SHARD["devices"]
