@@ -90,7 +90,8 @@ class MarchSolver(HyperbolicSolver):
         self.MeshRT = prepare_mesh(self._rt_mesh, self.nsm,
                                    mesh_np=self._rt_mesh_np)
         order = int(self.nsm.reconstruction.order)
-        recon = self._build_reconstruction(self._rt_mesh, self._rt_model.sm)
+        recon = self._build_reconstruction(
+            self._rt_mesh, self._rt_model.sm, self._rt_model)
         self.Ops = build_operators(
             self._rt_model, self.MeshRT,
             reconstruct=recon, order=order,

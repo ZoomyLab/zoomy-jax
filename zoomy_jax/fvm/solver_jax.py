@@ -456,7 +456,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return compute_max_abs_eigenvalue
 
-    def _build_reconstruction(self, mesh, symbolic_model):
+    def _build_reconstruction(self, mesh, symbolic_model, runtime):
         """Build JAX face reconstruction.
 
         First-order: piecewise-constant.  Second-order: the LSQ-augmented
@@ -482,24 +482,18 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         from zoomy_jax.fvm.reconstruction_jax import (
             ConstantReconstruction, LSQMUSCLReconstructionJAX,
             PositivityPreservingLSQMUSCLJAX,
-            EtaWellBalancedLSQMUSCLJAX,
+            EmittedWLSQMUSCLJAX,
         )
         dim = symbolic_model.dimension
-        # REQ-48: the wet/dry threshold is the NSM-owned canonical parameter
-        # ``wet_dry_eps`` (populated from the model, also read by the riemann
-        # solver) — the single source of truth.  Read it from the NSM when
-        # present; if the model declares none, leave ``eps_wet`` unset so the
-        # eta reconstruction uses its own default.
-        eps_wet = None
-        for _z in (getattr(self.nsm, "parameter_values", None),
-                   getattr(self.nsm, "parameters", None)):
-            if _z is not None and getattr(_z, "contains", None) \
-                    and _z.contains("wet_dry_eps"):
-                try:
-                    eps_wet = float(getattr(_z, "wet_dry_eps"))
-                    break
-                except (TypeError, ValueError):
-                    pass
+        # MANDATE 6a: there is no ``eps_wet`` to plumb any more.  The ``eta``
+        # reconstruction consumes the EMITTED reconstruction-variable pair,
+        # whose ``1/h`` is already core's KP-desingularized ``hinv`` at the
+        # canonical ``wet_dry_eps`` — so the threshold lives in core, is
+        # emitted, and cannot be contradicted by a backend default.  The old
+        # code read ``wet_dry_eps`` from the NSM and FELL BACK to the class
+        # literal ``1e-3`` when the model declared none; SWE declares none, so
+        # the fallback is what actually ran, and it was the dry-bed order-2
+        # collapse.
         if self.nsm.reconstruction.order >= 2:
             mode = self.reconstruction_variables
             limiter = self.nsm.reconstruction.limiter
@@ -507,12 +501,20 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 assert self.free_surface_h_index is not None, (
                     "reconstruction_variables='eta' requires "
                     "free_surface_h_index to be set")
-                return EtaWellBalancedLSQMUSCLJAX(
+                if runtime.state_from_reconstruction_uses_aux:
+                    raise NotImplementedError(
+                        "This model's emitted ``state_from_reconstruction`` "
+                        "reads AUX variables, but the order-2 face pass has "
+                        "only CELL-centre aux — feeding it there would "
+                        "silently use the wrong aux at every face.  Reported, "
+                        "not worked around.")
+                return EmittedWLSQMUSCLJAX(
                     mesh, dim,
+                    runtime.reconstruction_variables,
+                    runtime.state_from_reconstruction,
                     b_index=int(self.free_surface_b_index),
                     h_index=int(self.free_surface_h_index),
                     momentum_indices=self.free_surface_momentum_indices,
-                    **({"eps_wet": eps_wet} if eps_wet is not None else {}),
                     positivity=(self.positivity_method or None),
                     front_tol=self.front_theta_tol,
                     limiter=limiter,
@@ -554,7 +556,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         * Interior + boundary faces are accumulated in separate
           accumulators (split loops).
         """
-        reconstruct = self._build_reconstruction(mesh, runtime.sm)
+        reconstruct = self._build_reconstruction(mesh, runtime.sm, runtime)
         rt_num_flux = runtime.numerical_flux
         rt_num_fluct = runtime.numerical_fluctuations
         rt_bc = runtime.boundary_conditions
@@ -576,6 +578,12 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # part).  Active only when the reconstruction exposes its limited
         # gradient (plain LSQ-MUSCL); order 1 has slope ≡ 0.
         rt_ncm = getattr(runtime, "nonconservative_matrix", None)
+        # The emitted-W reconstruction needs Qaux + parameters at call time
+        # (its ``W`` map reads the desingularized ``hinv`` aux), plus the
+        # emitted LOCAL aux formula to rebuild aux on ghost/boundary states.
+        from zoomy_jax.fvm.reconstruction_jax import EmittedWLSQMUSCLJAX
+        needs_emitted_w = isinstance(reconstruct, EmittedWLSQMUSCLJAX)
+        rt_uav = getattr(runtime, "update_aux_variables", None)
         # ``hasattr`` is NOT a valid test here and was the bug: it succeeds on
         # an INHERITED base-class ``reconstruct_with_grad``, so a subclass that
         # puts its positivity / wet-dry / WB treatment only in ``__call__``
@@ -717,6 +725,21 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
             # 2. Reconstruct with bf_values (LSQ-MUSCL sees boundary
             # face values for limiter bounds + Q_R override).
             o1kw = {"force_o1": force_o1} if support_o1 else {}
+            if needs_emitted_w:
+                # The EMITTED reconstruction map reads aux (``hinv``), so the
+                # reconstruction needs Qaux + parameters, and the boundary face
+                # states need aux CONSISTENT WITH THE GHOST STATE.  Recompute
+                # it from ``bf_values`` via the model's own emitted local aux
+                # formula — the same thing core's numpy solver does in
+                # ``_ghost_aux``.  Reusing the inner cell's aux would pair a
+                # ghost ``h`` with the interior's ``hinv``.
+                if n_bf > 0 and rt_uav is not None:
+                    bf_aux = rt_uav(bf_values, Qaux[:, iInner_bnd], parameters)
+                else:
+                    bf_aux = jnp.zeros((Qaux.shape[0], bf_values.shape[1]),
+                                       dtype=bf_values.dtype)
+                o1kw = dict(o1kw, Qaux=Qaux, parameters=parameters,
+                            bf_aux=bf_aux)
             if use_interior_ncp:
                 Q_L, Q_R, lim_grad = reconstruct.reconstruct_with_grad(
                     Q, bf_values, **o1kw)

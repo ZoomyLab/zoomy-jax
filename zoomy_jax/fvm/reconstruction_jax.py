@@ -982,9 +982,36 @@ class PositivityPreservingLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         return Q_L, Q_R
 
 
-class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
-    """Primitive-variable LSQ-MUSCL on ``(b, η, hu, hv)`` with
-    ``η = h + b`` (Audusse-Bouchut 2005, Kurganov-Petrova 2007).
+class EmittedWLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
+    """Primitive-variable LSQ-MUSCL on the **emitted** reconstruction
+    variables ``W = reconstruction_variables(Q, Qaux, p)``, inverted by the
+    **emitted** ``state_from_reconstruction`` (Audusse-Bouchut 2005,
+    Kurganov-Petrova 2007).
+
+    For SWE / SME core emits ``W = (b, b+h, hinv·q)`` — free surface plus
+    PRIMITIVE VELOCITY, with ``hinv`` the KP-desingularized inverse depth at
+    core's canonical ``wet_dry_eps``.  This is the identical pair OpenFOAM
+    consumes in ``zoomy_foam/numerics_o2.H``, and it is why foam needs no
+    wet/dry threshold in its reconstruction.
+
+    MANDATE 6a — WHAT THIS CLASS REPLACED, AND WHY IT MATTERED.  This used to
+    be ``EtaWellBalancedLSQMUSCLJAX``, which hand-coded its own variable set
+    ``(b, η, hu, hv)`` — free surface but CONSERVATIVE momentum — and then
+    needed a class-default ``eps_wet = 1e-3`` literal to survive ``hu/h`` at a
+    dry front.  That literal was five orders of magnitude larger than core's
+    canonical ``1e-8``, and 20% of the SWASHES Ritter reservoir depth.  It was
+    used twice: to demote the limiter in cells with ``h < 1e-3``, and to ZERO
+    THE FACE MOMENTUM wherever ``h_f < 1e-3``.  The second deleted the
+    advective flux that drives the Ritter front, so the front stalled on the
+    exact solution's ``h = 1e-3`` contour and the entire tail beyond it was
+    erased.  The resulting order-2 L1 error was a FIXED PHYSICAL REGION that
+    could not shrink under refinement — the "convergence rate" of 0.155 was
+    never a convergence rate.
+
+    Reconstructing the emitted primitive velocity removes the need for the
+    threshold rather than retuning it: ``u = hinv·q`` is bounded as ``h -> 0``,
+    and the inverse recovers ``q_f = u_f·h_f``, which vanishes exactly where
+    ``h_f`` does and nowhere else.  There is no epsilon in this class.
 
     The reconstruction problem on conservative ``(b, h, hu, hv)`` is
     ill-conditioned at a wet/dry shoreline on non-flat bathymetry:
@@ -1032,15 +1059,32 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
     # operator checks this flag before threading the mask through.
     supports_force_o1 = True
 
-    def __init__(self, mesh, dim, b_index=0, h_index=1,
-                 momentum_indices=None, eps_wet=1e-3, positivity=None,
+    def __init__(self, mesh, dim, w_of_q, q_of_w, b_index=0, h_index=1,
+                 momentum_indices=None, positivity=None,
                  front_tol=None,
                  limiter="venkatakrishnan", unlimited_indices=None):
         super().__init__(mesh, dim, limiter=limiter,
                          unlimited_indices=unlimited_indices)
+        # MANDATE 6a: the reconstruction VARIABLES and their inverse are the
+        # EMITTED model-map pair, not a set hand-coded here.  ``w_of_q`` is
+        # ``reconstruction_variables(Q, Qaux, p)`` and ``q_of_w`` is
+        # ``state_from_reconstruction(W, Qaux, p)`` — the same pair OpenFOAM
+        # consumes.  There is deliberately NO ``eps_wet`` argument: the emitted
+        # forward map divides the momentum by core's KP-desingularized ``hinv``
+        # (canonical ``wet_dry_eps``), so the primitive velocity is bounded at a
+        # dry front by construction and the backend needs no threshold to
+        # survive it.  A float literal here would be exactly the defect.
+        if w_of_q is None or q_of_w is None:
+            raise ValueError(
+                "EmittedWLSQMUSCLJAX requires the EMITTED reconstruction map "
+                "pair (reconstruction_variables / state_from_reconstruction). "
+                "The runtime returned None for at least one — the model "
+                "declares no reconstruction map, so there is nothing to "
+                "reconstruct in primitive variables.")
+        self._w_of_q = w_of_q
+        self._q_of_w = q_of_w
         self._b_idx = int(b_index)
         self._h_idx = int(h_index)
-        self._eps_wet = float(eps_wet)
         self._mom_idx = (
             tuple(momentum_indices) if momentum_indices is not None
             else tuple(range(h_index + 1, h_index + 1 + dim))
@@ -1060,31 +1104,51 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         self._front_tol = front_tol
         self._build_cell_face_rays(mesh, dim)
 
-    def _eta_core(self, Q, bf_face_values, force_o1=None):
-        """Shared η reconstruction core for ``__call__`` and
+    def _eta_core(self, Q, bf_face_values, force_o1=None,
+                  Qaux=None, parameters=None, bf_aux=None):
+        """Shared reconstruction core for ``__call__`` and
         ``reconstruct_with_grad`` — returns ``(Q_L, Q_R, grads, phi)`` where
-        ``grads`` / ``phi`` are the slopes + tied, dry-aware limiter on
-        ``W = (b, η, hu, hv)``.  Exposing them lets the order≥2 interior NCP
-        integral reuse the *same* limited slopes the η face flux was built
-        from (well-balanced + wet/dry-safe)."""
-        # Q -> W: replace h with η = h + b.
-        W = Q.at[self._h_idx, :].set(
-            Q[self._h_idx, :] + Q[self._b_idx, :])
+        ``grads`` / ``phi`` are the slopes + tied limiter on the EMITTED
+        ``W = reconstruction_variables(Q, Qaux, p)``.  Exposing them lets the
+        order≥2 interior NCP integral reuse the *same* limited slopes the face
+        flux was built from (well-balanced + wet/dry-safe)."""
+        if Qaux is None or parameters is None:
+            raise ValueError(
+                "EmittedWLSQMUSCLJAX needs Qaux and parameters: the EMITTED "
+                "reconstruction map reads the desingularized ``hinv`` AUX. "
+                "The caller passed None — it is still on the old hand-coded "
+                "signature.")
+        # Q -> W through the EMITTED map (SWE/SME: [b, b+h, hinv·q]).  The
+        # momentum row is the PRIMITIVE VELOCITY, which is what removes the
+        # need for a wet/dry threshold: u = hinv·q stays bounded as h -> 0
+        # (KP), where the old hand-coded conservative ``hu`` row did not.
+        W = self._w_of_q(Q, Qaux, parameters)
         bf_W = bf_face_values
         if bf_face_values is not None:
-            bf_W = bf_face_values.at[self._h_idx, :].set(
-                bf_face_values[self._h_idx, :]
-                + bf_face_values[self._b_idx, :])
+            if bf_aux is None:
+                raise ValueError(
+                    "EmittedWLSQMUSCLJAX needs ``bf_aux`` whenever "
+                    "``bf_face_values`` is given: the boundary face state must "
+                    "go through the SAME emitted map, and that map reads aux. "
+                    "Feeding the inner cell's aux to a ghost state desyncs "
+                    "``hinv`` from the ghost ``h`` (core's numpy solver calls "
+                    "this the periodic mass leak).")
+            bf_W = self._w_of_q(bf_face_values, bf_aux, parameters)
 
-        # Compute slope + limiter per variable on W = (b, η, hu, hv).
+        # Compute slope + limiter per variable on the emitted W.
         n_var = Q.shape[0]
         grads = self._compute_gradients(W, n_var, bf_W)
         phi = self._compute_phi(W, n_var, bf_W, grads)
 
-        # Drop limiter to 1st order in dry cells (h_bar < eps_wet) so
-        # the reconstruction can't push η far across the shoreline.
-        dry = Q[self._h_idx, :self._nc] < self._eps_wet
-        phi = jnp.where(dry[jnp.newaxis, :], 0.0, phi)
+        # NOTE: there is deliberately NO dry-cell ``φ:=0`` demotion here.  The
+        # old code demoted every cell with ``h < eps_wet = 1e-3`` — 20% of the
+        # SWASHES Ritter reservoir depth — which is what froze the front at the
+        # exact solution's h = 1e-3 contour.  The emitted W needs no such
+        # guard: ``η`` is continuous across the shoreline and ``u = hinv·q`` is
+        # bounded, so the limiter sees finite slopes on both.  The genuine
+        # positivity guards (``front_tol`` pre-detector, ``zhang_shu`` cap)
+        # remain below and are threshold-FREE — they key on the positivity
+        # indicator θ, not on an absolute depth.
 
         # **Critical: tie phi_b to phi_η.**  At the shoreline the η-row
         # limiter clips to 0 (η has the wet/dry discontinuity), but b
@@ -1150,30 +1214,66 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
 
         W_L, W_R = self._reconstruct(W, grads, phi, bf_W)
 
-        # W_face -> Q_face: h_f = max(η_f - b_f, 0).  Audusse-Bouchut
-        # 2005 §4: at dry-side faces (h_f < eps_wet) zero the momentum
-        # components so ``u = hu/h`` stays finite when the Riemann sees
-        # nearly-zero face depth.
-        h_L = jnp.maximum(
-            W_L[self._h_idx, :] - W_L[self._b_idx, :], 0.0)
-        h_R = jnp.maximum(
-            W_R[self._h_idx, :] - W_R[self._b_idx, :], 0.0)
-        Q_L = W_L.at[self._h_idx, :].set(h_L)
-        Q_R = W_R.at[self._h_idx, :].set(h_R)
-        dry_L = h_L < self._eps_wet
-        dry_R = h_R < self._eps_wet
-        for mi in self._mom_idx:
-            Q_L = Q_L.at[mi, :].set(
-                jnp.where(dry_L, 0.0, Q_L[mi, :]))
-            Q_R = Q_R.at[mi, :].set(
-                jnp.where(dry_R, 0.0, Q_R[mi, :]))
+        # AUDUSSE-BOUCHUT 2005 §4 face-state positivity, applied in W SPACE:
+        # clip the reconstructed FREE SURFACE to the reconstructed bed,
+        # ``η_f := max(η_f, b_f)``.  The emitted inverse then yields
+        # ``h_f = η_f − b_f >= 0`` AND ``q_f = u_f·h_f = 0`` as a matched pair,
+        # so the momentum needs no separate rule (the old code zeroed it on
+        # ``h_f < eps_wet`` — that literal is what deleted the Ritter tail).
+        #
+        # This is an exact ``max(·, 0)`` on a FACE state, not an epsilon and not
+        # a floor on the evolved cell mean: no constant enters, and the cell
+        # average is never truncated (MOOD repairs a cell whose AVERAGE goes
+        # negative, exactly as foam's numerics_o2.H documents).  It is NOT
+        # optional — the MOOD detector's own correctness argument cites it, and
+        # measured without it the Ritter march reaches h = −2.6e-02 at t = 0.7
+        # and NaNs by t = 0.75.
+        eta_L = jnp.maximum(W_L[self._h_idx, :], W_L[self._b_idx, :])
+        eta_R = jnp.maximum(W_R[self._h_idx, :], W_R[self._b_idx, :])
+        W_L = W_L.at[self._h_idx, :].set(eta_L)
+        W_R = W_R.at[self._h_idx, :].set(eta_R)
+
+        # W_face -> Q_face through the EMITTED INVERSE
+        # ``state_from_reconstruction`` (SWE/SME: h = η−b, q = u·(η−b)).
+        #
+        # This is where the deleted-tail bug dies.  The old code zeroed the
+        # face momentum wherever ``h_f < eps_wet = 1e-3``, which deleted the
+        # advective flux that drives the Ritter front.  The emitted inverse
+        # needs no such rule and has no threshold: the momentum is RECOVERED as
+        # ``q_f = u_f · h_f``, so it vanishes exactly where ``h_f`` vanishes and
+        # nowhere else.  The Riemann solver never sees a ``hu/h`` blow-up
+        # because ``u_f`` was reconstructed as a bounded primitive, not divided
+        # out at the face.
+        #
+        # The aux passed to the inverse is the CELL aux broadcast to faces.
+        # That is only sound while the inverse does not actually read aux —
+        # asserted at construction by the solver via
+        # ``state_from_reconstruction_uses_aux``.
+        Q_L = self._q_of_w(W_L, self._face_aux(W_L, Qaux), parameters)
+        Q_R = self._q_of_w(W_R, self._face_aux(W_R, Qaux), parameters)
         return Q_L, Q_R, grads, phi
 
-    def __call__(self, Q, bf_face_values, force_o1=None):
-        Q_L, Q_R, _grads, _phi = self._eta_core(Q, bf_face_values, force_o1)
+    @staticmethod
+    def _face_aux(W_face, Qaux):
+        """Aux array shaped to the FACE axis for the emitted inverse.
+
+        Zeros, not the cell aux: the inverse is asserted aux-free (see
+        ``state_from_reconstruction_uses_aux``), so this array is never read.
+        Building it explicitly — rather than passing the cell-shaped ``Qaux``
+        and relying on broadcasting — makes the shape mismatch a loud error
+        the day a model DOES put aux in its inverse, instead of a silent
+        wrong-length read.
+        """
+        return jnp.zeros((Qaux.shape[0], W_face.shape[1]), dtype=W_face.dtype)
+
+    def __call__(self, Q, bf_face_values, force_o1=None,
+                 Qaux=None, parameters=None, bf_aux=None):
+        Q_L, Q_R, _grads, _phi = self._eta_core(
+            Q, bf_face_values, force_o1, Qaux, parameters, bf_aux)
         return Q_L, Q_R
 
-    def reconstruct_with_grad(self, Q, bf_face_values, force_o1=None):
+    def reconstruct_with_grad(self, Q, bf_face_values, force_o1=None,
+                              Qaux=None, parameters=None, bf_aux=None):
         """η-consistent limited cell gradient for the order≥2 cell-interior
         NCP integral ``B(Q_c)·s_c`` (well-balanced + positivity-safe on
         wet/dry beds).
@@ -1187,17 +1287,44 @@ class EtaWellBalancedLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         ``h < 0`` (the failure shared by all three face variants, since they
         all reused this base gradient).
 
-        Returning the η-consistent slope instead: the conservative ``h``
-        slope is ``∂η − ∂b``, carrying the SAME tied, dry-aware limiter the
-        face states use — so at lake-at-rest (``∂η = 0``) it reduces to
-        ``−∂b`` and the interior NCP exactly cancels the η hydrostatic face
-        flux.  ``b`` and the momentum rows already carry their tied limited
-        slopes ``φ·grad``."""
-        Q_L, Q_R, grads, phi = self._eta_core(Q, bf_face_values, force_o1)
-        lim_grad = phi[:, jnp.newaxis, :] * grads     # slopes on (b, η, hu, hv)
-        # η row → conservative h slope ∂η − ∂b (tied limiter on both rows).
-        lim_grad = lim_grad.at[self._h_idx].set(
-            lim_grad[self._h_idx] - lim_grad[self._b_idx])
+        Returning the W-consistent slope instead, pushed back to CONSERVATIVE
+        variables through the EMITTED inverse: at lake-at-rest (``∂η = 0``) the
+        depth slope reduces to ``−∂b`` and the interior NCP exactly cancels the
+        hydrostatic face flux.
+
+        The push-back is a JVP of ``state_from_reconstruction``, NOT a
+        hand-written chain rule.  ``B(Q_c)·s_c`` contracts against the
+        CONSERVATIVE state gradient, but the limited slopes above live on the
+        emitted ``W`` — and now that the momentum row of ``W`` is the PRIMITIVE
+        velocity ``u`` rather than ``q``, ``∂q = h·∂u + u·∂h ≠ ∂u``.  Writing
+        that transform out by hand here would re-introduce exactly the kind of
+        backend-local duplicate of the model map this change exists to delete
+        (and would be silently wrong for any model whose inverse is not SWE's).
+        ``jax.jvp`` differentiates the emitted inverse itself, so the chain rule
+        is whatever the model says it is.
+
+        For SWE/SME this is not merely cosmetic bookkeeping: it keeps the h row
+        at ``∂η − ∂b`` (identical to the old hand-written line, verified
+        numerically) while giving the momentum rows the conservative slope the
+        old code only got by accident, because it reconstructed ``q`` directly.
+        """
+        Q_L, Q_R, grads, phi = self._eta_core(
+            Q, bf_face_values, force_o1, Qaux, parameters, bf_aux)
+        lim_grad = phi[:, jnp.newaxis, :] * grads     # slopes on emitted W
+        # Linearize about the CELL-CENTRE W, sliced to the owned cells so it
+        # matches the slope array's cell axis exactly (no silent broadcast).
+        W_c = self._w_of_q(Q, Qaux, parameters)[:, :self._nc]
+        aux0 = jnp.zeros((Qaux.shape[0], self._nc), dtype=W_c.dtype)
+
+        def _push(dW):
+            """W-slope -> conservative-state slope, per direction."""
+            return jax.jvp(
+                lambda w: self._q_of_w(w, aux0, parameters),
+                (W_c,), (dW,))[1]
+
+        # vmap over the DIRECTION axis of lim_grad (n_state, dim, n_cells).
+        lim_grad = jax.vmap(_push, in_axes=1, out_axes=1)(
+            lim_grad[:, :, :self._nc])
         return Q_L, Q_R, lim_grad
 
 

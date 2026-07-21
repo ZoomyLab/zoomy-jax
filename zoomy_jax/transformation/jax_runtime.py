@@ -360,6 +360,50 @@ class JaxRuntime:
             )
         else:
             self.state_update = None
+
+        # ── reconstruction_variables / state_from_reconstruction ──────────
+        # The order-2 primitive reconstruction MODEL MAP PAIR, emitted here so
+        # jax consumes the SAME (b, b+h, hinv·q) that OpenFOAM's
+        # ``Model::reconstruction_variables`` / ``state_from_reconstruction``
+        # consume (``zoomy_foam/numerics_o2.H``).  MANDATE 6a: the ``1/h`` in
+        # the forward map is the KP-desingularized ``hinv`` AUX that core swept
+        # in via ``desingularize_hinv`` (``_RECONSTRUCTION_OPERATORS``) at the
+        # canonical ``wet_dry_eps`` — so the reconstruction needs NO threshold
+        # of its own, and no backend-side literal can disagree with core.
+        #
+        # Both are NON-slot model maps, so (like ``state_update`` above) they
+        # keep a hand-built arg list rather than a declared ``operator_signature``.
+        # The INVERSE is expressed in fresh ``WB_<state>`` symbols (see
+        # ``zoomy_core.model.reconstruction_inverse``), NOT in the state
+        # symbols — its first arg group is therefore the WB vector, fed with
+        # the limiter's reconstructed primitive FACE values.
+        rv = getattr(sm, "reconstruction_variables", None)
+        sfr = getattr(sm, "state_from_reconstruction", None)
+        if rv is not None and sfr is not None:
+            from zoomy_core.model.reconstruction_inverse import (
+                reconstruction_symbols)
+            wb_syms = reconstruction_symbols(self._q_syms)
+            rv_arr = _to_array_of_exprs(rv)
+            sfr_arr = _to_array_of_exprs(sfr)
+            self.reconstruction_variables = self._vmap_cell(
+                _lambdify_array(rv_arr, std, self.module), n_extra=0)
+            self.state_from_reconstruction = self._vmap_cell(
+                _lambdify_array(
+                    sfr_arr, (wb_syms, self._qaux_syms, self._p_syms),
+                    self.module),
+                n_extra=0)
+            # Does the INVERSE actually read aux?  The face pass has cell-centre
+            # aux, not face aux; if the inverse needed a face-interpolated aux
+            # we would be silently feeding it the wrong thing.  Record the fact
+            # rather than assume it — the consumer asserts on it.
+            _aux_set = set(self._qaux_syms)
+            self.state_from_reconstruction_uses_aux = any(
+                _aux_set & sp.sympify(e).free_symbols
+                for e in sp.flatten(sfr_arr))
+        else:
+            self.reconstruction_variables = None
+            self.state_from_reconstruction = None
+            self.state_from_reconstruction_uses_aux = False
         # ── mass_matrix: (n_eq, n_state)
         self.mass_matrix = self._build_slot_operator(
             "mass_matrix", sm.mass_matrix)
