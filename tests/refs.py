@@ -8,7 +8,9 @@ import json, pathlib, numpy as np
 DIR = pathlib.Path(__file__).parent / "refs"
 DIAG = DIR / "diagnostics"
 TIMES = DIR / "timings.json"
-SLOWER_OK = 1.10          # a test may get 10% slower; faster ratchets down
+SLOWER_OK = 1.25          # a test may get 25% slower (user ruling 2026-07-21:
+                          # 10% sits below this shared box's noise floor —
+                          # 23% spread measured on identical code); faster ratchets down
 
 
 def dump(name, **arrays):
