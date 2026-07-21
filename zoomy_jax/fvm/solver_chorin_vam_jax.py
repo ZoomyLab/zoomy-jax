@@ -778,18 +778,25 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         # scipy (the numpy reference) does -- was tried and reverted; it is a
         # serialising `while_loop` and it was NOT faster here.
         #
-        # ⚠ OPEN COST PROBLEM, measured, not yet solved.  Both solve methods
-        # take the four jax Chorin test modules from ~170 s to >45 min without
-        # finishing.  The driver is NOT the solve method: it is that the solve
-        # now targets the emitted 1e-10 (was a literal 1e-6) on an
-        # UNPRECONDITIONED O(1/h^2) operator, cannot reach it, and therefore
-        # burns the whole `restart * maxiter` budget on EVERY step instead of
-        # stopping after 20 vectors.  Note `pressure_maxit` is the wrong lever
-        # to trim (core measured that explicitly) -- once `restart` is the FULL
-        # space, GMRES has the exact answer after one cycle in exact
-        # arithmetic, so the extra 99 restarts are pure round-off chasing.  The
-        # real fix is a PRECONDITIONER for this block; until then a caller who
-        # needs the old speed sets `pressure_tol` explicitly.
+        # ⚠ OPEN COST QUESTION -- OBSERVED, CAUSE NOT ISOLATED.  Do not quote
+        # this as a result.  The four jax Chorin test modules ran green in
+        # ~170 s at the commit that introduced the emitted restart, and in
+        # three later runs the SAME modules were still unfinished after 45 min.
+        # The only functional delta across that boundary is the ACCEPT GATE,
+        # which cannot slow a Krylov solve down -- so either the box was not
+        # idle for the slow runs, or something here is not what it looks like.
+        # It was NOT measured on a confirmed-idle box, which is the standing
+        # requirement for any timing claim, so it is recorded as a question.
+        #
+        # The hypothesis worth testing first: the solve now targets the emitted
+        # 1e-10 (it used to target a literal 1e-6) on an UNPRECONDITIONED
+        # O(1/h^2) operator; where it cannot reach that, it burns the whole
+        # `restart * maxiter` budget every step instead of stopping after 20
+        # vectors.  If that is confirmed, `pressure_maxit` is still the wrong
+        # lever (core measured that) -- with `restart` at the FULL space GMRES
+        # has the answer after one cycle in exact arithmetic, so the remaining
+        # restarts chase round-off.  The fix would be a PRECONDITIONER for this
+        # block; a caller needing the old speed meanwhile sets `pressure_tol`.
         p_new, _info = jax_gmres(
             matvec, -b,
             atol=0.0, tol=c_elliptic_tol,
