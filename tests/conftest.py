@@ -4,9 +4,14 @@ Determinism:
 
 * ``JAX_PLATFORMS=cpu`` is pinned HERE, at module top, BEFORE any jax /
   zoomy_jax import anywhere in the suite (conftest imports first).
-* ``XLA_FLAGS=--xla_force_host_platform_device_count=2`` gives the
-  parallelization twin two real CPU devices — also before the first jax
-  import, because a test-file-level setdefault would be too late.
+* ``XLA_FLAGS=--xla_force_host_platform_device_count=4`` gives the SPMD tier
+  four real CPU devices — also before the first jax import, because a
+  test-file-level setdefault would be too late.  It USED to be 2 (enough for
+  the retired ``runtime/test_parallel_two_devices.py``); the ``tests/spmd``
+  suite moved in from the superrepo asserts device-count transparency across
+  {3, 4} devices and would SKIP itself into vacuity at 2.  A conftest that
+  imports first wins, so THIS number — not the ``setdefault`` at the top of
+  each spmd test module — is the one that takes effect.
 * x64 is ASSERTED, not set: ``zoomy_jax/__init__.py`` enables it by default,
   but a stray ``ZOOMY_JAX_ENABLE_X64=0`` in the environment silently flips the
   whole suite to float32 (LSQ error differs ~9 orders).  We hard-fail loudly
@@ -45,8 +50,8 @@ import sys
 
 # ── determinism: BEFORE any jax import ──────────────────────────────────────
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-# 2 CPU devices for the parallelization test — BEFORE the first jax import.
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=2")
+# 4 CPU devices for the SPMD tier — BEFORE the first jax import.
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
 
 # shared test modules (refs / models / cases) import bare
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))

@@ -760,7 +760,28 @@ class FreeSurfaceLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
             else tuple(range(h_index + 1, h_index + 1 + dim))
         )
 
-    def __call__(self, Q, bf_face_values):
+    # NOT a bare ``supports_grad_recon = True`` opt-in: the inherited
+    # ``LSQMUSCLReconstructionJAX.reconstruct_with_grad`` is NOT correct for
+    # this class.  It skips BOTH wet/dry treatments this class exists for —
+    # the dry-cell ``φ = 0`` demotion and ``_wet_dry_clamp`` — so an
+    # NCP-bearing model at order ≥ 2 would take face states with no wet/dry
+    # handling at all (the exact defeat the ``solver_jax.get_flux_operator``
+    # guard was written to catch: measured min h_face = −3.1e-03, NEGATIVE
+    # DEPTH, on the sibling ``PositivityPreservingLSQMUSCLJAX``).  The class
+    # therefore provides its OWN implementation below and ``__call__``
+    # delegates to it, so the two entry points cannot drift apart.
+
+    def reconstruct_with_grad(self, Q, bf_face_values):
+        """Wet/dry-aware twin of :meth:`__call__` that also returns the
+        LIMITED cell gradient for the order ≥ 2 cell-interior NCP integral.
+
+        The gradient returned is ``φ_dry · ∇Q`` — the SAME dry-demoted
+        limiter the face states are built from, so the interior NCP
+        ``B(Q_c)·s_c`` is consistent with the face fluctuations (in a dry
+        cell both are first order, slope ≡ 0).  ``_wet_dry_clamp`` is a
+        nonlinear clip of the FACE states only and has no slope counterpart;
+        it is applied to the faces here exactly as in ``__call__``.
+        """
         # Drop to first order in dry cells: zero φ for h < eps_wet.
         # ``phi`` is sized for inner cells only (``self._nc``); the
         # SPMD path may pass a full local mesh ``Q`` of shape
@@ -773,6 +794,11 @@ class FreeSurfaceLSQMUSCLJAX(LSQMUSCLReconstructionJAX):
         Q_L, Q_R = self._reconstruct(Q, grads, phi, bf_face_values)
         Q_L = self._wet_dry_clamp(Q_L)
         Q_R = self._wet_dry_clamp(Q_R)
+        return Q_L, Q_R, phi[:, jnp.newaxis, :] * grads
+
+    def __call__(self, Q, bf_face_values):
+        # Single body, single source of truth — see the note above.
+        Q_L, Q_R, _ = self.reconstruct_with_grad(Q, bf_face_values)
         return Q_L, Q_R
 
     def _wet_dry_clamp(self, Q_face):
