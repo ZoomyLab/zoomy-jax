@@ -4,10 +4,10 @@
  "bc_inflow": 1.217,
  "bc_periodic": 1.179,
  "bc_wall": 4.983,
- "boundary_o2_small": 2.152,
- "parity": 5.223,
+ "boundary_o2_small": 6.675,
+ "parity": 5.132,
  "ritter_dry": 1.245,
- "ritter_dry_o2_small": 3.129,
+ "ritter_dry_o2_small": 4.682,
  "stoker_wet": 1.224,
  "stoker_wet_o2_small": 1.867,
  "swashes_ritter_dry_o1": 4.011,
@@ -16,7 +16,7 @@
  "swashes_stoker_wet_o2": 8.098,
  "swe_2d": 7.819,
  "vam_chorin": 17.662,
- "vam_smooth_small": 14.612,
+ "vam_smooth_small": 14.42,
  "wb_lake": 1.452,
  "wb_long": 83.15
 }

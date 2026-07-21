@@ -489,10 +489,23 @@ class LSQMUSCLReconstructionJAX:
                         u_bf[jnp.maximum(bf, 0)],
                         u_i,
                     )
-                # Ghost-distance convention (see docstring): the virtual point
-                # sits at the ghost offset 2·(face - cell), so its delta is the
-                # GHOST delta u_ghost - u_cell = 2·(u_face - u_cell).
-                u_bf_delta = jnp.where(bf >= 0, 2.0 * (u_bf_i - u_i), 0.0)
+                # The virtual point sits at the ghost offset 2·(face - cell),
+                # so the delta it carries is u_ghost - u_cell — and ``u_bf`` is
+                # ALREADY a ghost value: the BC kernels return ghost semantics
+                # (Wall mirrors q -> -q; FromData returns 2·interp - Q). So it
+                # enters DIRECTLY, with no second lift.
+                #
+                # Lifting it again by 2·(u_bf - u_i) asserts q_ghost = -3·q at a
+                # wall instead of -q. That double lift is measurable and does
+                # NOT converge: it freezes a 7/6 (+16.67%) error into the
+                # boundary-cell wall-normal slope at every resolution, which is
+                # geometrically equivalent to placing the wall a quarter cell
+                # inside the domain. Fixed in the numpy twin at
+                # zoomy_core/fvm/reconstruction.py:591; matching it here.
+                # (Only a kernel that returns a FACE value would need the lift —
+                # that is what zoomy_core/mesh/lsq_reconstruction.py:431 does,
+                # and it applies the lift itself.)
+                u_bf_delta = jnp.where(bf >= 0, u_bf_i - u_i, 0.0)
                 delta_u = jnp.concatenate([u_cells, u_bf_delta])
             else:
                 delta_u = u_cells
