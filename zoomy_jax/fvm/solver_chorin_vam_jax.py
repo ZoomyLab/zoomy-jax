@@ -773,21 +773,28 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         # matvecs.  `restart` used to be jax's library default of 20; it is now
         # the emitted `c_elliptic_restart`, resolved from N above.
         #
-        # `solve_method='incremental'` is REQUIRED once the restart is resolved
-        # from N rather than pinned at 20.  jax's default 'batched' path builds
-        # the FULL `restart`-dimensional Krylov basis unconditionally (a
-        # `fori_loop` over `range(restart)`, no residual check inside the
-        # cycle), so a size-resolved restart of, say, 1000 costs 1000 matvecs
-        # per solve even when the residual hit tol at iteration 12.  scipy's
-        # gmres -- the numpy reference -- exits early inside the cycle, so
-        # 'incremental' is also the setting that makes the two backends run the
-        # same algorithm rather than merely the same operator.
+        # `solve_method` stays at jax's default 'batched'.  'incremental' --
+        # which checks the residual INSIDE the cycle and exits early, the way
+        # scipy (the numpy reference) does -- was tried and reverted; it is a
+        # serialising `while_loop` and it was NOT faster here.
+        #
+        # ⚠ OPEN COST PROBLEM, measured, not yet solved.  Both solve methods
+        # take the four jax Chorin test modules from ~170 s to >45 min without
+        # finishing.  The driver is NOT the solve method: it is that the solve
+        # now targets the emitted 1e-10 (was a literal 1e-6) on an
+        # UNPRECONDITIONED O(1/h^2) operator, cannot reach it, and therefore
+        # burns the whole `restart * maxiter` budget on EVERY step instead of
+        # stopping after 20 vectors.  Note `pressure_maxit` is the wrong lever
+        # to trim (core measured that explicitly) -- once `restart` is the FULL
+        # space, GMRES has the exact answer after one cycle in exact
+        # arithmetic, so the extra 99 restarts are pure round-off chasing.  The
+        # real fix is a PRECONDITIONER for this block; until then a caller who
+        # needs the old speed sets `pressure_tol` explicitly.
         p_new, _info = jax_gmres(
             matvec, -b,
             atol=0.0, tol=c_elliptic_tol,
             restart=c_elliptic_restart,
             maxiter=self.pressure_maxit,
-            solve_method="incremental",
         )
         # REQ-173's `elliptic` stage contract: the executor must surface
         # ‖b − A x‖/‖b‖.  ⚠ BACKEND DIVERGENCE, deliberate: numpy stores it on
