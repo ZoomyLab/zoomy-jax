@@ -110,8 +110,18 @@ def test_rain_mass_matches_rate_times_T_rain_jax():
     nsm = NumericalSystemModel.from_system_model(
         model, reconstruction=ReconstructionSpec(order=1))
 
+    # NOT a CFL-law test: this asserts a TIME INTEGRAL of a source that switches
+    # off at T_rain, so its accuracy is set by dt, not by stability.  The step
+    # straddling T_rain applies rain over its whole width, making the error
+    # O(rate*dt) — at the suite CFL (0.9, dimension=1 => dt = 0.9*dx/a = 0.0225)
+    # that is 0.011, four times the 5e-3 tolerance, and the test fails on
+    # quadrature error alone while the t-binding it exists to check is perfect.
+    # A fixed dt that divides T_rain and t_end exactly (0.05/1e-3 = 50 steps,
+    # 0.12/1e-3 = 120) puts the switch on a step boundary and drives the
+    # quadrature error to zero, leaving the assertion sensitive only to whether
+    # t is bound.  CFL here is 0.04 — stability is not the constraint.
     solver = HyperbolicSolver(
-        time_end=T_END, compute_dt=timestepping.adaptive(CFL=0.9, dimension=1))
+        time_end=T_END, compute_dt=timestepping.constant(dt=1.0e-3))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
 
     c = np.asarray(Q[0, :NC], dtype=float)
@@ -187,8 +197,12 @@ def test_source_binds_time_directly_jax():
     nsm = NumericalSystemModel.from_system_model(
         model, reconstruction=ReconstructionSpec(order=1))
 
+    # Fixed dt for the same reason as the aux test above: this measures a time
+    # integral, not stability, and the suite CFL's dt = 0.0225 straddles T_rain
+    # badly enough (O(rate*dt) = 0.011) to break a 5e-3 tolerance on quadrature
+    # error alone.  dt = 1e-3 divides both T_rain and t_end exactly.
     solver = HyperbolicSolver(
-        time_end=T_END, compute_dt=timestepping.adaptive(CFL=0.9, dimension=1))
+        time_end=T_END, compute_dt=timestepping.constant(dt=1.0e-3))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
 
     c = np.asarray(Q[0, :NC], dtype=float)
