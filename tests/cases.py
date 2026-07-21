@@ -50,12 +50,26 @@ ESC_H_RES, ESC_H_DRY = 0.34, 0.015
 # condition number grows like O(1/h^2) and the attainable residual degrades
 # with every refinement.
 #
-# CONSEQUENCE, and why ``test_vam_second_order`` fails: the error in the
-# pressure modes is then set by the solver residual rather than by the
-# discretization, so P_0 / P_1 DIVERGE under refinement (per-row Richardson
-# rates -1.60 / -1.87) while the conservative rows h, q_0, q_1, r_0, r_1 all
-# converge with positive rates.  Loosening this constant would hide a real
-# defect behind a number that merely looks converged.
+# The GMRES stagnation above is REAL and still worth fixing with a
+# preconditioner.  But the paragraph that used to sit here — claiming the
+# stagnation is "why ``test_vam_second_order`` fails", because the pressure
+# error is set by the solver residual rather than the discretization — is
+# WRONG, and it misled a later reader into recommending the preconditioner as
+# the top VAM priority.  RETRACTED, with the measurement that killed it:
+#
+#   config                       aggregate   P_0     P_1
+#   defaults (order=1!)            -1.456   -1.61   -1.86
+#   ReconstructionSpec(order=2)    +1.183   +0.93   +1.00
+#
+# Same solver, same tolerance, same unpreconditioned GMRES — only the
+# reconstruction order changed, and the pressure rows go from diverging to
+# converging.  The test was failing because it never requested second order:
+# ``ReconstructionSpec`` defaults to ``order=1`` and ``time_order`` defaults
+# to 1, and the test passed neither.
+#
+# What IS still open at order 2: ``h`` converges at ~1.07, not 2.  That is the
+# real remaining defect, and it is a spatial-convergence question about the
+# depth row, not an elliptic-solver question.
 VAM_PRESSURE_TOL = 1e-13
 
 # The cached SWASHES analytic tables live in the thesis case; zoomy_jax always

@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import zoomy_core.model.initial_conditions as IC
 from zoomy_core.mesh import LSQMesh
+from zoomy_core.numerics.numerical_system_model import ReconstructionSpec
 from zoomy_core.systemmodel.system_model import SystemModel
 
 import models
@@ -26,6 +27,15 @@ def test_vam_second_order(overwrite):
     PROVES the order, NOT the consistency: a wrong scheme can self-converge
     to a wrong limit.  VAM correctness lives in the bump-vs-experiment test
     and the core VAM->SME O(mu) smooth-limit test.
+
+    THE ORDER KNOBS MUST BE PASSED EXPLICITLY.  ``ReconstructionSpec`` defaults
+    to ``order=1`` and ``ChorinSplitVAMSolverJax.time_order`` defaults to 1, so
+    a call that passes neither runs a FULLY FIRST-ORDER scheme.  This test did
+    exactly that and asserted second order against it — measured, at the
+    defaults: aggregate -1.456 with the pressure rows at -1.61/-1.86.  Passing
+    ``order=2`` alone moves the SAME run to aggregate +1.183 with the pressure
+    rows at +0.93/+1.00.  The pressure divergence was never the elliptic
+    solver; it was the reconstruction order.
     """
     Ns, T_END = [64, 128, 256], 0.05          # N, 2N, 4N — a couple of steps
     model = models.vam(level=1, dimension=2, bc="periodic")
@@ -40,7 +50,9 @@ def test_vam_second_order(overwrite):
         mesh = LSQMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=n)
         sols[n], auxs[n] = chorin_march(triple, mesh, cfl=CFL,
                                         ic=smooth_vam_ic, t_end=T_END,
-                                        pressure_tol=VAM_PRESSURE_TOL)
+                                        pressure_tol=VAM_PRESSURE_TOL,
+                                        reconstruction=ReconstructionSpec(order=2),
+                                        time_order=2)
     elapsed = time.perf_counter() - t0
 
     D1 = np.abs(restrict(sols[Ns[1]]) - sols[Ns[0]])
