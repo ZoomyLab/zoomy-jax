@@ -56,7 +56,7 @@ def test_periodic_advection_conserves_mass():
 
     solver = HyperbolicSolver(
         time_end=2.0 * L / U0,                        # ~2 full wraps
-        compute_dt=timestepping.adaptive(CFL=0.3))
+        compute_dt=timestepping.adaptive(CFL=0.9, dimension=1))
 
     Q0, _ = solver.setup_simulation(mesh, nsm)
     mass0 = float(np.sum(np.asarray(Q0)[1, :NC] * vol))

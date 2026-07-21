@@ -10,7 +10,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, ORDER_FLOOR, restrict
+from conftest import CFL, ORDER_FLOOR, restrict
 
 
 @pytest.mark.regression
@@ -38,7 +38,7 @@ def test_vam_second_order(overwrite):
     t0 = time.perf_counter()
     for n in Ns:
         mesh = LSQMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=n)
-        sols[n], auxs[n] = chorin_march(triple, mesh, cfl=CFL_1D,
+        sols[n], auxs[n] = chorin_march(triple, mesh, cfl=CFL,
                                         ic=smooth_vam_ic, t_end=T_END,
                                         pressure_tol=VAM_PRESSURE_TOL)
     elapsed = time.perf_counter() - t0

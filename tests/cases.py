@@ -300,7 +300,7 @@ def _boundary_reference(t_end: float, n_ref: int):
     conservatively averaged down.  Computed ONCE per session (lru_cache).
     """
     import models
-    from conftest import CFL_1D, march
+    from conftest import CFL, march
     from zoomy_core.mesh import LSQMesh
     from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
     from zoomy_core.systemmodel.system_model import SystemModel
@@ -312,7 +312,7 @@ def _boundary_reference(t_end: float, n_ref: int):
         sm, reconstruction=ReconstructionSpec(order=2, limiter="minmod"))
     set_state_width(nsm)
     mesh = LSQMesh.create_1d(domain=BOUNDARY_DOMAIN, n_inner_cells=n_ref)
-    Q, _ = march(nsm, mesh, cfl=CFL_1D, t_end=t_end)
+    Q, _ = march(nsm, mesh, cfl=CFL, t_end=t_end)
     return np.asarray(Q[1], float)
 
 
@@ -368,7 +368,7 @@ def march_with_history(nsm, mesh, t_end, cfl, n_samples: int = 50):
     from conftest import _adaptive
 
     n = mesh.n_inner_cells
-    solver = HyperbolicSolver(time_end=t_end, compute_dt=_adaptive(cfl))
+    solver = HyperbolicSolver(time_end=t_end, compute_dt=_adaptive(cfl, mesh))
     Q, Qaux = solver.setup_simulation(mesh, nsm)
     Qi = np.asarray(Q)[:, :n]
     eta0 = float((Qi[0] + Qi[1])[0])

@@ -12,7 +12,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, march
+from conftest import CFL, march
 
 
 @pytest.mark.small
@@ -28,7 +28,7 @@ def test_ahs26_small(overwrite):
 
     mesh = LSQMesh.create_1d(domain=AHS26_DOMAIN, n_inner_cells=20)
     t0 = time.perf_counter()
-    Q, Qaux = march(nsm, mesh, cfl=CFL_1D, n_steps=2)
+    Q, Qaux = march(nsm, mesh, cfl=CFL, n_steps=2)
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all()

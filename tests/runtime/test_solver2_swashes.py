@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from zoomy_core.mesh import LSQMesh
 
-from conftest import CFL_1D
+from conftest import CFL
 from cases import ritter_ic, stoker_ic
 from models import swe, state_index
 
@@ -47,7 +47,7 @@ def _march(nsm, order, recon="conservative"):
           dict(reconstruction_variables=recon, free_surface_h_index=1,
                free_surface_b_index=0))
     solver = MarchSolver(time_end=T_END, mood_redo=(order >= 2), **kw)
-    S = solver.setup_march(mesh, nsm, CFL=CFL_1D)
+    S = solver.setup_march(mesh, nsm, CFL=CFL)
     print(describe_nsm(nsm))          # user law: print the NSM matrices first
 
     nc = mesh.n_inner_cells

@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, march, wet_dry_o2
+from conftest import CFL, march, wet_dry_o2
 
 
 @pytest.mark.small
@@ -28,7 +28,7 @@ def test_ritter_dry(overwrite):
 
     mesh = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=100)
     t0 = time.perf_counter()
-    Q, Qaux = march(nsm, mesh, cfl=CFL_1D, t_end=1.0)
+    Q, Qaux = march(nsm, mesh, cfl=CFL, t_end=1.0)
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all()
@@ -63,7 +63,7 @@ def test_ritter_dry_o2_small(overwrite):
 
     mesh = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=20)
     t0 = time.perf_counter()
-    Q, Qaux = march(nsm, mesh, cfl=CFL_1D, n_steps=2, **wet_dry_o2(nsm))
+    Q, Qaux = march(nsm, mesh, cfl=CFL, n_steps=2, **wet_dry_o2(nsm))
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all()

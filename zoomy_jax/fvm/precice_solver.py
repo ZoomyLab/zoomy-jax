@@ -54,7 +54,12 @@ def precice_callback_write(interface, meshName, vertexIDs, dataName, data):
 class PreciceHyperbolicSolver(solver.HyperbolicSolver):
     """PreciceHyperbolicSolver. (class)."""
     settings: Zstruct = field(factory=lambda: Settings.default())
-    compute_dt: Callable = field(factory=lambda: timestepping.adaptive(CFL=0.45))
+    # CFL is a pure safety factor: the 1/d spatial-dimension factor already
+    # lives inside ``timestepping.adaptive``.  0.45 here double-counted it
+    # (effective 0.225 on a 2-D mesh).  A coupled 1-D case must pass its own
+    # ``adaptive(CFL=0.9, dimension=1)``.
+    compute_dt: Callable = field(
+        factory=lambda: timestepping.adaptive(CFL=0.9, dimension=2))
     num_flux: Callable = field(factory=lambda: flux.Zero())
     nc_flux: Callable = field(factory=lambda: nonconservative_flux.segmentpath())
     time_end: float = 0.1

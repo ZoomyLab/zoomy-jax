@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, fit_order, march, wet_dry_o2
+from conftest import CFL, fit_order, march, wet_dry_o2
 
 
 @pytest.mark.regression
@@ -47,7 +47,7 @@ def test_swashes_order(overwrite, case, order):
         # reconstruction's default eps_wet, so the switch would be far from
         # neutral there.  Flagged rather than silently applied.
         kw = wet_dry_o2(nsm) if (order >= 2 and case == "ritter_dry") else {}
-        Q, Qaux = march(nsm, mesh, cfl=CFL_1D, t_end=SWASHES_T_END, **kw)
+        Q, Qaux = march(nsm, mesh, cfl=CFL, t_end=SWASHES_T_END, **kw)
         errs.append(l1_vs_analytic(Q, mesh, case, t=SWASHES_T_END))
     elapsed = time.perf_counter() - t0
 

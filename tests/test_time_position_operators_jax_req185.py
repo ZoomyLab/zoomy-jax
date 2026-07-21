@@ -111,7 +111,7 @@ def test_rain_mass_matches_rate_times_T_rain_jax():
         model, reconstruction=ReconstructionSpec(order=1))
 
     solver = HyperbolicSolver(
-        time_end=T_END, compute_dt=timestepping.adaptive(CFL=0.4))
+        time_end=T_END, compute_dt=timestepping.adaptive(CFL=0.9, dimension=1))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
 
     c = np.asarray(Q[0, :NC], dtype=float)
@@ -188,7 +188,7 @@ def test_source_binds_time_directly_jax():
         model, reconstruction=ReconstructionSpec(order=1))
 
     solver = HyperbolicSolver(
-        time_end=T_END, compute_dt=timestepping.adaptive(CFL=0.4))
+        time_end=T_END, compute_dt=timestepping.adaptive(CFL=0.9, dimension=1))
     Q, _ = solver.solve(mesh, nsm, write_output=False)
 
     c = np.asarray(Q[0, :NC], dtype=float)

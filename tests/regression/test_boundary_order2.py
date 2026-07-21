@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, ORDER_FLOOR, fit_order, march
+from conftest import CFL, ORDER_FLOOR, fit_order, march
 
 
 @pytest.mark.regression
@@ -35,7 +35,7 @@ def test_second_order_at_boundaries(overwrite):
             print(describe(nsm))
         set_state_width(nsm)
         mesh = LSQMesh.create_1d(domain=BOUNDARY_DOMAIN, n_inner_cells=n)
-        Q, Qaux = march(nsm, mesh, cfl=CFL_1D, t_end=BOUNDARY_T_END)
+        Q, Qaux = march(nsm, mesh, cfl=CFL, t_end=BOUNDARY_T_END)
         for w, e in l1_by_window(Q, mesh, t=BOUNDARY_T_END).items():
             err[w].append(e)
     elapsed = time.perf_counter() - t0

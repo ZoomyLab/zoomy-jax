@@ -169,7 +169,7 @@ def _run(N: int, order: int) -> tuple[np.ndarray, np.ndarray]:
         model, reconstruction=ReconstructionSpec(order=order, limiter="minmod"))
     solver = SWEHyperbolicSolver(
         time_end=T_END,
-        compute_dt=timestepping.adaptive(CFL=0.3),
+        compute_dt=timestepping.adaptive(CFL=0.9, dimension=1),
     )
     Q, _ = solver.solve(mesh, nsm, write_output=False)
     x = np.asarray(mesh.cell_centers[0, :N])
@@ -207,7 +207,7 @@ def _run_smooth(N: int, order: int, t_end: float = T_SMOOTH) -> tuple[np.ndarray
         model, reconstruction=ReconstructionSpec(order=order, limiter="minmod"))
     solver = SWEHyperbolicSolver(
         time_end=t_end,
-        compute_dt=timestepping.adaptive(CFL=0.3),
+        compute_dt=timestepping.adaptive(CFL=0.9, dimension=1),
     )
     Q, _ = solver.solve(mesh, nsm, write_output=False)
     x = np.asarray(mesh.cell_centers[0, :N])

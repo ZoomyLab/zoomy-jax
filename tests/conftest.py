@@ -73,7 +73,19 @@ logger.remove()
 
 
 # ── the CFL law (user mandate — no augmentation, ever) ──────────────────────
-CFL_1D, CFL_2D = 0.9, 0.45          # user law — no augmentation, ever
+# ONE number, in EVERY dimension.  ``timestepping.adaptive`` already carries the
+# spatial-dimension factor INSIDE the formula
+#
+#     dt <= CFL * 2*r_in / (d * (2k+1) * |lambda|_max)      (d = mesh dimension)
+#
+# so ``CFL`` is a pure safety factor in (0, 1] and the law "effective 0.9 in
+# 1-D, 0.45 in 2-D" falls out of the ``1/d`` by construction.  A separate
+# ``CFL_2D = 0.45`` constant encoded that SAME dimensional factor a SECOND
+# time and silently quartered the 2-D step (measured effective 0.225); passing no
+# ``dimension`` at all left the default d=2 on 1-D meshes and halved those.
+# Do NOT "fix" this back into a per-dimension split — pass the MESH's
+# ``dimension`` into :func:`_adaptive` instead.
+CFL = 0.9                           # user law — no augmentation, ever
 ORDER_FLOOR = {1: 0.9, 2: 1.9}      # measured smooth rates are 1.95-2.11
 
 G = 9.81
@@ -146,7 +158,7 @@ def march(nsm, mesh, cfl, t_end=None, n_steps=None, n_devices=1, **solver_kw):
 
     n = mesh.n_inner_cells
     if t_end is not None:
-        solver = HyperbolicSolver(time_end=t_end, compute_dt=_adaptive(cfl),
+        solver = HyperbolicSolver(time_end=t_end, compute_dt=_adaptive(cfl, mesh),
                                   **solver_kw)
         Q, Qaux = solver.solve(mesh, nsm, write_output=False)
         return np.asarray(Q)[:, :n], np.asarray(Qaux)[:, :n]
@@ -154,7 +166,7 @@ def march(nsm, mesh, cfl, t_end=None, n_steps=None, n_devices=1, **solver_kw):
     # n_steps: drive step/post_step directly so the count is EXACT.  Marching
     # to a t_end guessed from dt would silently take a different number of
     # steps as soon as the wave speed changes.
-    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl),
+    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl, mesh),
                               **solver_kw)
     Q, Qaux = solver.setup_simulation(mesh, nsm)
     t = 0.0
@@ -236,13 +248,13 @@ def march_sharded(nsm, mesh, cfl, n_devices, t_end=None, n_steps=None,
     n = mesh.n_inner_cells
 
     # dt from the unsharded mesh at the SAME CFL law, then frozen.
-    ref = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl),
+    ref = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl, mesh),
                            **solver_kw)
     Q0, Qaux0 = ref.setup_simulation(mesh, nsm)
     dt = float(ref.compute_timestep(Q0, Qaux0))
 
     parts = partition_1d_contiguous(mesh, n_parts=n_devices, halo=halo)
-    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl),
+    solver = HyperbolicSolver(time_end=np.inf, compute_dt=_adaptive(cfl, mesh),
                               **solver_kw)
     solver.setup_simulation(parts[0], nsm)
 
@@ -265,9 +277,17 @@ def march_sharded(nsm, mesh, cfl, n_devices, t_end=None, n_steps=None,
 LAST_SHARD: dict = {"devices": 1}
 
 
-def _adaptive(cfl):
+def _adaptive(cfl, mesh):
+    """``timestepping.adaptive`` with the MESH's spatial dimension.
+
+    ``dimension`` is NOT optional here, on purpose.  It defaults to 2 in core,
+    so every 1-D march that omitted it silently ran at HALF the law (the
+    ``1/d`` factor applied to a mesh that has no second direction).  Reading it
+    off ``mesh.dimension`` is what makes the single ``CFL`` constant above
+    correct in every dimension.
+    """
     import zoomy_core.fvm.timestepping as timestepping
-    return timestepping.adaptive(CFL=cfl)
+    return timestepping.adaptive(CFL=cfl, dimension=int(mesh.dimension))
 
 
 def fit_order(sizes, errors):

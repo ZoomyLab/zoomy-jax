@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D
+from conftest import CFL
 
 
 @pytest.mark.regression
@@ -31,7 +31,7 @@ def test_wb_drift_history(overwrite):
     mesh = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=200)
     t0 = time.perf_counter()
     Q, Qaux, t, drift, umax = march_with_history(nsm, mesh, t_end=50.0,
-                                                 cfl=CFL_1D)
+                                                 cfl=CFL)
     elapsed = time.perf_counter() - t0
 
     assert drift.max() < 1e-10, f"surface drift {drift.max():.2e} at t=50 s"

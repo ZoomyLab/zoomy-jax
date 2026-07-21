@@ -128,7 +128,7 @@ def _run(order: int) -> tuple[LSQMesh, np.ndarray]:
     )
     solver = SWE2DHyperbolicSolver(
         time_end=T_END,
-        compute_dt=timestepping.adaptive(CFL=0.3),
+        compute_dt=timestepping.adaptive(CFL=0.9, dimension=2),
     )
     Q, _ = solver.solve(mesh, nsm, write_output=False)
     return mesh, np.asarray(Q)

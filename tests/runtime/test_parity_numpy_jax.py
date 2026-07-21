@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, march
+from conftest import CFL, march
 
 
 @pytest.mark.small
@@ -30,9 +30,10 @@ def test_numpy_jax_parity(overwrite):
 
     mesh = LSQMesh.create_1d(domain=(0.0, 10.0), n_inner_cells=50)
     t0 = time.perf_counter()
-    Qj, Aj = march(nsm, mesh, cfl=CFL_1D, t_end=0.5)
+    Qj, Aj = march(nsm, mesh, cfl=CFL, t_end=0.5)
     Qn, An = NumpySolver(time_end=0.5,
-                         compute_dt=timestepping.adaptive(CFL=CFL_1D)
+                         compute_dt=timestepping.adaptive(
+                             CFL=CFL, dimension=int(mesh.dimension))
                          ).solve(mesh, nsm, write_output=False)
     elapsed = time.perf_counter() - t0
     n = mesh.n_inner_cells

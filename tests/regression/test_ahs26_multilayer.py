@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, march
+from conftest import CFL, march
 
 
 @pytest.mark.regression
@@ -28,7 +28,7 @@ def test_ahs26_multilayer(overwrite):
 
     mesh = LSQMesh.create_1d(domain=AHS26_DOMAIN, n_inner_cells=200)
     t0 = time.perf_counter()
-    Q, Qaux = march(nsm, mesh, cfl=CFL_1D, t_end=AHS26_T_END)
+    Q, Qaux = march(nsm, mesh, cfl=CFL, t_end=AHS26_T_END)
     elapsed = time.perf_counter() - t0
 
     err = ahs26_l1_vs_reference(Q, mesh)

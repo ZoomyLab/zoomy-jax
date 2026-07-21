@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D
+from conftest import CFL
 
 
 @pytest.mark.small
@@ -26,7 +26,7 @@ def test_vam_chorin_short(overwrite):
 
     mesh = LSQMesh.create_1d(domain=ESC_DOMAIN, n_inner_cells=ESC_NCELLS)
     t0 = time.perf_counter()
-    Q, Qaux = chorin_march(triple, mesh, cfl=CFL_1D, ic=bump_ic, t_end=0.5,
+    Q, Qaux = chorin_march(triple, mesh, cfl=CFL, ic=bump_ic, t_end=0.5,
                            h_scale=ESC_H_RES)
     elapsed = time.perf_counter() - t0
 
@@ -49,7 +49,7 @@ def test_vam_smooth_small(overwrite):
 
     mesh = LSQMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=20)
     t0 = time.perf_counter()
-    Q, Qaux = chorin_march(triple, mesh, cfl=CFL_1D, ic=smooth_vam_ic,
+    Q, Qaux = chorin_march(triple, mesh, cfl=CFL, ic=smooth_vam_ic,
                            n_steps=2, pressure_tol=VAM_PRESSURE_TOL)
     elapsed = time.perf_counter() - t0
 

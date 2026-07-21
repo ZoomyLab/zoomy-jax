@@ -11,7 +11,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, march
+from conftest import CFL, march
 
 
 @pytest.mark.small
@@ -30,7 +30,7 @@ def test_boundary_kinds(overwrite, kind):
 
     mesh = LSQMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=40)
     t0 = time.perf_counter()
-    Q, Qaux = march(nsm, mesh, cfl=CFL_1D, t_end=0.2)
+    Q, Qaux = march(nsm, mesh, cfl=CFL, t_end=0.2)
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all()
@@ -54,7 +54,7 @@ def test_boundary_o2_small(overwrite):
 
     mesh = LSQMesh.create_1d(domain=(0.0, 1.0), n_inner_cells=20)
     t0 = time.perf_counter()
-    Q, Qaux = march(nsm, mesh, cfl=CFL_1D, n_steps=2)
+    Q, Qaux = march(nsm, mesh, cfl=CFL, n_steps=2)
     elapsed = time.perf_counter() - t0
 
     assert np.isfinite(Q).all()

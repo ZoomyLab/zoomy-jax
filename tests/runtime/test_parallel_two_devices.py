@@ -27,7 +27,7 @@ from zoomy_core.systemmodel.system_model import SystemModel
 import models
 import refs
 from cases import *
-from conftest import CFL_1D, march_sharded
+from conftest import CFL, march_sharded
 
 N_STEPS = 6
 
@@ -55,8 +55,8 @@ def test_two_device_twin(overwrite):
     # solver instead would confound sharding with time-stepping: the sharded
     # path marches a fixed dt, and the two would diverge for that reason
     # alone and prove nothing about the halo.
-    Q1, A1 = march_sharded(nsm, mesh, CFL_1D, 1, n_steps=N_STEPS)
-    Q2, A2 = march_sharded(nsm, mesh, CFL_1D, 2, n_steps=N_STEPS)
+    Q1, A1 = march_sharded(nsm, mesh, CFL, 1, n_steps=N_STEPS)
+    Q2, A2 = march_sharded(nsm, mesh, CFL, 2, n_steps=N_STEPS)
     elapsed = time.perf_counter() - t0
 
     assert used_devices(Q2) == 2, "the 2-device run did not actually shard"
