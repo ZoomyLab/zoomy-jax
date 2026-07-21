@@ -173,12 +173,17 @@ def test_spmd_real_solver_2d_transparent(order):
     assert np.max(np.abs(a - b)) < 1e-10, "2D real-solver SPMD not device-count transparent"
 
 
-# SMALL, but the suite's slowest test by far: MEASURED 195 s here (next
-# slowest 64 s, whole spmd tier 386 s).  The cost is XLA COMPILE, not
-# arithmetic — the N-step Arnoldi is UNROLLED inside ``shard_map`` with a
-# collective per inner product.  195 s < the 300 s size-rule threshold, so it
-# stays ``small``; if N is ever raised the mark has to move to ``large`` with
-# it.
+# The spmd tier's slowest test, MEASURED 195 s when the tier runs on its own
+# (next slowest 64 s; whole tier 386 s) — under the 300 s size-rule threshold,
+# hence ``small``.  The cost is XLA COMPILE, not arithmetic: the N-step Arnoldi
+# is UNROLLED inside ``shard_map`` with a collective per inner product.
+#
+# REPORTED, not accommodated: in a SINGLE process that has already run the rest
+# of the zoomy_jax tier, this test (and others in this tier) blow past 10 min
+# apiece — the shard_map compile time grows with what the process has already
+# traced.  Marking one test ``large`` does not fix that; it is a property of
+# running the whole tier in one interpreter, and it needs a real fix (smaller
+# N, or a per-file process) rather than a mark that hides it.
 @pytest.mark.small
 @pytest.mark.unittest
 @pytest.mark.jax

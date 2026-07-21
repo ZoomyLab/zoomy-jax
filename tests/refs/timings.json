@@ -5,6 +5,7 @@
  "bc_periodic": 1.179,
  "bc_wall": 4.983,
  "boundary_o2_small": 6.675,
+ "boundary_order2": 41.157,
  "parity": 5.132,
  "ritter_dry": 1.245,
  "ritter_dry_o2_small": 4.682,

@@ -20,7 +20,6 @@ Import style: bare (``from cases import ...``) — see ``conftest.py`` for why
 from __future__ import annotations
 
 import csv
-import functools
 import pathlib
 
 import numpy as np
@@ -82,14 +81,17 @@ def bcs_for(kind: str, dimension: int):
         # SWASHES and the Escalante bump both run open (extrapolation) ends.
         return BC.BoundaryConditions([BC.Extrapolation(tag=t) for t in tags])
     if kind == "wall":
-        # ``Wall.momentum_field_indices`` DEFAULTS to [[1, 2]] — a
-        # two-component momentum at state rows 1,2.  Our state is
-        # [b, h, q_0(, q_1)], so the default would reflect (h, q_0) as a
-        # 2-vector and raise a sympy ShapeError against a 1-D normal.  The
-        # momentum rows are 2 for 1-D horizontal, (2, 3) for 2-D.
-        mom = [[2]] if dimension == 2 else [[2, 3]]
-        return BC.BoundaryConditions(
-            [BC.Wall(tag=t, momentum_field_indices=mom) for t in tags])
+        # NO ``momentum_field_indices``: it defaults to ``None`` = DERIVE from
+        # the model's own ``interpolate_to_3d`` rows at resolve time
+        # (``zoomy_core/model/boundary_conditions.py``
+        # ``derive_momentum_field_indices`` / ``_DerivedMomentumIndices``).
+        # It USED to be pinned here to ``[[2]]`` / ``[[2, 3]]`` because the
+        # old default was a hard-coded ``[[1, 2]]`` that reflected (h, q_0) as
+        # a 2-vector and raised a sympy ShapeError against a 1-D normal.  The
+        # derived default now yields exactly those same rows for the DERIVED
+        # SME state ``[b, h, q_0(, q_1)]``, and deriving beats pinning: a
+        # pinned index silently goes stale the moment the state layout moves.
+        return BC.BoundaryConditions([BC.Wall(tag=t) for t in tags])
     if kind == "periodic":
         # Periodic BCs come in PAIRS: each carries the tag it maps onto.
         # Leaving ``periodic_to_physical_tag`` at its "" default makes the
@@ -287,67 +289,77 @@ def l1_vs_analytic(Q, mesh, case: str, t: float) -> float:
     return float(np.sum(np.abs(h - h_exact) * dx) / np.sum(dx))
 
 
-# ── region-decomposed convergence (the REQ-46 boundary probe) ───────────────
-BOUNDARY_DOMAIN, BOUNDARY_T_END, BOUNDARY_N_REF = (0.0, 1.0), 0.2, 1600
+# ── boundary-order probe: ACOUSTIC standing wave in a CLOSED BOX ────────────
+# RETRIEVED case, not a constructed one.  Source:
+# ``tests/scripts/zoomy_core/swe/run_acoustic_wall_convergence.py`` at superrepo
+# sha d6cafaab ("Standing wave convergence test: O2 rate 2.25 at walls",
+# 2026-04-11), deleted at 2cc22d51.
+#
+# WHY THIS REPLACED THE CONSTRUCTED SMOOTH-DIRICHLET CASE: that one had NO
+# closed form, so it measured the error against a 1600-cell run of the SAME
+# code conservatively averaged down.  A self-reference cannot separate "the
+# scheme is 2nd order" from "the scheme and its own reference share a defect",
+# and it sat at rate 0.83 with no way to tell which.  The standing wave has an
+# EXACT solution and the wall BCs are exactly the BCs the boundary treatment
+# has to get right.
+#
+# SWE linearised about h = H0 in a box with a WALL at each end:
+#     h(x, t) = H0 + A cos(m π x / L) cos(m π c t / L)
+#     u(x, t) = (A c / H0) sin(m π x / L) sin(m π c t / L),   c = sqrt(g H0)
+# After one full period the exact solution is the IC again, so the error needs
+# no quadrature of an analytic profile at an awkward time — it is |h − h(t=0)|.
+ACOUSTIC_DOMAIN = (0.0, 1.0)
+ACOUSTIC_H0 = 1.0
+ACOUSTIC_A = 1e-4          # linear amplitude: 1e-4 keeps the wave acoustic,
+                           # so the closed form is the solution and not just
+                           # its leading order
+ACOUSTIC_MODE = 1
+ACOUSTIC_PERIODS = 1
 
 
-@functools.lru_cache(maxsize=None)
-def _boundary_reference(t_end: float, n_ref: int):
-    """A well-resolved reference for the smooth-Dirichlet march.
-
-    There is no closed form for the nonlinear SWE with this IC, so the error
-    is measured against a run at ``n_ref`` cells — 4x the finest study mesh —
-    conservatively averaged down.  Computed ONCE per session (lru_cache).
-    """
-    import models
-    from conftest import CFL, march
-    from zoomy_core.mesh import LSQMesh
-    from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
-    from zoomy_core.systemmodel.system_model import SystemModel
-    import zoomy_core.model.initial_conditions as IC
-
-    sm = SystemModel.from_model(models.swe(dimension=2, bc="inflow"))
-    sm.initial_conditions = IC.UserFunction(function=smooth_dirichlet_ic)
-    nsm = NumericalSystemModel.from_system_model(
-        sm, reconstruction=ReconstructionSpec(order=2, limiter="minmod"))
-    set_state_width(nsm)
-    mesh = LSQMesh.create_1d(domain=BOUNDARY_DOMAIN, n_inner_cells=n_ref)
-    Q, _ = march(nsm, mesh, cfl=CFL, t_end=t_end)
-    return np.asarray(Q[1], float)
+def acoustic_t_end() -> float:
+    """One full period of mode ``ACOUSTIC_MODE``."""
+    L = ACOUSTIC_DOMAIN[1] - ACOUSTIC_DOMAIN[0]
+    c = np.sqrt(G * ACOUSTIC_H0)
+    return ACOUSTIC_PERIODS * 2.0 * L / (ACOUSTIC_MODE * c)
 
 
-def coarsen(fine: np.ndarray, factor: int) -> np.ndarray:
-    """Conservative cell average of a fine field onto a coarse mesh."""
-    assert fine.size % factor == 0, (fine.size, factor)
-    return fine.reshape(-1, factor).mean(axis=1)
+def acoustic_h_exact(x) -> np.ndarray:
+    """``h`` of the standing wave at ``t = 0`` — and, after a whole number of
+    periods, at ``t = acoustic_t_end()`` as well."""
+    L = ACOUSTIC_DOMAIN[1] - ACOUSTIC_DOMAIN[0]
+    return ACOUSTIC_H0 + ACOUSTIC_A * np.cos(
+        ACOUSTIC_MODE * np.pi * np.asarray(x, float) / L)
 
 
-def l1_by_window(Q, mesh, t: float) -> dict:
-    """L1 error of h against the fine reference, decomposed into
+def acoustic_ic(x):
+    """``Q = [0, H0 + A cos(m π x / L), 0]`` — flat bed, fluid at rest."""
+    return _pad_state(np.array([0.0, float(acoustic_h_exact(float(x[0]))),
+                                0.0]))
+
+
+def acoustic_l2_by_window(Q, mesh) -> dict:
+    """L2 error of ``h`` against the CLOSED FORM, decomposed into
     full / interior / left-strip / right-strip windows.
 
-    The strips are the outer 10 % at each end — the region where a halved
-    boundary gradient (REQ-46) shows up and where a full-domain norm dilutes
-    it below visibility.
+    The windowed decomposition is kept from the constructed case it replaces:
+    the boundary defect it was built to expose showed up as an ASYMMETRY
+    between the left and right strips, which a full-domain norm dilutes below
+    visibility.  Strips are the outer 5 % (the historical case's ``N // 20``).
     """
     n = mesh.n_inner_cells
-    ref_fine = _boundary_reference(t, BOUNDARY_N_REF)
-    assert BOUNDARY_N_REF % n == 0, (
-        f"reference {BOUNDARY_N_REF} not a multiple of {n} — the conservative "
-        f"average would be inexact and would fake an error floor")
-    h_ref = coarsen(ref_fine, BOUNDARY_N_REF // n)
-    h = np.asarray(Q[1], float)
     x = np.asarray(mesh.cell_centers[0, :n], float)
-    dx = np.asarray(mesh.cell_volumes[:n], float)
-    err = np.abs(h - h_ref)
+    h = np.asarray(Q[1, :n], float)
+    assert np.all(np.isfinite(h)), "non-finite h — the march diverged"
+    assert h.min() > 0.5 * ACOUSTIC_H0, (
+        f"unphysical h.min() = {h.min()} — an acoustic wave of amplitude "
+        f"{ACOUSTIC_A} cannot legitimately move h by more than that")
+    d = h - acoustic_h_exact(x)
 
-    lo, hi = BOUNDARY_DOMAIN
-    L = hi - lo
-    left, right = x < lo + 0.1 * L, x > hi - 0.1 * L
-    masks = {"full": np.ones_like(x, bool), "interior": ~(left | right),
-             "left": left, "right": right}
-    return {w: float(np.sum(err[m] * dx[m]) / np.sum(dx[m]))
-            for w, m in masks.items()}
+    k = max(2, n // 20)
+    masks = {"full": slice(None), "interior": slice(k, n - k),
+             "left": slice(0, k), "right": slice(n - k, n)}
+    return {w: float(np.sqrt(np.mean(d[m] ** 2))) for w, m in masks.items()}
 
 
 # ── long-march history (well-balancing drift over time) ─────────────────────

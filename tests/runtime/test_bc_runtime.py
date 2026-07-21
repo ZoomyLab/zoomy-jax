@@ -41,9 +41,16 @@ def test_boundary_kinds(overwrite, kind):
 @pytest.mark.small
 @pytest.mark.jax
 def test_boundary_o2_small(overwrite):
-    """Small twin of boundary_order2: smooth space-varying Dirichlet, order 2,
-    20 cells, 2 steps.  Pins the REQ-46 boundary-gradient path (the factor-2
-    ghost convention in reconstruction_jax.py:456) without the sweep."""
+    """Smooth space-varying Dirichlet, order 2, 20 cells, 2 steps.  Pins the
+    REQ-46 boundary-gradient path (the factor-2 ghost convention in
+    ``reconstruction_jax.py``) in the small tier.
+
+    NOT the small twin of ``boundary_order2`` any more: that test moved onto
+    the retrieved acoustic standing wave in a CLOSED BOX (Wall BCs, exact
+    closed form).  Wall / Extrapolation / periodic are structurally BLIND to
+    a halved boundary gradient — the delta they carry is zero or a pure
+    reflection — so a Dirichlet with a NONZERO boundary slope is the only
+    thing that sees REQ-46, and this test is now its sole guard.  Keep it."""
     model = models.swe(dimension=2, bc="inflow")
     sm = SystemModel.from_model(model)
     sm.initial_conditions = IC.UserFunction(function=smooth_dirichlet_ic)
