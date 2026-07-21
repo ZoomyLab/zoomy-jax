@@ -72,7 +72,7 @@ class _SWE2D(StructuredDerivativeModel):
 
 
 class _SWE2DSolver(HyperbolicSolver):
-    def _build_reconstruction(self, mesh, symbolic_model):
+    def _build_reconstruction(self, mesh, symbolic_model, runtime=None):
         from zoomy_jax.fvm.reconstruction_jax import (
             ConstantReconstruction, FreeSurfaceLSQMUSCLJAX)
         if self.nsm.reconstruction.order >= 2:

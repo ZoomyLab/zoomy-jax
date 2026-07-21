@@ -62,7 +62,7 @@ class SWEHyperbolicSolver(HyperbolicSolver):
     dry front (LSQ-augmented stencil; mirrors NumPy
     ``FreeSurfaceLSQMUSCL``)."""
 
-    def _build_reconstruction(self, mesh, symbolic_model):
+    def _build_reconstruction(self, mesh, symbolic_model, runtime=None):
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
             # h is variable index 0 for our SWE1D model (state = [h, hu]).

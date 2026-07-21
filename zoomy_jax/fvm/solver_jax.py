@@ -456,7 +456,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return compute_max_abs_eigenvalue
 
-    def _build_reconstruction(self, mesh, symbolic_model, runtime):
+    def _build_reconstruction(self, mesh, symbolic_model, runtime=None):
         """Build JAX face reconstruction.
 
         First-order: piecewise-constant.  Second-order: the LSQ-augmented

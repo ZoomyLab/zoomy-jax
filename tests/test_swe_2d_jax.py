@@ -79,7 +79,7 @@ class SWE2D(StructuredDerivativeModel):
 class SWE2DHyperbolicSolver(HyperbolicSolver):
     """JAX HyperbolicSolver with wet/dry-aware reconstruction for SWE."""
 
-    def _build_reconstruction(self, mesh, symbolic_model):
+    def _build_reconstruction(self, mesh, symbolic_model, runtime=None):
         dim = symbolic_model.dimension
         if self.nsm.reconstruction.order >= 2:
             return FreeSurfaceLSQMUSCLJAX(
