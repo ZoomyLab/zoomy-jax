@@ -52,6 +52,7 @@ from zoomy_core.fvm.solver_chorin_vam_numpy import (
     ChorinSplitVAMSolver as _CoreChorin,
     _pad_to_square, _substitute_dt,
 )
+from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
 
 import zoomy_jax.fvm.ode as ode
 from zoomy_jax.fvm.solver_jax import HyperbolicSolver as HyperbolicSolverJax
@@ -91,14 +92,44 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         Predictor reconstruction spec.
     pressure_tol : float
     pressure_maxit : int
+    pressure_restart : int, optional
+        GMRES restart; ``None`` ⇒ resolved from the block size via the emitted
+        ``elliptic_constants``.
     time_order : int
         Number of OUTER SSP-RK2 stages, each running a full
         hyperbolic-Euler → Poisson → correction cycle.  1 = one cycle;
         2 = the paper's two-stage scheme.
     """
 
-    pressure_tol = param.Number(default=1e-6, bounds=(0, None))
-    pressure_maxit = param.Integer(default=100, bounds=(1, None))
+    pressure_tol = param.Number(
+        default=ELLIPTIC_RTOL, bounds=(0, None),
+        doc=("Relative tolerance for the elliptic pressure block.  Defaults to "
+             "the EMITTED ``c_elliptic_tol`` "
+             "(:data:`zoomy_core.solver.constants.ELLIPTIC_RTOL`) — mandate 6a: "
+             "the number lives in the emitted set, not as a literal beside the "
+             "``gmres`` call.  Was a hard-coded 1e-6 here, which also diverged "
+             "from the numpy reference solver's default."))
+    pressure_maxit = param.Integer(
+        default=100, bounds=(1, None),
+        doc=("Maximum OUTER iterations (RESTARTS) of the elliptic solve.  Read "
+             "with :attr:`pressure_restart`: jax's ``maxiter`` counts restarts "
+             "of a Krylov space of size ``restart``, so once the restarted "
+             "iteration stagnates this knob buys nothing.  The lever is "
+             "``restart``."))
+    pressure_restart = param.Integer(
+        default=None, allow_None=True, bounds=(1, None),
+        doc=("GMRES restart — the Krylov-space dimension rebuilt each outer "
+             "iteration, and the ACTUAL convergence lever for this block.  "
+             "``None`` (default) resolves it from the block size via the "
+             "emitted :func:`zoomy_core.solver.constants.elliptic_restart`, "
+             "i.e. the FULL space up to a memory cap.  jax hard-coded the "
+             "library default 20 here; measured, on a SMOOTH FULLY WET state "
+             "(min h = 0.9, sine wave, first step) that missed tol by 1.654e-04 "
+             "after restart=20 x maxiter=200 ~ 4000 matvecs.  The elliptic "
+             "operator is O(1/h^2)-conditioned and this solve is "
+             "unpreconditioned, so a FIXED restart degrades with every "
+             "refinement — which is exactly what poisons a convergence ladder.  "
+             "Pin an integer only to reproduce that degradation deliberately."))
     time_order = param.Integer(
         default=1, bounds=(1, 2),
         doc=("Number of OUTER SSP-RK2 (Shu-Osher) stages, each of which runs a "
@@ -689,6 +720,17 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
                               p_mat - pdir["cell_value"], R)
             return R.reshape(-1)
 
+        # Emitted elliptic constants (mandate 6a).  The restart is RESOLVED
+        # FROM ``N`` — the size of THIS pressure block — so it moves with the
+        # mesh instead of sitting as a literal beside the ``gmres`` call.  Same
+        # resolver the numpy solver consumes, so the two backends now assemble
+        # and solve the same problem with the same budget.
+        ell = elliptic_constants(n_unknowns=N, tol=self.pressure_tol,
+                                 restart=self.pressure_restart)
+        c_elliptic_tol = ell.values["c_elliptic_tol"]
+        c_elliptic_restart = ell.values["c_elliptic_restart"]
+        self.last_elliptic_restart = c_elliptic_restart
+
         b = _residual(jnp.zeros(N))
         zero_p = jnp.zeros(N)
 
@@ -704,12 +746,14 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         # measure the residual, which is what we do below.  (PETSc backends get
         # DIVERGED_ITS for free and print a warning; jax gets silence.)
         #
-        # `maxiter` here is the number of RESTARTS of a size-`restart` (default
-        # 20) Krylov space, NOT an iteration count -- the budget is ~20*maxiter
-        # matvecs.
+        # `maxiter` here is the number of RESTARTS of a size-`restart` Krylov
+        # space, NOT an iteration count -- the budget is ~restart*maxiter
+        # matvecs.  `restart` used to be jax's library default of 20; it is now
+        # the emitted `c_elliptic_restart`, resolved from N above.
         p_new, _info = jax_gmres(
             matvec, -b,
-            atol=0.0, tol=self.pressure_tol,
+            atol=0.0, tol=c_elliptic_tol,
+            restart=c_elliptic_restart,
             maxiter=self.pressure_maxit,
         )
         # REQ-173's `elliptic` stage contract: the executor must surface
@@ -740,8 +784,10 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         # Python `raise` on a tracer is impossible.
         h_min = (jnp.min(Q[self._h_row, :self.nc])
                  if self._h_row is not None else jnp.asarray(jnp.nan))
-        tol = float(self.pressure_tol)
+        tol = float(c_elliptic_tol)
         maxit = int(self.pressure_maxit)
+        restart = int(c_elliptic_restart)
+        restart_prov = ell.provenance["c_elliptic_restart"]
 
         def _abort(r, t_now, dt_now, hm):
             r = float(r)
@@ -752,7 +798,8 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
                 "Chorin elliptic (pressure) stage did NOT converge at step "
                 f"{step_no} (t={t_now:.6g}, dt={dt_now:.6g}): rel residual "
                 f"{r:.3e} > tol {tol:.1e} after the full GMRES budget "
-                f"(restart=20 x maxiter={maxit} ~ {20 * maxit} matvecs); "
+                f"(restart={restart} x maxiter={maxit} ~ {restart * maxit} "
+                f"matvecs; restart provenance: {restart_prov}); "
                 f"min(h)={hm:.6g}.  The march is ABORTED — a projection that "
                 "misses its tolerance leaves the corrector applying a "
                 "pressure that does not satisfy the elliptic constraint, and "
@@ -769,7 +816,7 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
             rr = float(rel_resid)
         except Exception:
             jax.lax.cond(
-                rel_resid > self.pressure_tol,
+                rel_resid > tol,
                 lambda r, tn, dn, hm: jax.debug.callback(_abort, r, tn, dn, hm),
                 lambda r, tn, dn, hm: None,
                 rel_resid, jnp.asarray(time, dtype=rel_resid.dtype),
