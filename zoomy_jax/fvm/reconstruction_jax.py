@@ -1060,7 +1060,7 @@ class EmittedWLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
     supports_force_o1 = True
 
     def __init__(self, mesh, dim, w_of_q, q_of_w, aux_of_q=None,
-                 b_index=0, h_index=1,
+                 eps_wet=None, b_index=0, h_index=1,
                  momentum_indices=None, positivity=None,
                  front_tol=None,
                  limiter="venkatakrishnan", unlimited_indices=None):
@@ -1096,6 +1096,18 @@ class EmittedWLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         # (``_apply_local_aux_formula`` / ``_ghost_aux``); the non-local
         # derivative-aux rows pass through from the supplied ``Qaux``.
         self._aux_of_q = aux_of_q
+        # EMITTED wet/dry threshold, or None.  NOT a class default — the whole
+        # point of this rewrite is that no float literal lives here.
+        #
+        # Why a demotion is still needed at all (MEASURED): the emitted W puts
+        # PRIMITIVE VELOCITY on the momentum row, and the face momentum is
+        # recovered as ``q_f = u_f·h_f``.  In a near-dry cell the η-row
+        # extrapolation can hand back a face depth much LARGER than the cell's
+        # own mean (h_f/h_cell ~ 1e4 measured at the Ritter front, cell h =
+        # 1.2e-7 against h_f ~ 1.2e-3), so a large ``u`` from ``q/h`` in that
+        # cell is AMPLIFIED onto the face instead of damped.  Demoting such a
+        # cell to piecewise-constant removes the amplification.
+        self._eps_wet = None if eps_wet is None else float(eps_wet)
         self._b_idx = int(b_index)
         self._h_idx = int(h_index)
         self._mom_idx = (
@@ -1156,6 +1168,13 @@ class EmittedWLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         n_var = Q.shape[0]
         grads = self._compute_gradients(W, n_var, bf_W)
         phi = self._compute_phi(W, n_var, bf_W, grads)
+
+        # Dry-cell demotion, threshold from the EMITTED ``wet_dry_eps`` ONLY.
+        # ``None`` => no demotion at all (the model emitted no threshold); this
+        # class never invents one.  See ``_eps_wet`` for why it is needed.
+        if self._eps_wet is not None:
+            dry = Q[self._h_idx, :self._nc] < self._eps_wet
+            phi = jnp.where(dry[jnp.newaxis, :], 0.0, phi)
 
         # NOTE: there is deliberately NO dry-cell ``φ:=0`` demotion here.  The
         # old code demoted every cell with ``h < eps_wet = 1e-3`` — 20% of the

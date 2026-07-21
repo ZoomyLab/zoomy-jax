@@ -494,6 +494,20 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # literal ``1e-3`` when the model declared none; SWE declares none, so
         # the fallback is what actually ran, and it was the dry-bed order-2
         # collapse.
+        # The ONLY wet/dry threshold this solver will pass to the
+        # reconstruction: the model's EMITTED ``wet_dry_eps``.  Absent => None
+        # => the reconstruction does no dry-cell demotion (and says so).  There
+        # is deliberately no fallback literal; the old fallback WAS the bug.
+        emitted_wet_dry_eps = None
+        for _z in (getattr(self.nsm, "parameter_values", None),
+                   getattr(self.nsm, "parameters", None)):
+            if _z is not None and getattr(_z, "contains", None) \
+                    and _z.contains("wet_dry_eps"):
+                try:
+                    emitted_wet_dry_eps = float(getattr(_z, "wet_dry_eps"))
+                    break
+                except (TypeError, ValueError):
+                    pass
         if self.nsm.reconstruction.order >= 2:
             mode = self.reconstruction_variables
             limiter = self.nsm.reconstruction.limiter
@@ -513,6 +527,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                     runtime.reconstruction_variables,
                     runtime.state_from_reconstruction,
                     aux_of_q=getattr(runtime, "update_aux_variables", None),
+                    eps_wet=emitted_wet_dry_eps,
                     b_index=int(self.free_surface_b_index),
                     h_index=int(self.free_surface_h_index),
                     momentum_indices=self.free_surface_momentum_indices,
