@@ -1059,7 +1059,8 @@ class EmittedWLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
     # operator checks this flag before threading the mask through.
     supports_force_o1 = True
 
-    def __init__(self, mesh, dim, w_of_q, q_of_w, b_index=0, h_index=1,
+    def __init__(self, mesh, dim, w_of_q, q_of_w, aux_of_q=None,
+                 b_index=0, h_index=1,
                  momentum_indices=None, positivity=None,
                  front_tol=None,
                  limiter="venkatakrishnan", unlimited_indices=None):
@@ -1083,6 +1084,18 @@ class EmittedWLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
                 "reconstruct in primitive variables.")
         self._w_of_q = w_of_q
         self._q_of_w = q_of_w
+        # The EMITTED local aux formula (``update_aux_variables``).  Needed
+        # because the RK stages do NOT refresh Qaux: SSP-RK2 evaluates stage 2
+        # at ``Q1`` while still passing stage 1's ``Qaux``
+        # (``solver_jax._rk2``).  That staleness was harmless while ``W``
+        # depended only on ``Q`` (η = h + b), but the emitted ``W`` carries
+        # ``u = hinv·q`` — pairing a stage-2 momentum with a stage-1 ``hinv``
+        # at a fast-moving front gives a velocity that is simply wrong, and it
+        # runs away.  Re-deriving the aux from the CURRENT ``Q`` through the
+        # model's own emitted map is what core's numpy solver does
+        # (``_apply_local_aux_formula`` / ``_ghost_aux``); the non-local
+        # derivative-aux rows pass through from the supplied ``Qaux``.
+        self._aux_of_q = aux_of_q
         self._b_idx = int(b_index)
         self._h_idx = int(h_index)
         self._mom_idx = (
@@ -1122,6 +1135,10 @@ class EmittedWLSQMUSCLJAX(_ZhangShuPP, LSQMUSCLReconstructionJAX):
         # momentum row is the PRIMITIVE VELOCITY, which is what removes the
         # need for a wet/dry threshold: u = hinv·q stays bounded as h -> 0
         # (KP), where the old hand-coded conservative ``hu`` row did not.
+        # Re-derive the LOCAL aux from THIS stage's Q before forming W (see
+        # ``_aux_of_q``): the solver hands us the previous stage's Qaux.
+        if self._aux_of_q is not None:
+            Qaux = self._aux_of_q(Q, Qaux, parameters)
         W = self._w_of_q(Q, Qaux, parameters)
         bf_W = bf_face_values
         if bf_face_values is not None:

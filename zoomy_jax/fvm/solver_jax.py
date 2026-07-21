@@ -512,6 +512,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                     mesh, dim,
                     runtime.reconstruction_variables,
                     runtime.state_from_reconstruction,
+                    aux_of_q=getattr(runtime, "update_aux_variables", None),
                     b_index=int(self.free_surface_b_index),
                     h_index=int(self.free_surface_h_index),
                     momentum_indices=self.free_surface_momentum_indices,
