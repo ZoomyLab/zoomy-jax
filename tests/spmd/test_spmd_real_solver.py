@@ -26,8 +26,6 @@ logger.remove()
 import zoomy_core.model.initial_conditions as IC
 import zoomy_core.model.boundary_conditions as BC
 from zoomy_core.mesh import LSQMesh
-from zoomy_core.misc.misc import ZArray
-from zoomy_core.model.derivative_workflow import StructuredDerivativeModel
 from zoomy_core.model.models import SME
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.numerics.numerical_system_model import ReconstructionSpec
@@ -46,39 +44,20 @@ try:
 except ImportError:                                   # pragma: no cover
     from jax import shard_map
 
-from sympy import Matrix
-
 N_STEPS = 6
 
 
 # ── 2D SWE model (flat bed) ──────────────────────────────────────────────────
-class _SWE2D(StructuredDerivativeModel):
-    dimension = 2
-    variables = ["h", "hu", "hv"]
-    parameters = {"g": (9.81, "positive")}
-
-    def flux(self):
-        h, hu, hv = self.Q.h, self.Q.hu, self.Q.hv
-        g = self.params.g
-        u, v = hu / h, hv / h
-        F = Matrix.zeros(self.n_variables, self.dimension)
-        F[0, 0] = hu; F[0, 1] = hv
-        F[1, 0] = hu * u + 0.5 * g * h * h; F[1, 1] = hu * v
-        F[2, 0] = hv * u; F[2, 1] = hv * v + 0.5 * g * h * h
-        return ZArray(F)
-
-    def source(self):
-        return ZArray.zeros(self.n_variables)
-
-
-class _SWE2DSolver(HyperbolicSolver):
-    def _build_reconstruction(self, mesh, symbolic_model, runtime=None):
-        from zoomy_jax.fvm.reconstruction_jax import (
-            ConstantReconstruction, FreeSurfaceLSQMUSCLJAX)
-        if self.nsm.reconstruction.order >= 2:
-            return FreeSurfaceLSQMUSCLJAX(mesh, symbolic_model.dimension, h_index=0,
-                                          eps_wet=1e-6, limiter=self.nsm.reconstruction.limiter)
-        return ConstantReconstruction(mesh, symbolic_model.dimension)
+# DERIVED, not hand-built: ``SME(level=0, dimension=3)`` IS the 2-horizontal
+# shallow-water system — state ``[b, h, q_x_0, q_y_0]``.  A hand-written
+# ``StructuredDerivativeModel`` used to stand here, and because it registered no
+# ``interpolate_to_3d`` rows the Wall BC could not derive its momentum vector
+# and the test had to PIN ``momentum_field_indices=[[1, 2]]``.  The derived
+# model carries the rows, so ``Wall`` resolves the group ``[[2, 3]]`` itself and
+# no pin is needed anywhere in this file.
+def _swe2d_model(bcs, ic):
+    return SME(level=0, dimension=3, boundary_conditions=bcs,
+               initial_conditions=ic)
 
 
 @pytest.mark.small
@@ -140,29 +119,25 @@ def test_spmd_real_solver_2d_transparent(order):
         bcs = BC.BoundaryConditions([
             BC.Periodic(tag="left", periodic_to_physical_tag="right"),
             BC.Periodic(tag="right", periodic_to_physical_tag="left"),
-            # ``momentum_field_indices`` PINNED, deliberately.  Core's default
-            # is None = derive from the model's ``interpolate_to_3d`` rows
-            # (``derive_momentum_field_indices``); ``_SWE2D`` below is a
-            # hand-written ``StructuredDerivativeModel`` with no such rows, so
-            # the derivation has nothing to read and Wall raises "unresolved".
-            # State is [h, hu, hv] ⇒ the momentum vector is rows (1, 2).
-            BC.Wall(tag="bottom", momentum_field_indices=[[1, 2]]),
-            BC.Wall(tag="top", momentum_field_indices=[[1, 2]])])
-        model = _SWE2D(boundary_conditions=bcs,
-                       initial_conditions=IC.UserFunction(
-                           function=lambda x: np.array([smooth(float(x[0])), 0.0, 0.0])))
+            # NO ``momentum_field_indices`` pin: the derived model registers the
+            # ``interpolate_to_3d`` rows Wall derives the momentum vector from.
+            BC.Wall(tag="bottom"),
+            BC.Wall(tag="top")])
+        # state [b, h, q_x_0, q_y_0]: flat bed, smooth depth, momentum at rest
+        model = _swe2d_model(bcs, IC.UserFunction(
+            function=lambda x: np.array([0.0, smooth(float(x[0])), 0.0, 0.0])))
         nsm = NumericalSystemModel.from_system_model(
             model, reconstruction=ReconstructionSpec(order=order, limiter="minmod"))
         gmesh = LSQMesh.create_2d(domain=DOMAIN, nx=NX, ny=NY)
         parts = partition_xaxis_structured(gmesh, n_parts=n_devs, halo=halo_x,
                                            domain=DOMAIN, shape=(NX, NY))
-        solver = _SWE2DSolver()
+        solver = HyperbolicSolver()
         _, Qaux0 = solver.setup_simulation(parts[1], nsm)
         naux = int(np.asarray(Qaux0).shape[0])
-        u0 = np.zeros((3, NX * NY))
+        u0 = np.zeros((4, NX * NY))
         for ix in range(NX):
             for iy in range(NY):
-                u0[0, ix * NY + iy] = smooth((ix + 0.5) * DX)
+                u0[1, ix * NY + iy] = smooth((ix + 0.5) * DX)
         Q_pad, n_local = shard_global_state(u0, n_devs, halo)
         Qaux_pad = jnp.zeros((naux, Q_pad.shape[1]), dtype=Q_pad.dtype)
         Q_out, _ = run_solver_sharded(solver, n_devs, halo, N_STEPS, DT)(Q_pad, Qaux_pad)
