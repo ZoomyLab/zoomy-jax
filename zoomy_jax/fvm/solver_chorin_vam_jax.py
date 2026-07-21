@@ -1,8 +1,16 @@
 """ChorinSplitVAMSolverJax — JAX port of the NumPy ChorinSplitVAMSolver.
 
-Three-step Chorin projection split for the VAM(1,2,2) chain:
+Three-step Chorin projection split for the VAM(1,2,2) chain::
 
-    predictor → pressure → corrector
+    hyperbolic (Euler) → pressure → corrector
+
+wrapped, when ``time_order == 2``, in the OUTER two-stage SSP-RK2 of
+Escalante et al. 2024 (JCP 504:112882, "Time stepping"): the full
+projection-correction cycle runs ONCE PER STAGE, the Poisson system is
+re-solved in each stage (P is stage-indexed), and the step closes with
+``U^{n+1} = ½ U^(0) + ½ U^(2)``.  The per-stage hyperbolic update is a single
+Euler step in time (eq. 11) — second order comes from the SPATIAL
+reconstruction, not from an inner RK.
 
 Each substep is driven by its own ``JaxRuntime`` over the corresponding
 sub-SystemModel (``sm_pred`` / ``sm_press`` / ``sm_corr``).  The
@@ -45,6 +53,7 @@ from zoomy_core.fvm.solver_chorin_vam_numpy import (
     _pad_to_square, _substitute_dt,
 )
 
+import zoomy_jax.fvm.ode as ode
 from zoomy_jax.fvm.solver_jax import HyperbolicSolver as HyperbolicSolverJax
 from zoomy_jax.mesh.mesh import lsq_gradient_per_field
 from zoomy_jax.transformation.jax_runtime import JaxRuntime
@@ -83,12 +92,23 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
     pressure_tol : float
     pressure_maxit : int
     time_order : int
-        1 = single Chorin cycle per step; 2 = SSPRK2 wrap.
+        Number of OUTER SSP-RK2 stages, each running a full
+        hyperbolic-Euler → Poisson → correction cycle.  1 = one cycle;
+        2 = the paper's two-stage scheme.
     """
 
     pressure_tol = param.Number(default=1e-6, bounds=(0, None))
     pressure_maxit = param.Integer(default=100, bounds=(1, None))
-    time_order = param.Integer(default=1, bounds=(1, 2))
+    time_order = param.Integer(
+        default=1, bounds=(1, 2),
+        doc=("Number of OUTER SSP-RK2 (Shu-Osher) stages, each of which runs a "
+             "FULL projection-correction cycle (hyperbolic Euler step -> "
+             "Poisson solve -> correction).  1: a single cycle.  2: the scheme "
+             "of Escalante et al. 2024 (JCP 504:112882) — U^(1) = S(U^(0)), "
+             "U^(2) = S(U^(1)), U^{n+1} = 1/2 U^(0) + 1/2 U^(2), with P "
+             "stage-indexed and the Poisson system re-solved in EACH stage.  "
+             "Consumed by :meth:`chorin_cycle`; it was previously declared and "
+             "read nowhere, while the RK2 sat inside the predictor instead."))
 
     #: The stage kinds this solver realises (REQ-173).  Mirrors
     #: ``ChorinSplitVAMSolver._STAGE_KINDS``; the Chorin march is exactly
@@ -420,11 +440,42 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
 
     # ── Chorin step (pure-functional core, JIT-able) ──────────────
 
-    def chorin_cycle(self, dt, time, Q, Qaux_pred, Qaux_press, Qaux_corr):
-        """One predictor → pressure → corrector cycle as a PURE
-        function of ``(Q, Qaux_pred, Qaux_press, Qaux_corr)`` — no
-        ``self._sim_*`` mutations during the call.  This is the
-        JIT-able entry point.  Returns the updated 4-tuple.
+    def _hyperbolic_stage(self, dt, time, Q, Qaux_pred):
+        """The stage's HYPERBOLIC substep: one path-conservative flux update
+        advanced by a SINGLE EULER step in time, plus the algebraic source.
+
+        This is the parent's :meth:`HyperbolicSolverJax.step` with
+        ``time_euler=True``: same reconstruction (order ≥ 2 stays order ≥ 2 in
+        SPACE), same MOOD, same halo wrap, same RK1 source — only the time
+        advance is Euler instead of the parent's internal Heun.
+
+        WHY: Escalante et al. 2024 (JCP 504:112882, "Time stepping") puts the
+        two-stage SSP-RK2 on the OUTSIDE and runs the full projection-correction
+        cycle once per stage; the per-stage hyperbolic update is a single Euler
+        step (eq. 11), second order coming from the SPATIAL reconstruction.
+        Calling the parent ``step`` here instead nests the RK2 INSIDE the
+        predictor — the exact inverse of the prescribed nesting — which is what
+        this solver did before, and it makes the pressure projection a
+        once-per-step correction of a state that already took two flux stages
+        without a projection between them."""
+        parameters = self._rt_parameters
+        flux = self._rt_flux_op
+        Q = self._explicit_hyperbolic_step(
+            dt, time, Q, Qaux_pred, parameters, flux,
+            int(self._rt_mesh.n_inner_cells), time_euler=True)
+        # Source step (explicit Euler — the source is treated as O1), mirroring
+        # the parent ``step``.  REQ-185: ``time`` is threaded so a
+        # time-dependent source binds ``t``.
+        return ode.RK1(self._rt_source_op, Q, Qaux_pred, parameters, dt, time)
+
+    def chorin_stage(self, dt, time, Q, Qaux_pred, Qaux_press, Qaux_corr):
+        """ONE projection-correction stage: hyperbolic Euler → Poisson →
+        correction, as a PURE function of ``(Q, Qaux_pred, Qaux_press,
+        Qaux_corr)`` — no ``self._sim_*`` mutations during the call.  Returns
+        the updated 4-tuple.
+
+        This is the paper's per-stage cycle.  ``chorin_cycle`` wraps ``time_order``
+        of these into the outer SSP-RK2.
 
         The three pools are re-derived from the INCOMING ``Q`` before the
         predictor runs.  That is not belt-and-braces: the predictor consumes
@@ -447,8 +498,8 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
         Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
 
-        # 1. Predictor (parent JAX HyperbolicSolver step).
-        Q = super().step(dt, time, Q, Qaux_pred)
+        # 1. Hyperbolic substep — ONE Euler step (see _hyperbolic_stage).
+        Q = self._hyperbolic_stage(dt, time, Q, Qaux_pred)
         Qaux_pred = self._refresh_aux_for_sm(Qaux_pred, self.sm_pred, Q)
         Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
         Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
@@ -465,6 +516,49 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
         Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
 
+        return Q, Qaux_pred, Qaux_press, Qaux_corr
+
+    def chorin_cycle(self, dt, time, Q, Qaux_pred, Qaux_press, Qaux_corr):
+        """One full TIME STEP: the outer SSP-RK2 (Shu–Osher) over
+        :meth:`chorin_stage`.  Pure function; the JIT-able entry point.
+
+        ``time_order == 1``  ⇒  U^{n+1} = S(U^n), one stage.
+
+        ``time_order == 2``  ⇒  the paper's scheme (Escalante et al. 2024,
+        JCP 504:112882, "Time stepping")::
+
+            U^(1)   = S(U^(0), t)          # hyp Euler → Poisson → correct
+            U^(2)   = S(U^(1), t + dt)     # the FULL cycle again; P is
+                                           # stage-indexed, re-solved here
+            U^{n+1} = ½ U^(0) + ½ U^(2)
+
+        Note what is NOT here any more: the RK2 used to sit INSIDE the
+        predictor (the parent's ``_explicit_hyperbolic_step``) while the
+        projection ran once per step — the inverse of the prescribed nesting,
+        and it left the constraint enforced only once per two flux stages.
+        ``time_order`` was declared and read NOWHERE before this; it is now the
+        knob that selects the number of stages.
+
+        The Shu–Osher average is taken on the STATE.  The aux pools are then
+        RE-DERIVED from the averaged state rather than averaged themselves: the
+        derivative rows are exact linear functionals of Q so averaging would
+        agree, but the ALGEBRAIC rows (the KP-desingularized ``hinv`` above all)
+        are nonlinear in Q and an averaged ``hinv`` is not ``hinv`` of the
+        averaged h."""
+        n_stages = int(self.time_order)
+        if n_stages == 1:
+            return self.chorin_stage(
+                dt, time, Q, Qaux_pred, Qaux_press, Qaux_corr)
+
+        Q0 = Q
+        Q, Qaux_pred, Qaux_press, Qaux_corr = self.chorin_stage(
+            dt, time, Q0, Qaux_pred, Qaux_press, Qaux_corr)
+        Q, Qaux_pred, Qaux_press, Qaux_corr = self.chorin_stage(
+            dt, time + dt, Q, Qaux_pred, Qaux_press, Qaux_corr)
+        Q = 0.5 * (Q0 + Q)
+        Qaux_pred = self._refresh_aux_for_sm(Qaux_pred, self.sm_pred, Q)
+        Qaux_press = self._refresh_aux_for_sm(Qaux_press, self.sm_press, Q)
+        Qaux_corr = self._refresh_aux_for_sm(Qaux_corr, self.sm_corr, Q)
         return Q, Qaux_pred, Qaux_press, Qaux_corr
 
     def step(self, dt, time, Q, Qaux=None):

@@ -939,7 +939,8 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
 
         return Q, Qaux
 
-    def _explicit_hyperbolic_step(self, dt, time, Q, Qaux, parameters, flux, nc):
+    def _explicit_hyperbolic_step(self, dt, time, Q, Qaux, parameters, flux, nc,
+                                  *, time_euler=False):
         """The explicit hyperbolic (flux) sub-step, MOOD-aware — WITHOUT the
         source.  Factored out of ``step`` so the IMEX solver's explicit stage
         reuses the SAME a-priori front pre-detector (which rides inside the
@@ -948,6 +949,16 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         operator; ``nc`` = #inner cells (for the troubled-cell mask).  order≥2 =
         SSP-RK2 (Heun); order 1 = explicit Euler.  The caller applies the source
         afterwards (explicit RK1 in ``step``, implicit in the IMEX loop).
+
+        ``time_euler=True`` keeps the order-≥2 SPATIAL reconstruction (and the
+        whole MOOD apparatus) but advances with a SINGLE Euler step in time.
+        That is the shape a projection/splitting scheme needs: the outer RK
+        stages live in the *splitting* driver, and each stage's hyperbolic
+        substep must be one Euler step or the split operators are applied at
+        the wrong nesting (Escalante et al. 2024, JCP 504:112882, eq. 11 — the
+        per-stage hyperbolic update is Euler, second order coming from the
+        reconstruction).  Default ``False`` ⇒ every pre-existing caller keeps
+        the RK2-inside-the-step behaviour, bit-identically.
 
         SPMD: the flux is halo-wrapped here (once), so EVERY solver that reuses
         this sub-step — the base explicit ``step`` AND the IMEX explicit stage —
@@ -970,6 +981,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 Q2 = Q1 + dt * dQ
                 return 0.5 * (Q0 + Q2)
 
+            def _euler(force_o1):
+                dQ = flux(dt, time, Q, Qaux, parameters,
+                          jnp.zeros_like(Q), force_o1)
+                return Q + dt * dQ
+
+            _advance = _euler if time_euler else _rk2
+
             if self.mood:
                 # A-posteriori MOOD: take the order-2 candidate, detect troubled
                 # cells (PAD h<0 + CAD non-finite), and — only if any cell is
@@ -978,16 +996,16 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 # positivity-preserving (XZS 1st-order lemma + Audusse face
                 # clip).  With the front pre-detector on, troubled cells rarely
                 # form, so the lax.cond branch is rarely taken.
-                Q_cand = _rk2(None)
+                Q_cand = _advance(None)
                 h_idx = int(self.free_surface_h_index)
                 troubled = ((Q_cand[h_idx, :nc] < 0.0)
                             | (~jnp.isfinite(Q_cand[:, :nc]).all(axis=0)))
                 return jax.lax.cond(
                     jnp.any(troubled),
-                    lambda: _rk2(troubled),
+                    lambda: _advance(troubled),
                     lambda: Q_cand,
                 )
-            return _rk2(None)
+            return _advance(None)
         dQ = flux(dt, time, Q, Qaux, parameters, jnp.zeros_like(Q))
         return Q + dt * dQ
 
