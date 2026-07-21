@@ -69,6 +69,28 @@ from zoomy_jax.transformation.jax_runtime import JaxRuntime
 # ── The solver ───────────────────────────────────────────────────────
 
 
+def _elliptic_accept(c_elliptic_tol: float) -> float:
+    """Residual above which the elliptic stage is declared FAILED.
+
+    MIRRORS the numpy reference's gate
+    (``solver_chorin_vam_numpy.py``: ``max(1e-6, 10.0 * c_elliptic_tol)``).
+    The solve TARGETS ``c_elliptic_tol``; it is only declared BROKEN an order
+    of magnitude past that, with a floor — because this operator is
+    unpreconditioned with an O(1/h²) condition number, so in float64 it cannot
+    reliably reach 1e-10 and a gate sitting exactly AT the target turns
+    round-off into an abort.  Measured on the smooth fully-wet ladder at n=64:
+    rel_resid 5.060e-10 against a target of 1e-10 — a converged solve that the
+    at-the-target gate killed at step 2.
+
+    ⚠ DIVERGENCE FLAG, deliberately surfaced rather than buried: this
+    expression is a LITERAL in core as well.  It belongs in the EMITTED set
+    beside ``c_elliptic_tol`` / ``c_elliptic_restart`` (mandate 6a) and this is
+    the second copy of it.  ``zoomy_core`` is another steward's tree, so the
+    fix is a core-side ``c_elliptic_accept`` with both backends reading it —
+    filed, not silently forked."""
+    return max(1e-6, 10.0 * float(c_elliptic_tol))
+
+
 class EllipticSolveError(RuntimeError):
     """The elliptic (pressure) stage missed its tolerance.
 
@@ -750,11 +772,22 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         # space, NOT an iteration count -- the budget is ~restart*maxiter
         # matvecs.  `restart` used to be jax's library default of 20; it is now
         # the emitted `c_elliptic_restart`, resolved from N above.
+        #
+        # `solve_method='incremental'` is REQUIRED once the restart is resolved
+        # from N rather than pinned at 20.  jax's default 'batched' path builds
+        # the FULL `restart`-dimensional Krylov basis unconditionally (a
+        # `fori_loop` over `range(restart)`, no residual check inside the
+        # cycle), so a size-resolved restart of, say, 1000 costs 1000 matvecs
+        # per solve even when the residual hit tol at iteration 12.  scipy's
+        # gmres -- the numpy reference -- exits early inside the cycle, so
+        # 'incremental' is also the setting that makes the two backends run the
+        # same algorithm rather than merely the same operator.
         p_new, _info = jax_gmres(
             matvec, -b,
             atol=0.0, tol=c_elliptic_tol,
             restart=c_elliptic_restart,
             maxiter=self.pressure_maxit,
+            solve_method="incremental",
         )
         # REQ-173's `elliptic` stage contract: the executor must surface
         # ‖b − A x‖/‖b‖.  ⚠ BACKEND DIVERGENCE, deliberate: numpy stores it on
@@ -784,7 +817,10 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
         # Python `raise` on a tracer is impossible.
         h_min = (jnp.min(Q[self._h_row, :self.nc])
                  if self._h_row is not None else jnp.asarray(jnp.nan))
-        tol = float(c_elliptic_tol)
+        # Two DIFFERENT numbers, as in the numpy reference: the solve TARGETS
+        # c_elliptic_tol; `tol` below is the ACCEPT gate (see _elliptic_accept).
+        tol = _elliptic_accept(c_elliptic_tol)
+        target = float(c_elliptic_tol)
         maxit = int(self.pressure_maxit)
         restart = int(c_elliptic_restart)
         restart_prov = ell.provenance["c_elliptic_restart"]
@@ -797,7 +833,8 @@ class ChorinSplitVAMSolverJax(HyperbolicSolverJax):
             raise EllipticSolveError(
                 "Chorin elliptic (pressure) stage did NOT converge at step "
                 f"{step_no} (t={t_now:.6g}, dt={dt_now:.6g}): rel residual "
-                f"{r:.3e} > tol {tol:.1e} after the full GMRES budget "
+                f"{r:.3e} > accept gate {tol:.1e} (target {target:.1e}) after "
+                f"the full GMRES budget "
                 f"(restart={restart} x maxiter={maxit} ~ {restart * maxit} "
                 f"matvecs; restart provenance: {restart_prov}); "
                 f"min(h)={hm:.6g}.  The march is ABORTED — a projection that "
