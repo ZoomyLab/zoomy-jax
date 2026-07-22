@@ -32,6 +32,31 @@ ETA_L, ETA_R, DAM_X = 0.005, 0.001, 5.0
 SWASHES_DOMAIN = (0.0, 10.0)
 SWASHES_T_END = 6.0
 
+# ── SWASHES 3.1.1, subcritical flow over a bump ────────────────────────────
+# The one SMOOTH, wet/wet SWASHES case: no shock, no dry front, so it is the
+# only one that can carry a genuine second-order floor.  Constants read off
+# reference/bump_sub.meta.txt and the table's own inlet row.
+BUMP_SUB_DOMAIN = (0.0, 25.0)
+BUMP_SUB_Q = 4.42          # m^2/s, imposed upstream (table q, constant)
+BUMP_SUB_H = 2.0           # m, imposed downstream (h + z = 2, z = 0 there)
+BUMP_SUB_T_END = 200.0
+#: Extra march used to VERIFY steadiness: the state must not move over it.
+BUMP_SUB_T_SETTLE = 25.0
+
+
+def bump_sub_bed(x):
+    """z(x) = max(0, 0.2 - 0.05 (x - 10)^2) — the SWASHES bump."""
+    return np.maximum(0.0, 0.2 - 0.05 * (np.asarray(x) - 10.0) ** 2)
+
+
+def bump_sub_ic(xv):
+    """Rest state h + z = 2, q = 0 — the SWASHES initial condition.
+
+    The steady profile is REACHED by the march; it is not prescribed, so this
+    genuinely exercises the scheme rather than seeding the answer."""
+    b = bump_sub_bed(xv[0])
+    return _pad_state(np.array([b, 2.0 - b, 0.0]))
+
 AHS26_DOMAIN, AHS26_T_END = (0.0, 1.0), 0.5
 
 ESC_DOMAIN, ESC_NCELLS = (-1.5, 1.5), 60
@@ -94,6 +119,30 @@ def bcs_for(kind: str, dimension: int):
     if kind in ("extrapolation", "swashes", "bump"):
         # SWASHES and the Escalante bump both run open (extrapolation) ends.
         return BC.BoundaryConditions([BC.Extrapolation(tag=t) for t in tags])
+    if kind == "bump_sub":
+        # SWASHES 3.1.1 subcritical bump: DISCHARGE imposed upstream, DEPTH
+        # imposed downstream — the standard subcritical pair (one characteristic
+        # enters at each end).  This is the only SWASHES case whose solution is
+        # SMOOTH and wet everywhere, so it is the only one entitled to a real
+        # second-order floor; stoker carries a shock and ritter a dry front,
+        # and both are pinned rather than floored for that reason.
+        # CHARACTERISTIC, not Lambda/Dirichlet.  A hard Dirichlet on h at the
+        # outlet REFLECTS: measured, the state never settles — spatially frozen
+        # (q spread 5.63e-03 at t=200 vs 5.72e-03 at t=600) yet still moving in
+        # time (1.06e-03 over a further 25 s), i.e. a standing wave, not a
+        # transient.  ``Characteristic`` imposes the target only on the INCOMING
+        # characteristics, ``Q_ghost = Q + P⁻(Q_target − Q)`` with
+        # ``P⁻ = R·1_{λ<0}·L``, leaving the outgoing content as the interior's —
+        # so the prescribed value is honoured without reflecting what leaves.
+        # The unprescribed slots extrapolate by default, which is exactly the
+        # "fix one field, extrapolate the rest, then project" construction.
+        # SWE state is [b, h, q_0]: discharge is index 2, depth index 1.
+        left = [BC.Characteristic(tag="left",
+                                  prescribe_fields={2: lambda *a: BUMP_SUB_Q})]
+        right = [BC.Characteristic(tag="right",
+                                   prescribe_fields={1: lambda *a: BUMP_SUB_H})]
+        rest = [BC.Extrapolation(tag=t) for t in tags[2:]]
+        return BC.BoundaryConditions(left + right + rest)
     if kind == "wall":
         # NO ``momentum_field_indices``: it defaults to ``None`` = DERIVE from
         # the model's own ``interpolate_to_3d`` rows at resolve time
@@ -287,13 +336,19 @@ def l1_vs_analytic(Q, mesh, case: str, t: float) -> float:
     """Mesh-normalized L1 error of h against the SWASHES analytic solution.
 
     ``t`` is ASSERTED against the table's time rather than used: the cached
-    tables are t = 6 s only, and silently comparing a t = 1 s run against a
-    t = 6 s table would manufacture a meaningless "error" that still
+    dam-break tables are t = 6 s only, and silently comparing a t = 1 s run
+    against a t = 6 s table would manufacture a meaningless "error" that still
     converges.
+
+    ``bump_sub`` is exempt from that assertion because its solution is STEADY —
+    the table is the t → ∞ limit, so any march time long enough to reach
+    steady state is the right comparison.  The march time is instead validated
+    by the steady-state residual check at the call site.
     """
-    assert abs(t - SWASHES_T_END) < 1e-12, (
-        f"the cached SWASHES tables are t = {SWASHES_T_END} s only; got "
-        f"t = {t}. Generate a new table before comparing at another time.")
+    if case != "bump_sub":
+        assert abs(t - SWASHES_T_END) < 1e-12, (
+            f"the cached SWASHES tables are t = {SWASHES_T_END} s only; got "
+            f"t = {t}. Generate a new table before comparing at another time.")
     ref = swashes_table(case)
     n = mesh.n_inner_cells
     x = np.asarray(mesh.cell_centers[0, :n], float)
