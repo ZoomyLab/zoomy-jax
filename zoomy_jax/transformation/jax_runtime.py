@@ -805,6 +805,33 @@ class JaxRuntime:
         self.numerical_flux = numerical_flux
         self.numerical_fluctuations = numerical_fluctuations
 
+        # The EMITTED interior nonconservative term.  Same face signature
+        # SHAPE, so the same lambdify + vmap path — but the state pair is
+        # (cell mean, that cell's own reconstructed edge value) and the normal
+        # points OUT of the cell rather than across the face.
+        #
+        # Bound only when the numerics registers it, so a runtime built against
+        # an older core still works; the solver then falls back to its legacy
+        # inline volume form.
+        num_ces = getattr(numerics, "numerical_cell_edge_source", None)
+        if num_ces is None:
+            self.numerical_cell_edge_source = None
+        else:
+            num_ces_arr = _to_array_of_exprs(num_ces())
+            num_ces_per_face = _lambdify_array(
+                num_ces_arr, face_sig, self.module)
+
+            @jax.jit
+            def numerical_cell_edge_source(qc, qe, qauxc, qauxe,
+                                           parameters, normal):
+                def per_face(qci, qei, qauxci, qauxei, n):
+                    return num_ces_per_face(qci, qei, qauxci, qauxei,
+                                            parameters, n)
+                return jax.vmap(per_face, in_axes=(1, 1, 1, 1, 1),
+                                out_axes=-1)(qc, qe, qauxc, qauxe, normal)
+
+            self.numerical_cell_edge_source = numerical_cell_edge_source
+
     # ── Boundary-condition kernels ───────────────────────────────
 
     def _build_bc(self):

@@ -102,6 +102,7 @@ class MUSCLReconstruction:
             "venkatakrishnan": self._limit_vk,
             "barth_jespersen": self._limit_bj,
             "minmod": self._limit_minmod,
+            "none": lambda u, grad, u_min, u_max: jnp.ones(self.n_cells),
         }
         self._limiter_fn = _limiter_map[limiter]
 
@@ -386,6 +387,7 @@ class LSQMUSCLReconstructionJAX:
             "venkatakrishnan": self._limit_vk,
             "barth_jespersen": self._limit_bj,
             "minmod": self._limit_minmod,
+            "none": lambda u, grad_v, u_min, u_max: jnp.ones_like(u),
         }
         if limiter not in _limiter_map:
             raise ValueError(

@@ -594,6 +594,13 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # part).  Active only when the reconstruction exposes its limited
         # gradient (plain LSQ-MUSCL); order 1 has slope ≡ 0.
         rt_ncm = getattr(runtime, "nonconservative_matrix", None)
+        # THE EMITTED interior nonconservative term (core
+        # ``numerical_cell_edge_source``).  Preferred over the inline volume
+        # form above when the runtime provides it: it is the SAME
+        # Gauss-Legendre path integral the face fluctuations use, so the two
+        # halves of one nonconservative product share a quadrature — which is
+        # what the order-2 well-balancing cancellation depends on.
+        rt_ces = getattr(runtime, "numerical_cell_edge_source", None)
         # The emitted-W reconstruction needs Qaux + parameters at call time
         # (its ``W`` map reads the desingularized ``hinv`` aux), plus the
         # emitted LOCAL aux formula to rebuild aux on ghost/boundary states.
@@ -622,7 +629,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         use_interior_ncp = bool(
             self.nsm.reconstruction.order >= 2
             and rt_ncm is not None
-            and _grad_recon_ok)
+            and (_grad_recon_ok or rt_ces is not None))
         if (self.nsm.reconstruction.order >= 2 and rt_ncm is not None
                 and not use_interior_ncp):
             # Silently dropping the interior NCP at order >= 2 loses
@@ -756,13 +763,21 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                                        dtype=bf_values.dtype)
                 o1kw = dict(o1kw, Qaux=Qaux, parameters=parameters,
                             bf_aux=bf_aux)
-            if use_interior_ncp:
+            if use_interior_ncp and rt_ces is None:
                 Q_L, Q_R, lim_grad = reconstruct.reconstruct_with_grad(
                     Q, bf_values, **o1kw)
-                # 2b. Cell-interior NCP integral: dQ_c −= Σ_d B(Q_c)[:,:,d]
-                # · s_c[:,d].  No |cell| division — the volume factor
-                # cancels against the per-unit-volume residual (NumPy
-                # parity).
+                # LEGACY VOLUME FORM — used only by a runtime that predates the
+                # EMITTED ``numerical_cell_edge_source``.  dQ_c −= Σ_d
+                # B(Q_c)[:,:,d]·s_c[:,d]; no |cell| division, the volume factor
+                # cancels against the per-unit-volume residual.
+                #
+                # It evaluates B at the CELL MEAN only.  That is exact for a B
+                # LINEAR in the state (SWE's g·h — which is why Audusse's
+                # centred term is a closed form) and an approximation for every
+                # other one: hinv, q²/h, the moment couplings.  It also lived
+                # ONLY here, so foam/amrex/firedrake had no interior term at
+                # all.  Both reasons are why it moved into core as a shared
+                # Gauss-Legendre path integral.
                 B_all = rt_ncm(Q, Qaux, parameters)   # (n_eq, n_state, dim, nc)
                 interior_ncp = jnp.einsum("ijdc,jdc->ic", B_all, lim_grad)
                 dQ = dQ.at[:, :interior_ncp.shape[1]].subtract(interior_ncp)
@@ -792,6 +807,22 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 (F_num_int + Dm_int) * fv_int / cvA_int)
             dQ = dQ.at[:, iB_int].subtract(
                 (-F_num_int + Dp_int) * fv_int / cvB_int)
+
+            # 3b. EMITTED interior nonconservative term, once per (cell, edge).
+            # ``int_{T_ij} B(W)·grad W dx`` in surface form: with a linear
+            # reconstruction grad W is constant on the subcell, so the integral
+            # collapses to the segment path integral between the CELL MEAN and
+            # the cell's own reconstructed EDGE value.  Each side uses its own
+            # cell mean and its own edge trace, with the normal pointing OUT of
+            # that cell — so B's normal is negated.  Vanishes identically at
+            # order 1, where Q_L == Q[iA] and Q_R == Q[iB].
+            if use_interior_ncp and rt_ces is not None:
+                ces_A = rt_ces(Q[:, iA_int], Q_L_int, qauxA, qauxA,
+                               parameters, normals_int)
+                ces_B = rt_ces(Q[:, iB_int], Q_R_int, qauxB, qauxB,
+                               parameters, -normals_int)
+                dQ = dQ.at[:, iA_int].subtract(ces_A * fv_int / cvA_int)
+                dQ = dQ.at[:, iB_int].subtract(ces_B * fv_int / cvB_int)
 
             # 4. Boundary face loop — one inner cell only.
             if n_bf > 0:
@@ -833,6 +864,23 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 Dm_bnd = fluct_bnd[1]
                 dQ = dQ.at[:, iInner_bnd].subtract(
                     (F_num_bnd + Dm_bnd) * fv_bnd / cv_bnd)
+
+                # 4b. EMITTED interior nonconservative term at the BOUNDARY
+                # face.  A boundary cell's in-cell integral has TWO halves: the
+                # interior-face half (added in step 3b) and this boundary-face
+                # half.  Omitting it left boundary cells with an incomplete
+                # nonconservative integral — measured directly as an O(1)
+                # residual error in the boundary strips while the INTERIOR
+                # matched the conservative operator to O(h^2).  Over a march
+                # that boundary error propagates inward and caps a smooth
+                # quasilinear run at ~1.85 instead of 2.  The pair is (boundary
+                # cell mean, that cell's reconstructed boundary-face value) with
+                # the OUTWARD normal — same shape as the interior side.
+                if use_interior_ncp and rt_ces is not None:
+                    ces_bnd = rt_ces(Q[:, iInner_bnd], Q_L_bnd,
+                                     qauxBnd, qauxBnd, parameters, normals_bnd)
+                    dQ = dQ.at[:, iInner_bnd].subtract(
+                        ces_bnd * fv_bnd / cv_bnd)
 
             # 5. Explicit diffusion (REQ-50): dQ += ∇·(A:∇Q).  A evaluated at
             # the current state (explicit); the per-volume divergence matches
@@ -940,7 +988,7 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         return Q, Qaux
 
     def _explicit_hyperbolic_step(self, dt, time, Q, Qaux, parameters, flux, nc,
-                                  *, time_euler=False):
+                                  *, time_euler=False, aux_of_q=None):
         """The explicit hyperbolic (flux) sub-step, MOOD-aware — WITHOUT the
         source.  Factored out of ``step`` so the IMEX solver's explicit stage
         reuses the SAME a-priori front pre-detector (which rides inside the
@@ -976,7 +1024,23 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
                 dQ = flux(dt, time, Q0, Qaux, parameters,
                           jnp.zeros_like(Q), force_o1)
                 Q1 = Q0 + dt * dQ
-                dQ = flux(dt, time + dt, Q1, Qaux, parameters,
+                # REFRESH THE AUX AGAINST THE STAGE STATE.  Qaux is a FUNCTION
+                # of Q (SME/VAM carry the desingularized ``hinv`` = f(h)), so
+                # feeding stage 2 the aux computed from Q0 evaluates the flux
+                # at an inconsistent state: an O(dt) error that drags the whole
+                # scheme back to FIRST order in time no matter how good the
+                # spatial reconstruction is.
+                #
+                # Measured on smooth flat-bed SME(1) before this fix: with the
+                # diffusive minmod limiter the spatial error masked it
+                # (h 1.73 / q_0 1.78), but with venkatakrishnan -- which is
+                # 2nd-order at extrema, so the spatial error shrinks -- every
+                # row collapsed toward 1 (h 1.12 / q_0 1.16 / q_1 0.97). A
+                # "better limiter makes convergence worse" inversion is the
+                # signature of a time-integration defect, not a spatial one.
+                Qaux1 = (aux_of_q(Q1, Qaux, parameters)
+                         if aux_of_q is not None else Qaux)
+                dQ = flux(dt, time + dt, Q1, Qaux1, parameters,
                           jnp.zeros_like(Q), force_o1)
                 Q2 = Q1 + dt * dQ
                 return 0.5 * (Q0 + Q2)
@@ -1055,7 +1119,8 @@ class HyperbolicSolver(HyperbolicSolverNumpy):
         # front pre-detector + MOOD corrector for its explicit stage.
         Q = self._explicit_hyperbolic_step(
             dt, time, Q, Qaux, parameters, flux,
-            int(self._rt_mesh.n_inner_cells))
+            int(self._rt_mesh.n_inner_cells),
+            aux_of_q=getattr(self._rt_model, "update_aux_variables", None))
 
         # Source step (explicit Euler is fine — source is treated as O1).
         # REQ-185: thread the current ``time`` into the timestepping so a
