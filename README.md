@@ -1,3 +1,5 @@
+> **Moved.** This package now lives in [ZoomyLab/Zoomy](https://github.com/ZoomyLab/Zoomy/tree/main/library/zoomy_jax). This repository is archived. Install with `pip install zoomy-jax`.
+
 # zoomy-jax
 
 JAX solver backend for [Zoomy](https://github.com/ZoomyLab/Zoomy), a simulation
